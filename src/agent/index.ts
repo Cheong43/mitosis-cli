@@ -7,7 +7,7 @@ import * as path from 'path';
 import * as dotenv from 'dotenv';
 import { z } from 'zod';
 import { resolveCodeCliRoot } from '../config/projectPaths.js';
-import { AgentRuntime, createRuntime, RuntimeHandle } from '../runtime/index.js';
+import { AgentRuntime, createRuntime, RuntimeHandle, BeamSearchAgentRuntime } from '../runtime/index.js';
 import type { AgentBranchState, BranchSynthesisInput } from '../runtime/agent/AgentRuntime.js';
 import { TOOLS, TOOL_NAMES } from '../tools/definitions.js';
 import { installWorkspaceSkillFromLibraryViaCli } from '../mempedia/cli.js';
@@ -204,6 +204,11 @@ export class Agent {
   private readonly branchMaxCompleted: number;
   private readonly branchConcurrency: number;
   private readonly agentLlmTimeoutMs: number;
+  /** When true the agent uses the beam-search loop instead of branching. */
+  private readonly useBeamSearch: boolean;
+  private readonly beamWidth: number;
+  private readonly beamMaxDepth: number;
+  private readonly beamExpansionFactor: number;
   /** Governed runtime handle — routes mempedia actions through policy + guards. */
   private readonly runtimeHandle: RuntimeHandle;
   private readonly memoryClassifier: MemoryClassifierAgent;
@@ -269,6 +274,14 @@ export class Agent {
     this.branchConcurrency = Number.isFinite(rawBranchConcurrency) ? Math.max(1, Math.min(8, Math.floor(rawBranchConcurrency))) : 3;
     const rawAgentLlmTimeoutMs = Number(process.env.AGENT_LLM_TIMEOUT_MS ?? 120000);
     this.agentLlmTimeoutMs = Number.isFinite(rawAgentLlmTimeoutMs) ? Math.max(5000, Math.floor(rawAgentLlmTimeoutMs)) : 120000;
+    const rawUseBeamSearch = String(process.env.REACT_BEAM_SEARCH_ENABLED ?? '0').toLowerCase();
+    this.useBeamSearch = rawUseBeamSearch === '1' || rawUseBeamSearch === 'true' || rawUseBeamSearch === 'on';
+    const rawBeamWidth = Number(process.env.REACT_BEAM_WIDTH ?? 3);
+    this.beamWidth = Number.isFinite(rawBeamWidth) ? Math.max(1, Math.min(10, Math.floor(rawBeamWidth))) : 3;
+    const rawBeamMaxDepth = Number(process.env.REACT_BEAM_MAX_DEPTH ?? 5);
+    this.beamMaxDepth = Number.isFinite(rawBeamMaxDepth) ? Math.max(1, Math.min(10, Math.floor(rawBeamMaxDepth))) : 5;
+    const rawBeamExpansionFactor = Number(process.env.REACT_BEAM_EXPANSION_FACTOR ?? 3);
+    this.beamExpansionFactor = Number.isFinite(rawBeamExpansionFactor) ? Math.max(1, Math.min(10, Math.floor(rawBeamExpansionFactor))) : 3;
     this.memoryLogPath = path.join(projectRoot, '.mitosis', 'logs', 'mitosis_save.log');
     this.conversationLogDir = path.join(projectRoot, '.mitosis', 'conversations');
     this.nodeConversationMapPath = path.join(projectRoot, '.mitosis', 'logs', 'node_conversations.jsonl');
@@ -2445,6 +2458,54 @@ ${soulsGuidance}
       return extractText(_synthesisText).trim();
     };
     let completedBranchesForRun: Array<BranchSynthesisInput['branches'][number]> = [];
+    let finalAnswer: string;
+
+    if (this.useBeamSearch) {
+      // ── Beam Search ReAct mode ──────────────────────────────────────────
+      emitTrace({ type: 'thought', content: `Using beam-search mode (width=${this.beamWidth}, depth=${this.beamMaxDepth}, expansion=${this.beamExpansionFactor}).` });
+      const beamPlanner = {
+        plan: async (transcript: Array<{ role: string; content: string }>) => {
+          const { text: _planText } = await this.measure(perfEntries, `beam_llm_plan`, async () =>
+            this.withTimeout(
+              generateText({
+                model: this.openai,
+                messages: transcript as any,
+              }),
+              this.agentLlmTimeoutMs,
+              'beam_plan llm'
+            )
+          );
+          const raw = extractText(_planText);
+          const decision = parseDecision(raw);
+          if (decision.kind === 'tool') {
+            return { kind: 'tool' as const, thought: decision.thought, toolCalls: decision.tool_calls || [] };
+          }
+          return { kind: 'final' as const, thought: decision.thought, content: String(decision.final_answer || ''), completionSummary: decision.completion_summary };
+        },
+      };
+
+      const beamRuntime = new BeamSearchAgentRuntime({
+        planner: beamPlanner,
+        toolRuntime: {
+          execute: async (toolName: string, args: Record<string, unknown>) => {
+            return runRuntimeHandle.toolRuntime.execute(toolName, args);
+          },
+          resetSession: () => runRuntimeHandle.toolRuntime.resetSession(),
+        },
+        beamWidth: this.beamWidth,
+        maxDepth: this.beamMaxDepth,
+        expansionFactor: this.beamExpansionFactor,
+        onTrace: (event) => {
+          if (event.type === 'final') return;
+          emitTrace({ type: event.type, content: event.content, metadata: event.metadata });
+        },
+      });
+
+      finalAnswer = await beamRuntime.run(
+        `Original user request:\n${input}\n\nExplore multiple strategies to solve this.`,
+      );
+    } else {
+      // ── Branching ReAct mode (original) ─────────────────────────────────
     const runtime = new AgentRuntime({
       planner: { plan: async (transcript) => ({ kind: 'final', content: transcript.at(-1)?.content || '' }) },
       toolRuntime: {
@@ -2512,7 +2573,8 @@ ${soulsGuidance}
         });
       }
     });
-    const finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. Branch only when multiple distinct approaches are worth exploring.`);
+    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. Branch only when multiple distinct approaches are worth exploring.`);
+    }
     if (this.hadExplicitMemoryWrite(traceBuffer)) {
       memoryQueuedThisRun = true;
     }
