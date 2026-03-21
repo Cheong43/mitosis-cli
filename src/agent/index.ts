@@ -1,4 +1,4 @@
-import { generateText, type LanguageModelV1 } from 'ai';
+import { NoObjectGeneratedError, generateObject, generateText, type LanguageModelV1 } from 'ai';
 import { buildLanguageModel } from './llm.js';
 import { MempediaClient } from '../mempedia/client.js';
 import { ToolAction } from '../mempedia/types.js';
@@ -182,6 +182,7 @@ export class Agent {
   private readonly projectRoot: string;
   private readonly codeCliRoot: string;
   private openai: LanguageModelV1;
+  private beamPlannerOpenai: LanguageModelV1;
   private memoryOpenai: LanguageModelV1;
   private mempedia: MempediaClient;
   private model: string;
@@ -235,6 +236,17 @@ export class Agent {
       hmacSecretKey: config.hmacSecretKey,
       gatewayApiKey: config.gatewayApiKey,
     });
+    this.beamPlannerOpenai = buildLanguageModel(
+      {
+        model: this.model,
+        apiKey: config.apiKey,
+        baseURL: config.baseURL,
+        hmacAccessKey: config.hmacAccessKey,
+        hmacSecretKey: config.hmacSecretKey,
+        gatewayApiKey: config.gatewayApiKey,
+      },
+      { structuredOutputs: false }
+    );
     const memoryBaseURL = config.memoryBaseURL || config.baseURL;
     const memoryAccessKey = config.memoryHmacAccessKey || config.hmacAccessKey;
     const memorySecretKey = config.memoryHmacSecretKey || config.hmacSecretKey;
@@ -2115,6 +2127,9 @@ export class Agent {
       { role: 'user', content: turn.user },
       { role: 'assistant', content: turn.assistant }
     ]);
+    const originalUserRequest = this.extractOriginalUserRequest(input);
+    const asksAboutLocalSkills = /技能/.test(originalUserRequest) || /\bskills?\b/i.test(originalUserRequest);
+    const asksAboutMempedia = /mempedia/i.test(originalUserRequest) || /记忆库|知识库/.test(originalUserRequest);
 
     const toolCatalog = TOOLS.map((tool) => {
       const fn = (tool as any).function;
@@ -2166,6 +2181,8 @@ Rules:
 13. When you finish, return kind="final" with a direct user-facing answer.
 14. If the skill catalog is insufficient and you need the full guidance of one or two local skills, return kind="skills" with skills_to_load and no tool_calls, branches, or final_answer.
 15. Request full skill guidance only when it materially changes the next step.
+16. For questions about local Mempedia contents, workspace memory, or local skills, inspect local evidence first. Do not answer from generic model background knowledge.
+17. If the user asks what is in Mempedia or what skills are available, prefer search or read against local workspace evidence before final_answer.
 
 Available tools:
 ${toolCatalog}
@@ -2244,6 +2261,42 @@ ${soulsGuidance}
       ];
     };
 
+    const buildEvidenceFirstFallbackDecision = (): PlannerDecision | null => {
+      const toolCalls: Array<z.infer<typeof PlannerToolCallSchema>> = [];
+      if (asksAboutLocalSkills) {
+        toolCalls.push({
+          name: 'search',
+          arguments: { target: 'workspace', mode: 'glob', pattern: 'skills/**/SKILL.md', limit: 20 },
+          goal: 'Inspect local workspace skills before answering.',
+        });
+        toolCalls.push({
+          name: 'search',
+          arguments: { target: 'workspace', mode: 'glob', pattern: '.github/skills/**/SKILL.md', limit: 20 },
+          goal: 'Inspect any GitHub-scoped workspace skills before answering.',
+        });
+      }
+      if (asksAboutMempedia) {
+        toolCalls.push({
+          name: 'search',
+          arguments: { target: 'workspace', mode: 'glob', pattern: '.mempedia/memory/knowledge/nodes/**/*.md', limit: 20 },
+          goal: 'Inspect local Mempedia knowledge nodes before answering.',
+        });
+        toolCalls.push({
+          name: 'search',
+          arguments: { target: 'workspace', mode: 'glob', pattern: '.mempedia/memory/index/*.json', limit: 20 },
+          goal: 'Inspect local Mempedia index files before answering.',
+        });
+      }
+      if (toolCalls.length === 0) {
+        return null;
+      }
+      return {
+        kind: 'tool',
+        thought: 'Inspect local workspace evidence before answering this project-specific request.',
+        tool_calls: toolCalls,
+      };
+    };
+
     const traceMeta = (branch: BranchState, extra: Record<string, unknown> = {}) => ({
       branchId: branch.id,
       parentBranchId: branch.parentId,
@@ -2317,6 +2370,14 @@ ${soulsGuidance}
 
       if (!normalized) {
         const looksLikePromptEcho = /Original user request:|Current branch state:|Skill:|MEMPEDIA_BINARY_PATH|agent_upsert_markdown|list_skills|record_episodic/i.test(rawTrimmed);
+        const evidenceFirstDecision = buildEvidenceFirstFallbackDecision();
+        if (evidenceFirstDecision && !looksLikePromptEcho) {
+          emitTrace({
+            type: 'observation',
+            content: 'Planner returned unstructured output for a project-specific request; forcing local evidence inspection before answering.',
+          });
+          return PlannerDecisionSchema.parse(evidenceFirstDecision);
+        }
         return PlannerDecisionSchema.parse({
           kind: 'final',
           thought: 'Planner returned no valid structured decision; using fallback final answer.',
@@ -2419,6 +2480,44 @@ ${soulsGuidance}
       } as PlannerDecision;
     };
 
+    const planWithSkillRoutingObject = async (
+      initialTranscript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+      invoke: (transcript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>) => Promise<PlannerDecision>,
+    ): Promise<PlannerDecision> => {
+      let workingTranscript = initialTranscript;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const decision = PlannerDecisionSchema.parse(await invoke(workingTranscript));
+        if (decision.kind !== 'skills') {
+          return decision;
+        }
+        const requestedNames = Array.isArray(decision.skills_to_load) ? decision.skills_to_load : [];
+        const loadedSkillNames = getLoadedSkillNames(workingTranscript);
+        const skillsToInject = resolveSkillsByName(availableSkills, requestedNames, 2)
+          .filter((skill) => !loadedSkillNames.has(skill.name.toLowerCase()));
+        if (skillsToInject.length === 0) {
+          emitTrace({
+            type: 'observation',
+            content: `Skill router could not resolve requested skills: ${requestedNames.join(', ') || '(none)'}.`,
+          });
+          return {
+            kind: 'final',
+            thought: 'Skill router request could not be resolved to new skills; using fallback final answer.',
+            final_answer: '抱歉，当前请求的技能不可用。请重试或手动指定技能。',
+          } as PlannerDecision;
+        }
+        emitTrace({
+          type: 'observation',
+          content: `Skill router loaded local guidance: ${skillsToInject.map((skill) => skill.name).join(', ')}.`,
+        });
+        workingTranscript = appendSkillGuidance(workingTranscript, skillsToInject);
+      }
+      return {
+        kind: 'final',
+        thought: 'Skill router exceeded load attempts; using fallback final answer.',
+        final_answer: '抱歉，技能路由未能收敛为有效回答。请重试一次。',
+      } as PlannerDecision;
+    };
+
     const buildBranchMemoryJob = (
       branch: BranchState,
       reason: string,
@@ -2473,6 +2572,29 @@ ${soulsGuidance}
       ];
     };
 
+    const executePlannerTool = async (fnName: string, args: Record<string, unknown>): Promise<string> => {
+      if (fnName === 'read') {
+        return this.executeReadTool(args, runRuntimeHandle);
+      }
+      if (fnName === 'search') {
+        return this.executeSearchTool(args, runRuntimeHandle);
+      }
+      if (fnName === 'edit') {
+        return this.executeEditTool(args, runRuntimeHandle);
+      }
+      if (fnName === 'bash') {
+        const toolRes = await runRuntimeHandle.executeTool('run_shell', { command: String(args.command || '') });
+        if (!toolRes.success) {
+          return `Error: ${toolRes.error ?? 'unknown tool error'}`;
+        }
+        return typeof toolRes.result === 'string' ? toolRes.result : JSON.stringify(toolRes.result);
+      }
+      if (fnName === 'web') {
+        return this.executeWebTool(args);
+      }
+      return `Unknown tool: ${fnName}`;
+    };
+
     const executeToolCall = async (branch: BranchState, toolCall: z.infer<typeof PlannerToolCallSchema>): Promise<string> => {
       const args = toolCall.arguments || {};
       const fnName = toolCall.name;
@@ -2484,26 +2606,7 @@ ${soulsGuidance}
       const toolStart = Date.now();
       let result = '';
       try {
-        if (fnName === 'read') {
-          result = await this.executeReadTool(args as Record<string, unknown>, runRuntimeHandle);
-        } else if (fnName === 'search') {
-          result = await this.executeSearchTool(args as Record<string, unknown>, runRuntimeHandle);
-        } else if (fnName === 'edit') {
-          result = await this.executeEditTool(args as Record<string, unknown>, runRuntimeHandle);
-        } else if (fnName === 'bash') {
-          const toolRes = await runRuntimeHandle.executeTool('run_shell', { command: String(args.command || '') });
-          if (!toolRes.success) {
-            result = `Error: ${toolRes.error ?? 'unknown tool error'}`;
-          } else if (typeof toolRes.result === 'string') {
-            result = toolRes.result;
-          } else {
-            result = JSON.stringify(toolRes.result);
-          }
-        } else if (fnName === 'web') {
-          result = await this.executeWebTool(args as Record<string, unknown>);
-        } else {
-          result = `Unknown tool: ${fnName}`;
-        }
+        result = await executePlannerTool(fnName, args as Record<string, unknown>);
       } catch (error: any) {
         result = `Error executing tool: ${error.message}`;
       }
@@ -2589,21 +2692,46 @@ ${soulsGuidance}
       emitTrace({ type: 'thought', content: `Using beam-search mode (width=${this.beamWidth}, depth=${this.beamMaxDepth}, expansion=${this.beamExpansionFactor}).` });
       const beamPlanner = {
         plan: async (transcript: Array<{ role: string; content: string }>) => {
-          const decision = await planWithSkillRouting(
+          const decision = await planWithSkillRoutingObject(
             transcript as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
             async (workingTranscript) => {
-              const { text: _planText } = await this.measure(perfEntries, `beam_llm_plan`, async () =>
-                this.withTimeout(
-                  generateText({
-                    model: this.openai,
-                    messages: workingTranscript as any,
-                    providerOptions: { openai: { responseFormat: { type: 'json_object' } } },
-                  }),
-                  this.agentLlmTimeoutMs,
-                  'beam_plan llm'
-                )
-              );
-              return extractText(_planText);
+              try {
+                const { object } = await this.measure(perfEntries, `beam_llm_plan`, async () =>
+                  this.withTimeout(
+                    generateObject({
+                      model: this.beamPlannerOpenai,
+                      messages: workingTranscript as any,
+                      mode: 'json',
+                      schema: PlannerDecisionSchema,
+                    }),
+                    this.agentLlmTimeoutMs,
+                    'beam_plan llm'
+                  )
+                );
+                return object;
+              } catch (error: any) {
+                const shouldFallback = NoObjectGeneratedError.isInstance(error)
+                  || /No object generated/i.test(String(error?.message || error));
+                if (!shouldFallback) {
+                  throw error;
+                }
+                emitTrace({
+                  type: 'observation',
+                  content: `Beam planner object mode returned no object; falling back to text JSON planning. ${String(error?.message || error)}`,
+                });
+                const { text: fallbackText } = await this.measure(perfEntries, `beam_llm_plan_fallback_text`, async () =>
+                  this.withTimeout(
+                    generateText({
+                      model: this.openai,
+                      messages: workingTranscript as any,
+                      providerOptions: { openai: { responseFormat: { type: 'json_object' } } },
+                    }),
+                    this.agentLlmTimeoutMs,
+                    'beam_plan_fallback llm'
+                  )
+                );
+                return parseDecision(extractText(fallbackText));
+              }
             }
           );
           if (decision.kind === 'tool') {
@@ -2617,7 +2745,23 @@ ${soulsGuidance}
         planner: beamPlanner,
         toolRuntime: {
           execute: async (toolName: string, args: Record<string, unknown>) => {
-            return runRuntimeHandle.toolRuntime.execute(toolName, args);
+            const startedAt = Date.now();
+            try {
+              const result = await executePlannerTool(toolName, args);
+              const success = !/^Error[:\s]|^ERROR:/.test(String(result));
+              return {
+                success,
+                result,
+                error: success ? undefined : String(result).replace(/^Error:\s*/i, ''),
+                durationMs: Date.now() - startedAt,
+              };
+            } catch (error: any) {
+              return {
+                success: false,
+                error: String(error?.message || error),
+                durationMs: Date.now() - startedAt,
+              };
+            }
           },
           resetSession: () => runRuntimeHandle.toolRuntime.resetSession(),
         },

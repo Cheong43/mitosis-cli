@@ -7,7 +7,10 @@
  */
 import crypto from 'crypto';
 import { createOpenAI } from '@ai-sdk/openai';
+import type { OpenAIProvider } from '@ai-sdk/openai';
 import type { LanguageModelV1 } from 'ai';
+
+type OpenAIChatSettings = Parameters<OpenAIProvider['chat']>[1];
 
 export type { LanguageModelV1 };
 
@@ -55,7 +58,7 @@ export function buildHmacFetch(accessKey: string, secretKey: string): typeof glo
  *   2. Gateway (gatewayApiKey) — adds x-gateway-apikey header
  *   3. Plain OpenAI-compatible key (apiKey)
  */
-export function buildLanguageModel(cfg: LLMEndpointConfig): LanguageModelV1 {
+export function buildLanguageModel(cfg: LLMEndpointConfig, chatSettings?: OpenAIChatSettings): LanguageModelV1 {
   const { model, apiKey, baseURL, hmacAccessKey, hmacSecretKey, gatewayApiKey } = cfg;
 
   if (hmacAccessKey && hmacSecretKey) {
@@ -64,7 +67,7 @@ export function buildLanguageModel(cfg: LLMEndpointConfig): LanguageModelV1 {
       baseURL,
       apiKey: hmacAccessKey,
       fetch: buildHmacFetch(hmacAccessKey, hmacSecretKey),
-    })(model);
+    }).chat(model, chatSettings);
   }
 
   if (gatewayApiKey) {
@@ -76,8 +79,8 @@ export function buildLanguageModel(cfg: LLMEndpointConfig): LanguageModelV1 {
         'x-gatewat-apikey': `Bearer ${gatewayApiKey}`,
         'x-gateway-apikey': `Bearer ${gatewayApiKey}`,
       },
-    })(model);
+    }).chat(model, chatSettings);
   }
 
-  return createOpenAI({ apiKey, baseURL })(model);
+  return createOpenAI({ apiKey, baseURL }).chat(model, chatSettings);
 }
