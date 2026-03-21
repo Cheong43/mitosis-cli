@@ -1,9 +1,10 @@
 ---
 name: core-knowledge-curation
 description: "Use when stable, reusable facts should be promoted into Layer 1 core knowledge from source code, docs, configuration, or verified project evidence."
-category: mempedia
-priority: high
-tags: [mempedia, layer1, knowledge]
+metadata:
+  category: mempedia
+  priority: high
+  tags: [mempedia, layer1, knowledge]
 ---
 
 # Core Knowledge Curation

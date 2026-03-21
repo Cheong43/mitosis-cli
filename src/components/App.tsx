@@ -14,6 +14,14 @@ import {
   readUserPreferencesViaCli,
   updateUserPreferencesViaCli,
 } from '../mempedia/cli.js';
+import {
+  findSkillByName,
+  loadWorkspaceSkills as loadSkillsFromRouter,
+  mergeSkills,
+  parseSkillMarkdown as parseSkillMarkdownFromRouter,
+  renderSkillGuidance,
+  type SkillRecord,
+} from '../skills/router.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,18 +44,7 @@ interface HistoryItem {
   traceMeta?: TraceEvent['metadata'];
 }
 
-interface LocalSkill {
-  name: string;
-  description: string;
-  content: string;
-  category?: string;
-  priority?: number;
-  alwaysInclude?: boolean;
-  tags?: string[];
-  source?: 'local' | 'remote';
-  location?: string;
-  repository?: string;
-}
+type LocalSkill = SkillRecord;
 
 interface MempediaSkillRecord {
   id: string;
@@ -299,26 +296,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   };
 
   const loadWorkspaceSkills = (): LocalSkill[] => {
-    const skillRoots = [
-      path.join(codeCliRoot, 'skills'),
-      path.join(codeCliRoot, '.github', 'skills'),
-    ];
-    const loaded: LocalSkill[] = [];
-    for (const root of skillRoots) {
-      if (!fs.existsSync(root)) continue;
-      const skillFiles = listFiles(root).filter((filePath) => path.basename(filePath) === 'SKILL.md');
-      for (const filePath of skillFiles) {
-        try {
-          const markdown = fs.readFileSync(filePath, 'utf-8');
-          const fallbackName = path.basename(path.dirname(filePath)) || 'unnamed-skill';
-          loaded.push(parseSkillMarkdown(markdown, fallbackName, {
-            source: 'local',
-            location: normalizePath(path.relative(projectRoot, filePath)),
-          }));
-        } catch {}
-      }
-    }
-    return sortSkills(loaded);
+    return loadSkillsFromRouter(projectRoot, codeCliRoot);
   };
 
   const loadMemorySnapshot = async () => {
@@ -406,110 +384,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
 
   const normalizePath = (target: string) => target.replace(/\\/g, '/');
 
-  const parseSkillMarkdown = (raw: string, fallbackName: string, extra: Partial<LocalSkill> = {}): LocalSkill => {
-    const frontmatter = raw.match(/^---\s*[\r\n]+([\s\S]*?)\s*[\r\n]+---\s*[\r\n]*/);
-    const body = frontmatter ? raw.slice(frontmatter[0].length).trim() : raw.trim();
-    const meta = frontmatter ? frontmatter[1] : '';
-    const name = meta.match(/name:\s*"?([^"\n]+)"?/i)?.[1]?.trim() || fallbackName;
-    const description = meta.match(/description:\s*"?([^"\n]+)"?/i)?.[1]?.trim() || 'No description';
-    const category = meta.match(/category:\s*"?([^"\n]+)"?/i)?.[1]?.trim();
-    const rawPriority = meta.match(/priority:\s*"?([^"\n]+)"?/i)?.[1]?.trim().toLowerCase();
-    const priority = rawPriority === 'high'
-      ? 100
-      : rawPriority === 'medium'
-        ? 50
-        : rawPriority === 'low'
-          ? 10
-          : Number(rawPriority || 0);
-    const alwaysInclude = /always_include:\s*(true|yes|1)/i.test(meta);
-    const tagBlock = meta.match(/tags:\s*\[([^\]]*)\]/i)?.[1] || '';
-    const tags = tagBlock
-      .split(',')
-      .map((value) => value.replace(/["']/g, '').trim())
-      .filter(Boolean);
-    return {
-      name,
-      description,
-      content: body,
-      category,
-      priority: Number.isFinite(priority) ? priority : 0,
-      alwaysInclude,
-      tags,
-      ...extra,
-    };
-  };
-
-  const sortSkills = (items: LocalSkill[]) => [...items].sort((a, b) => a.name.localeCompare(b.name));
-
-  const mergeSkills = (...groups: LocalSkill[][]) => {
-    const merged = new Map<string, LocalSkill>();
-    for (const group of groups) {
-      for (const skill of group) {
-        const key = `${skill.source || 'local'}::${skill.location || skill.name}`;
-        if (!merged.has(key)) {
-          merged.set(key, skill);
-        }
-      }
-    }
-    return sortSkills([...merged.values()]);
-  };
-
   const availableSkills = () => mergeSkills(skills, remoteSkills);
-
-  const tokenizeForSkillMatch = (value: string) => {
-    const matches = value.toLowerCase().match(/[\p{L}\p{N}_-]+/gu) || [];
-    return [...new Set(matches.filter((token) => token.length >= 2))];
-  };
-
-  const scoreSkillMatch = (query: string, skill: LocalSkill) => {
-    const queryTokens = tokenizeForSkillMatch(query);
-    if (queryTokens.length === 0) return 0;
-    const skillName = skill.name.toLowerCase();
-    const skillDescription = skill.description.toLowerCase();
-    const skillBody = skill.content.toLowerCase().slice(0, 1600);
-    let score = 0;
-    for (const token of queryTokens) {
-      if (skillName.includes(token)) {
-        score += 3;
-      } else if (skillDescription.includes(token)) {
-        score += 2;
-      } else if (skillBody.includes(token)) {
-        score += 1;
-      }
-    }
-    return score / queryTokens.length;
-  };
-
-  const isMempediaSkill = (skill: LocalSkill) => {
-    return skill.category === 'mempedia' || (skill.tags || []).includes('mempedia');
-  };
-
-  const selectAutoSkills = (query: string) => {
-    const pinned = skills
-      .filter((skill) => skill.alwaysInclude && isMempediaSkill(skill))
-      .sort((a, b) => (b.priority || 0) - (a.priority || 0) || a.name.localeCompare(b.name));
-
-    const ranked = skills
-      .map((skill) => {
-        const score = scoreSkillMatch(query, skill);
-        const priorityBonus = (skill.priority || 0) / 100;
-        const mempediaBonus = isMempediaSkill(skill) ? 0.5 : 0;
-        return { skill, score: score + priorityBonus + mempediaBonus };
-      })
-      .filter((item) => item.skill.alwaysInclude || item.score >= (isMempediaSkill(item.skill) ? 0.75 : 1))
-      .sort((a, b) => b.score - a.score || a.skill.name.localeCompare(b.skill.name))
-      .map((item) => item.skill);
-
-    const merged = new Map<string, LocalSkill>();
-    for (const skill of [...pinned, ...ranked]) {
-      const key = `${skill.source || 'local'}::${skill.location || skill.name}`;
-      if (!merged.has(key)) {
-        merged.set(key, skill);
-      }
-    }
-
-    return [...merged.values()].slice(0, 3);
-  };
 
   const formatSkillLabel = (skill: LocalSkill) => {
     const source = skill.source === 'remote' ? `remote${skill.repository ? `:${skill.repository}` : ''}` : 'local';
@@ -517,12 +392,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   };
 
   const findSkill = (targetName: string) => {
-    const normalized = targetName.trim().toLowerCase();
-    return availableSkills().find((skill) => {
-      const name = skill.name.toLowerCase();
-      const repository = skill.repository?.toLowerCase() || '';
-      return name === normalized || name.endsWith(`/${normalized}`) || name.includes(normalized) || repository.includes(normalized);
-    });
+    return findSkillByName(availableSkills(), targetName);
   };
 
   const githubHeaders = () => {
@@ -576,7 +446,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
         if (!markdown.trim()) {
           return null;
         }
-        return parseSkillMarkdown(markdown, item.path || 'remote-skill', {
+        return parseSkillMarkdownFromRouter(markdown, item.path || 'remote-skill', {
           source: 'remote',
           repository: item.repository?.full_name,
           location: item.html_url || item.repository?.html_url || item.url,
@@ -590,13 +460,10 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
 
   const formatPromptWithSkill = (query: string, oneShotSkill?: LocalSkill | null) => {
     const explicitSkill = oneShotSkill || activeSkill;
-    const selectedSkills = explicitSkill ? [explicitSkill] : selectAutoSkills(query);
-    if (selectedSkills.length === 0) {
+    if (!explicitSkill) {
       return query;
     }
-    const rendered = selectedSkills
-      .map((skill) => `Skill: ${skill.name}\nDescription: ${skill.description}\nContent:\n${skill.content}`)
-      .join('\n\n---\n\n');
+    const rendered = renderSkillGuidance([explicitSkill]);
     return `Internal skill guidance for this turn:\nThese skills are internal behavioral guidance only. They are not part of the user's request, not evidence to analyze, not files to verify, and not content to summarize back to the user unless the user explicitly asks about skills. Do not inspect the skills directory just to confirm they exist. Do not emit a skill name in tool_calls.name. Use only actual tool names from the system tool catalog.\n\n${rendered}\n\nActual User Request:\n${query}`;
   };
 
@@ -1742,7 +1609,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   return (
     <Box flexDirection="column" padding={1}>
       <Text color="green" bold>Mempedia CodeCLI (Branching ReAct Agent)</Text>
-      <Text color="dim">Skill: {activeSkill ? formatSkillLabel(activeSkill) : 'none'} | Use /skills or /skills search</Text>
+      <Text color="dim">Manual skill: {activeSkill ? formatSkillLabel(activeSkill) : 'none'} | Local catalog: {skills.length} | Agent auto-loads on demand | /skills to inspect</Text>
       <Text color="dim">UI: {uiUrl || 'stopped'} | /ui start to launch mempedia-ui</Text>
       <Text color="dim">Trace log: {traceLogExpanded ? 'expanded' : 'collapsed'} | /tracelog to toggle</Text>
       {branchLoop && (

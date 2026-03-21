@@ -93,7 +93,7 @@ export async function installWorkspaceSkillFromLibraryViaCli(
   projectRoot: string,
   skillId: string,
   overwrite = false,
-  codeCliRoot = resolveCodeCliRoot(moduleDir),
+  _codeCliRoot = resolveCodeCliRoot(moduleDir),
 ): Promise<SkillInstallResult> {
   const normalizedSkillId = skillId.trim();
   if (!normalizedSkillId) {
@@ -112,7 +112,7 @@ export async function installWorkspaceSkillFromLibraryViaCli(
     };
   }
 
-  const skillFolder = path.join(codeCliRoot, 'skills', toSlug(normalizedSkillId));
+  const skillFolder = path.join(projectRoot, 'skills', toSlug(normalizedSkillId));
   const skillFilePath = path.join(skillFolder, 'SKILL.md');
   if (!overwrite && fs.existsSync(skillFilePath)) {
     return {

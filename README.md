@@ -14,7 +14,7 @@ A React-based CLI agent that interacts with Mempedia for context and knowledge m
    ```bash
    cd ..
    cargo build --release
-   cd mempedia-codecli
+   cd mitosis-cli
    ```
 
 2. Install dependencies:
@@ -23,7 +23,7 @@ A React-based CLI agent that interacts with Mempedia for context and knowledge m
    ```
 
 3. Configure Environment:
-   Create a `.env` file in `mempedia-codecli`.
+   Create a `.env` file in `mitosis-cli`.
    
    For Ark/Doubao (Recommended):
    ```
@@ -103,7 +103,7 @@ A React-based CLI agent that interacts with Mempedia for context and knowledge m
 npm start
 ```
 
-By default, CodeCLI stores runtime state under `mempedia-codecli/.mempedia`.
+By default, CodeCLI stores runtime state under `mitosis-cli/.mempedia`.
 Set `MEMPEDIA_PROJECT_ROOT` only if you intentionally want `.mempedia` written somewhere else.
 
 ## Claude Code Skills Compatibility

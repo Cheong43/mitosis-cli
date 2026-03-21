@@ -1,9 +1,10 @@
 ---
 name: episodic-capture
 description: "Use when the interaction is a transient event, greeting, one-off task update, or short-lived conversational episode that should stay in Layer 2 episodic memory."
-category: mempedia
-priority: high
-tags: [mempedia, layer2, episodic]
+metadata:
+  category: mempedia
+  priority: high
+  tags: [mempedia, layer2, episodic]
 ---
 
 # Episodic Capture

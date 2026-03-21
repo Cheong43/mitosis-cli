@@ -16,8 +16,36 @@ function findNearestAncestor(startDir: string, predicate: (dir: string) => boole
 }
 
 function isCodeCliRepoRoot(dir: string): boolean {
-  return fs.existsSync(path.join(dir, 'package.json'))
-    && fs.existsSync(path.join(dir, 'src'));
+  const packagePath = path.join(dir, 'package.json');
+  if (!fs.existsSync(packagePath) || !fs.existsSync(path.join(dir, 'src'))) {
+    return false;
+  }
+
+  try {
+    const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf-8'));
+    if (pkg && pkg.name === 'mitosis-cli') {
+      return true;
+    }
+  } catch {}
+
+  return fs.existsSync(path.join(dir, 'souls.md'))
+    && fs.existsSync(path.join(dir, 'src', 'index.tsx'));
+}
+
+export function resolveWorkspaceSkillRoots(projectRoot: string, codeCliRoot: string): string[] {
+  const roots = [
+    path.join(projectRoot, 'skills'),
+    path.join(projectRoot, '.github', 'skills'),
+  ];
+  const normalizedProjectRoot = path.resolve(projectRoot);
+  const normalizedCodeCliRoot = path.resolve(codeCliRoot);
+  if (normalizedCodeCliRoot !== normalizedProjectRoot) {
+    roots.push(
+      path.join(codeCliRoot, 'skills'),
+      path.join(codeCliRoot, '.github', 'skills'),
+    );
+  }
+  return [...new Set(roots.map((root) => path.resolve(root)))];
 }
 
 export function resolveCodeCliRoot(moduleDir: string): string {

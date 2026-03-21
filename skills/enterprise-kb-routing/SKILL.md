@@ -1,10 +1,11 @@
 ---
 name: enterprise-kb-routing
 description: "Use on every run inside Mempedia so the agent behaves like an enterprise knowledge-base operator: search evidence first, update the correct memory layer, and treat skills as reusable operating procedures."
-category: mempedia
-priority: high
-always_include: true
-tags: [mempedia, enterprise-kb, routing]
+metadata:
+  category: mempedia
+  priority: high
+  always_include: true
+  tags: [mempedia, enterprise-kb, routing]
 ---
 
 # Enterprise KB Routing

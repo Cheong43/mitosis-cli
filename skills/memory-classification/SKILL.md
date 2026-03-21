@@ -1,9 +1,10 @@
 ---
 name: memory-classification
 description: "Use for the independent post-turn memory agent that classifies each completed conversation into the four Mempedia layers before saving."
-category: mempedia
-priority: high
-tags: [mempedia, memory, classifier]
+metadata:
+  category: mempedia
+  priority: high
+  tags: [mempedia, memory, classifier]
 ---
 
 # Memory Classification

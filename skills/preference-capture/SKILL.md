@@ -1,9 +1,10 @@
 ---
 name: preference-capture
 description: "Use when the user expresses a stable preference, working style, formatting requirement, or persistent constraint that belongs in Layer 3 user preferences."
-category: mempedia
-priority: high
-tags: [mempedia, layer3, preferences]
+metadata:
+  category: mempedia
+  priority: high
+  tags: [mempedia, layer3, preferences]
 ---
 
 # Preference Capture

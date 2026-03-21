@@ -1,4 +1,5 @@
 import { TranscriptMessage, AgentStep, PlannedBranch, PlannedToolCall } from './types.js';
+import { parseJsonish } from '../../utils/jsonish.js';
 
 /**
  * SimplePlanner implements a minimal ReAct-style planning step.
@@ -60,15 +61,9 @@ export class SimplePlanner implements Planner {
   }
 
   private parse(raw: string): AgentStep {
-    // Strip markdown code fences if present.
-    const stripped = raw
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/\s*```\s*$/, '')
-      .trim();
-
     let parsed: Record<string, unknown>;
     try {
-      parsed = JSON.parse(stripped);
+      parsed = parseJsonish(raw) as Record<string, unknown>;
     } catch {
       // If the model returned plain text, treat it as a final answer.
       return { kind: 'final', content: raw.trim() };

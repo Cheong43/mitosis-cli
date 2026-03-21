@@ -13,6 +13,14 @@ import { TOOLS, TOOL_NAMES } from '../tools/definitions.js';
 import { installWorkspaceSkillFromLibraryViaCli } from '../mempedia/cli.js';
 import { MemoryClassifierAgent } from './MemoryClassifierAgent.js';
 import { fileURLToPath } from 'url';
+import { extractJsonishCandidates, extractJsonishText, parseJsonish } from '../utils/jsonish.js';
+import {
+  loadWorkspaceSkills,
+  renderSkillCatalog,
+  renderSkillGuidance,
+  resolveSkillsByName,
+  type SkillRecord,
+} from '../skills/router.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,10 +43,11 @@ const PlannerBranchSchema = z.object({
 });
 
 const PlannerDecisionSchema = z.object({
-  kind: z.enum(['tool', 'branch', 'final']),
+  kind: z.enum(['tool', 'branch', 'final', 'skills']),
   thought: z.string().trim().min(1),
   tool_calls: z.array(PlannerToolCallSchema).optional(),
   branches: z.array(PlannerBranchSchema).optional(),
+  skills_to_load: z.array(z.string().trim().min(1)).max(2).optional(),
   final_answer: z.string().optional(),
   completion_summary: z.string().trim().min(1).max(280).optional(),
 });
@@ -410,53 +419,6 @@ export class Agent {
       } catch {}
     }
     return '';
-  }
-
-  /**
-   * Scan mempedia-codecli/skills/* /SKILL.md and return a compact index string
-   * listing each skill's name and its description (from YAML frontmatter or first heading).
-   * Used to keep the system prompt informed of all available skills on every turn.
-   */
-  private loadLocalSkillsIndex(): string {
-    const skillsDir = path.join(this.codeCliRoot, 'skills');
-    try {
-      if (!fs.existsSync(skillsDir)) {
-        return '';
-      }
-      const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
-      const lines: string[] = [];
-      for (const entry of entries) {
-        if (!entry.isDirectory()) {
-          continue;
-        }
-        const skillFile = path.join(skillsDir, entry.name, 'SKILL.md');
-        if (!fs.existsSync(skillFile)) {
-          continue;
-        }
-        let description = '';
-        try {
-          const raw = fs.readFileSync(skillFile, 'utf-8');
-          // Extract description from YAML frontmatter
-          const fmMatch = raw.match(/^---\n[\s\S]*?^description:\s*(.+)$/m);
-          if (fmMatch) {
-            description = fmMatch[1].replace(/^["']|["']$/g, '').trim();
-          } else {
-            // Fall back to first non-empty heading or paragraph line
-            const headingMatch = raw.replace(/^---[\s\S]*?---\n/m, '').match(/^#+ (.+)$/m);
-            if (headingMatch) {
-              description = headingMatch[1].trim();
-            }
-          }
-        } catch {}
-        lines.push(`  - ${entry.name}${description ? `: ${description}` : ''}`);
-      }
-      if (lines.length === 0) {
-        return '';
-      }
-      return `Available local skills (read mitosis-cli/skills/<name>/SKILL.md for full guidance before using):\n${lines.join('\n')}`;
-    } catch {
-      return '';
-    }
   }
 
   /**
@@ -1624,14 +1586,24 @@ export class Agent {
                 content: `Current user request:\n${input}\n\nSelected recent conversation turns:\n${recentTurnsText}\n\nRecalled context candidates:\n${candidateList}`,
               },
             ],
+            providerOptions: { openai: { responseFormat: { type: 'json_object' } } },
           }),
           this.agentLlmTimeoutMs,
           'context_selection llm'
         )
       );
-      const raw = _contextRaw.trim();
-      const jsonText = raw.startsWith('{') ? raw : raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1);
-      const parsed = ContextSelectionSchema.parse(JSON.parse(jsonText));
+      const parsed = (() => {
+        const candidates = extractJsonishCandidates(_contextRaw);
+        for (const candidate of candidates) {
+          try {
+            const parsedCandidate = ContextSelectionSchema.parse(parseJsonish(candidate));
+            if (Array.isArray(parsedCandidate.relevant_node_ids)) {
+              return parsedCandidate;
+            }
+          } catch {}
+        }
+        return ContextSelectionSchema.parse(parseJsonish(_contextRaw));
+      })();
       const allowed = new Set(parsed.relevant_node_ids);
       const selected = candidates.filter((candidate) => allowed.has(candidate.nodeId)).slice(0, 3);
       if (selected.length > 0) {
@@ -2118,7 +2090,8 @@ export class Agent {
     let recalledNodeIds: string[] = [];
     let selectedNodeIds: string[] = [];
     const soulsGuidance = this.loadSoulsMarkdown();
-    const localSkillsIndex = this.loadLocalSkillsIndex();
+    const availableSkills = loadWorkspaceSkills(this.projectRoot, this.codeCliRoot);
+    const localSkillsIndex = renderSkillCatalog(availableSkills);
     const rawAutoQueueMemorySave = String(process.env.AUTO_QUEUE_MEMORY_SAVE ?? '1').toLowerCase();
     const autoQueueMemorySave = rawAutoQueueMemorySave !== '0' && rawAutoQueueMemorySave !== 'false' && rawAutoQueueMemorySave !== 'off';
     let memoryQueuedThisRun = false;
@@ -2158,7 +2131,7 @@ You only use five top-level tools:
   bash   -> run sandboxed shell commands
   web    -> search/fetch external web content when repository evidence is insufficient
 
-Local skills come from workspace SKILL.md files under mitosis-cli/skills/*/SKILL.md and are available by default.
+Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md and ./.github/skills/*/SKILL.md.
 ${localSkillsIndex ? `${localSkillsIndex}\n` : ''}Skills are guidance documents, not tool names. Never emit skill names such as project-discovery in tool_calls.name.
 If skill guidance has been injected for the turn, treat it as internal policy only. Do not inspect the skills directory, verify skill files, or summarize skill text back to the user unless the user explicitly asked about skills.
 When you save knowledge, prefer markdown-first notes that preserve concrete facts, numbers, data points, historical changes, viewpoints, evidence, and explicit uncertainties instead of terse summaries.
@@ -2168,8 +2141,9 @@ You must return exactly one JSON object on every loop iteration. Do not use mark
 
 Allowed JSON schema:
 {
-  "kind": "tool" | "branch" | "final",
+  "kind": "tool" | "branch" | "final" | "skills",
   "thought": "string",
+  "skills_to_load": ["skill-name"],
   "tool_calls": [{ "name": "tool_name", "arguments": {}, "goal": "optional" }],
   "branches": [{ "label": "short label", "goal": "what this child branch should try", "why": "optional", "priority": 0.0 }],
   "final_answer": "string",
@@ -2184,12 +2158,14 @@ Rules:
 5. Prefer search before edit when the correct answer may already exist in repository files.
 6. For repository discovery, prefer read and search on workspace evidence before using web.
 7. Prefer relative file paths rooted at the current project. Use absolute paths only when necessary for clarity or when the tool requires them.
-8. Local skills that are already auto-injected usually do not need to be read again manually.
+8. The skill catalog is lightweight; request full skill guidance only when it materially changes the next step.
 9. Do not answer a project-overview question by listing local skills unless the user explicitly asked about the skill system.
 10. Use bash whenever shell is the practical tool, but remember dangerous shell operations are sandboxed and should require confirmation.
 11. Use web only when repository evidence is insufficient.
 12. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
 13. When you finish, return kind="final" with a direct user-facing answer.
+14. If the skill catalog is insufficient and you need the full guidance of one or two local skills, return kind="skills" with skills_to_load and no tool_calls, branches, or final_answer.
+15. Request full skill guidance only when it materially changes the next step.
 
 Available tools:
 ${toolCatalog}
@@ -2225,6 +2201,49 @@ ${soulsGuidance}
       return String(content);
     };
 
+    const loadedSkillMarker = 'SKILL ROUTER LOAD:';
+
+    const getLoadedSkillNames = (transcript: Array<{ role: string; content: string }>) => {
+      const loaded = new Set<string>();
+      for (const message of transcript) {
+        if (message.role !== 'assistant' || typeof message.content !== 'string') {
+          continue;
+        }
+        if (!message.content.startsWith(loadedSkillMarker)) {
+          continue;
+        }
+        const match = message.content.match(/Loaded skills:\s*([^\n]+)/i);
+        if (!match) {
+          continue;
+        }
+        for (const part of match[1].split(',')) {
+          const normalized = part.trim().toLowerCase();
+          if (normalized) {
+            loaded.add(normalized);
+          }
+        }
+      }
+      return loaded;
+    };
+
+    const appendSkillGuidance = (
+      transcript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+      skillsToInject: SkillRecord[],
+    ) => {
+      if (skillsToInject.length === 0) {
+        return transcript;
+      }
+      const names = skillsToInject.map((skill) => skill.name).join(', ');
+      return [
+        ...transcript,
+        { role: 'assistant' as const, content: `${loadedSkillMarker} Loaded skills: ${names}` },
+        {
+          role: 'user' as const,
+          content: `Skill Router loaded the following full guidance because you requested it:\n\n${renderSkillGuidance(skillsToInject)}\n\nContinue the current ReAct step and return exactly one JSON object.`
+        },
+      ];
+    };
+
     const traceMeta = (branch: BranchState, extra: Record<string, unknown> = {}) => ({
       branchId: branch.id,
       parentBranchId: branch.parentId,
@@ -2244,55 +2263,160 @@ ${soulsGuidance}
     };
 
     const parseDecision = (raw: string): PlannerDecision => {
-      const trimmed = raw.trim();
-      const withoutFence = trimmed
-        .replace(/^```json\s*/i, '')
-        .replace(/^```\s*/i, '')
-        .replace(/```$/i, '')
-        .trim();
-      let jsonText = withoutFence;
-      if (!jsonText.startsWith('{')) {
-        const start = jsonText.indexOf('{');
-        const end = jsonText.lastIndexOf('}');
-        if (start >= 0 && end > start) {
-          jsonText = jsonText.slice(start, end + 1);
-        }
-      }
-      const parsed = JSON.parse(jsonText);
-      const obj = Array.isArray(parsed) ? (parsed[0] || {}) : parsed;
-      const normalized: Record<string, unknown> = obj && typeof obj === 'object' ? { ...obj } : {};
+      const rawTrimmed = raw.trim();
+      const candidates = extractJsonishCandidates(raw);
+      let normalized: Record<string, unknown> | null = null;
 
-      if (typeof normalized.kind !== 'string') {
-        if (typeof normalized.final_answer === 'string') {
-          normalized.kind = 'final';
-        } else if (Array.isArray(normalized.tool_calls)) {
-          normalized.kind = 'tool';
-        } else if (Array.isArray(normalized.branches)) {
-          normalized.kind = 'branch';
+      for (const candidate of candidates) {
+        let parsed: unknown;
+        try {
+          parsed = parseJsonish(candidate);
+        } catch {
+          continue;
+        }
+        const obj = Array.isArray(parsed) ? (parsed[0] || {}) : parsed;
+        if (!obj || typeof obj !== 'object') {
+          continue;
+        }
+        const probe: Record<string, unknown> = { ...obj as Record<string, unknown> };
+        const inferredKind = typeof probe.kind === 'string'
+          ? probe.kind
+          : Array.isArray(probe.skills_to_load) && probe.skills_to_load.length > 0
+            ? 'skills'
+          : typeof probe.final_answer === 'string' || typeof probe.finalAnswer === 'string' || typeof probe.answer === 'string' || typeof probe.content === 'string'
+            ? 'final'
+            : Array.isArray(probe.tool_calls)
+              ? 'tool'
+              : Array.isArray(probe.branches)
+                ? 'branch'
+                : null;
+        if (!inferredKind) {
+          continue;
+        }
+        probe.kind = inferredKind;
+        if (inferredKind === 'final') {
+          const finalAnswer = [probe.final_answer, probe.finalAnswer, probe.answer, probe.content]
+            .find((value) => typeof value === 'string' && value.trim().length > 0);
+          if (typeof finalAnswer !== 'string') {
+            continue;
+          }
+          probe.final_answer = finalAnswer;
+        }
+        if (inferredKind === 'tool' && (!Array.isArray(probe.tool_calls) || probe.tool_calls.length === 0)) {
+          continue;
+        }
+        if (inferredKind === 'branch' && (!Array.isArray(probe.branches) || probe.branches.length === 0)) {
+          continue;
+        }
+        if (inferredKind === 'skills' && (!Array.isArray(probe.skills_to_load) || probe.skills_to_load.length === 0)) {
+          continue;
+        }
+        normalized = probe;
+        break;
+      }
+
+      if (!normalized) {
+        const looksLikePromptEcho = /Original user request:|Current branch state:|Skill:|MEMPEDIA_BINARY_PATH|agent_upsert_markdown|list_skills|record_episodic/i.test(rawTrimmed);
+        return PlannerDecisionSchema.parse({
+          kind: 'final',
+          thought: 'Planner returned no valid structured decision; using fallback final answer.',
+          final_answer: rawTrimmed && !looksLikePromptEcho
+            ? rawTrimmed
+            : '抱歉，当前没有生成有效回答。请重试一次。',
+        });
+      }
+
+      const normalizedRecord: Record<string, unknown> = normalized;
+
+      if (typeof normalizedRecord.kind !== 'string') {
+        if (typeof normalizedRecord.final_answer === 'string') {
+          normalizedRecord.kind = 'final';
+        } else if (Array.isArray(normalizedRecord.tool_calls)) {
+          normalizedRecord.kind = 'tool';
+        } else if (Array.isArray(normalizedRecord.skills_to_load)) {
+          normalizedRecord.kind = 'skills';
+        } else if (Array.isArray(normalizedRecord.branches)) {
+          normalizedRecord.kind = 'branch';
         } else {
-          normalized.kind = 'final';
+          normalizedRecord.kind = 'final';
         }
       }
 
-      if (typeof normalized.thought !== 'string' || !normalized.thought.trim()) {
-        const kind = String(normalized.kind || 'tool');
-        if (kind === 'tool' && Array.isArray(normalized.tool_calls)) {
-          const names = normalized.tool_calls
+      if (typeof normalizedRecord.thought !== 'string' || !normalizedRecord.thought.trim()) {
+        const kind = String(normalizedRecord.kind || 'tool');
+        if (kind === 'tool' && Array.isArray(normalizedRecord.tool_calls)) {
+          const names = normalizedRecord.tool_calls
             .map((call: any) => (call && typeof call.name === 'string' ? call.name : 'tool'))
             .filter((name: string) => name.length > 0)
             .slice(0, 3)
             .join(', ');
-          normalized.thought = names
+          normalizedRecord.thought = names
             ? `Call tools for progress: ${names}`
             : 'Call tool to gather required context.';
         } else if (kind === 'branch') {
-          normalized.thought = 'Split into distinct strategies to improve solution quality.';
+          normalizedRecord.thought = 'Split into distinct strategies to improve solution quality.';
+        } else if (kind === 'skills') {
+          normalizedRecord.thought = 'Load additional skill guidance before the next planning step.';
         } else {
-          normalized.thought = 'Provide the final answer for the user.';
+          normalizedRecord.thought = 'Provide the final answer for the user.';
         }
       }
 
-      return PlannerDecisionSchema.parse(normalized);
+      if (normalizedRecord.kind === 'skills' && (!Array.isArray(normalizedRecord.skills_to_load) || normalizedRecord.skills_to_load.length === 0)) {
+        normalizedRecord.kind = 'final';
+        normalizedRecord.final_answer = '抱歉，当前没有生成有效回答。请重试一次。';
+      }
+
+      if (normalizedRecord.kind === 'final' && (typeof normalizedRecord.final_answer !== 'string' || !normalizedRecord.final_answer.trim())) {
+        const fallback = [normalizedRecord.answer, normalizedRecord.content, normalizedRecord.finalAnswer]
+          .find((value) => typeof value === 'string' && value.trim().length > 0);
+        if (typeof fallback === 'string') {
+          normalizedRecord.final_answer = fallback;
+        } else {
+          normalizedRecord.final_answer = '抱歉，当前没有生成有效回答。请重试一次。';
+        }
+      }
+
+      return PlannerDecisionSchema.parse(normalizedRecord);
+    };
+
+    const planWithSkillRouting = async (
+      initialTranscript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+      invoke: (transcript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>) => Promise<string>,
+    ): Promise<PlannerDecision> => {
+      let workingTranscript = initialTranscript;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const raw = await invoke(workingTranscript);
+        const decision = parseDecision(raw);
+        if (decision.kind !== 'skills') {
+          return decision;
+        }
+        const requestedNames = Array.isArray(decision.skills_to_load) ? decision.skills_to_load : [];
+        const loadedSkillNames = getLoadedSkillNames(workingTranscript);
+        const skillsToInject = resolveSkillsByName(availableSkills, requestedNames, 2)
+          .filter((skill) => !loadedSkillNames.has(skill.name.toLowerCase()));
+        if (skillsToInject.length === 0) {
+          emitTrace({
+            type: 'observation',
+            content: `Skill router could not resolve requested skills: ${requestedNames.join(', ') || '(none)'}.`,
+          });
+          return {
+            kind: 'final',
+            thought: 'Skill router request could not be resolved to new skills; using fallback final answer.',
+            final_answer: '抱歉，当前请求的技能不可用。请重试或手动指定技能。',
+          } as PlannerDecision;
+        }
+        emitTrace({
+          type: 'observation',
+          content: `Skill router loaded local guidance: ${skillsToInject.map((skill) => skill.name).join(', ')}.`,
+        });
+        workingTranscript = appendSkillGuidance(workingTranscript, skillsToInject);
+      }
+      return {
+        kind: 'final',
+        thought: 'Skill router exceeded load attempts; using fallback final answer.',
+        final_answer: '抱歉，技能路由未能收敛为有效回答。请重试一次。',
+      } as PlannerDecision;
     };
 
     const buildBranchMemoryJob = (
@@ -2465,18 +2589,23 @@ ${soulsGuidance}
       emitTrace({ type: 'thought', content: `Using beam-search mode (width=${this.beamWidth}, depth=${this.beamMaxDepth}, expansion=${this.beamExpansionFactor}).` });
       const beamPlanner = {
         plan: async (transcript: Array<{ role: string; content: string }>) => {
-          const { text: _planText } = await this.measure(perfEntries, `beam_llm_plan`, async () =>
-            this.withTimeout(
-              generateText({
-                model: this.openai,
-                messages: transcript as any,
-              }),
-              this.agentLlmTimeoutMs,
-              'beam_plan llm'
-            )
+          const decision = await planWithSkillRouting(
+            transcript as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+            async (workingTranscript) => {
+              const { text: _planText } = await this.measure(perfEntries, `beam_llm_plan`, async () =>
+                this.withTimeout(
+                  generateText({
+                    model: this.openai,
+                    messages: workingTranscript as any,
+                    providerOptions: { openai: { responseFormat: { type: 'json_object' } } },
+                  }),
+                  this.agentLlmTimeoutMs,
+                  'beam_plan llm'
+                )
+              );
+              return extractText(_planText);
+            }
           );
-          const raw = extractText(_planText);
-          const decision = parseDecision(raw);
           if (decision.kind === 'tool') {
             return { kind: 'tool' as const, thought: decision.thought, toolCalls: decision.tool_calls || [] };
           }
@@ -2518,18 +2647,23 @@ ${soulsGuidance}
       maxCompletedBranches: this.branchMaxCompleted,
       branchConcurrency: this.branchConcurrency,
       planBranch: async ({ branch }) => {
-        const { text: _planText } = await this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
-          this.withTimeout(
-            generateText({
-              model: this.openai,
-              messages: (buildMessages(branch as BranchState) as any),
-            }),
-            this.agentLlmTimeoutMs,
-            `planBranch_${branch.id} llm`
-          )
+        const decision = await planWithSkillRouting(
+          buildMessages(branch as BranchState) as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+          async (workingTranscript) => {
+            const { text: _planText } = await this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
+              this.withTimeout(
+                generateText({
+                  model: this.openai,
+                  messages: workingTranscript as any,
+                  providerOptions: { openai: { responseFormat: { type: 'json_object' } } },
+                }),
+                this.agentLlmTimeoutMs,
+                `planBranch_${branch.id} llm`
+              )
+            );
+            return extractText(_planText);
+          }
         );
-        const raw = extractText(_planText);
-        const decision = parseDecision(raw);
         return decision.kind === 'tool'
           ? { kind: 'tool', thought: decision.thought, toolCalls: decision.tool_calls || [] }
           : decision.kind === 'branch'

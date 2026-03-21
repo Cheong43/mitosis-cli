@@ -1,9 +1,10 @@
 ---
 name: skill-authoring
 description: "Use when a repeatable workflow should become a reusable skill document, and create or update a corresponding skills/<name>/SKILL.md file."
-category: mempedia
-priority: high
-tags: [mempedia, layer4, skills]
+metadata:
+  category: mempedia
+  priority: high
+  tags: [mempedia, layer4, skills]
 ---
 
 # Skill Authoring

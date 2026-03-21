@@ -44,7 +44,7 @@ test('skill library helper reads library records through the mempedia CLI', asyn
 test('skill install helper downloads a library skill into local skills directory', async () => {
   const projectRoot = createTempDir('mempedia-cli-install-project-');
   const codeCliRoot = createTempDir('mempedia-cli-install-codecli-');
-  fs.mkdirSync(path.join(codeCliRoot, 'skills'), { recursive: true });
+  fs.mkdirSync(path.join(projectRoot, 'skills'), { recursive: true });
 
   await executeMempediaCliAction(__dirname, projectRoot, {
     action: 'upsert_skill',
@@ -64,6 +64,7 @@ test('skill install helper downloads a library skill into local skills directory
 
   assert.equal(installed.kind, 'skill_installed');
   assert.ok(installed.path);
+  assert.ok(installed.path!.startsWith(path.join(projectRoot, 'skills')));
   assert.ok(fs.existsSync(installed.path!));
 
   const markdown = fs.readFileSync(installed.path!, 'utf-8');
