@@ -5,6 +5,7 @@ import { Agent, TraceEvent } from '../agent/index.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
+import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveCodeCliRoot } from '../config/projectPaths.js';
 import {
@@ -211,6 +212,71 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
 
   const runMempediaCliAction = async (payload: Record<string, unknown>) => {
     return executeMempediaCliAction(__dirname, projectRoot, payload);
+  };
+
+  // ── Real mempedia binary helper ───────────────────────────────────────────
+  const resolveMempediaBinary = (): string | null => {
+    if (process.env.MEMPEDIA_BINARY) return process.env.MEMPEDIA_BINARY;
+    const candidates = [
+      path.join(projectRoot, '..', '..', 'target', 'release', 'mempedia'),
+      path.join(projectRoot, '..', 'target', 'release', 'mempedia'),
+      path.join(projectRoot, 'target', 'release', 'mempedia'),
+    ];
+    for (const c of candidates) {
+      try { if (fs.existsSync(c)) return c; } catch {}
+    }
+    return null;
+  };
+
+  const callMempediaBinary = (action: Record<string, unknown>): Record<string, unknown> => {
+    const bin = resolveMempediaBinary();
+    if (!bin) return { kind: 'error', message: 'mempedia binary not found. Set MEMPEDIA_BINARY env var.' };
+    const result = spawnSync(bin, ['--project', projectRoot, '--action', JSON.stringify(action)], {
+      encoding: 'utf-8',
+      timeout: 30000,
+    });
+    if (result.error) return { kind: 'error', message: result.error.message };
+    if (result.status !== 0) return { kind: 'error', message: (result.stderr || '').trim() || `binary exited ${result.status}` };
+    const out = (result.stdout || '').trim();
+    if (!out) return { kind: 'error', message: 'binary produced no output' };
+    try { return JSON.parse(out); } catch { return { kind: 'error', message: 'could not parse binary output: ' + out.slice(0, 200) }; }
+  };
+
+  const memoryRoot = () => path.join(projectRoot, '.mempedia', 'memory');
+
+  const readVersionObject = (hash: string): Record<string, unknown> | null => {
+    const prefix = hash.slice(0, 2);
+    return readJsonOptional(path.join(memoryRoot(), 'objects', prefix, `${hash}.json`));
+  };
+
+  // Read node markdown directly from the knowledge/nodes directory
+  const readNodeMarkdownFs = (nodeId: string): { markdown: string; version?: string } | null => {
+    const kDir = path.join(memoryRoot(), 'knowledge', 'nodes');
+    if (!fs.existsSync(kDir)) return null;
+    const files = listFiles(kDir).filter((f) => f.endsWith('.md'));
+    for (const file of files) {
+      try {
+        const md = fs.readFileSync(file, 'utf-8');
+        const found = parseFrontmatterNodeId(md);
+        if (found === nodeId) {
+          const stateData = readJsonOptional(path.join(memoryRoot(), 'index', 'state.json')) || {};
+          const h = (stateData as any).heads?.[nodeId] || undefined;
+          return { markdown: md, version: h };
+        }
+      } catch {}
+    }
+    // fallback: match by filename slug
+    const slug = nodeId.replace(/[^a-z0-9]/gi, '-').replace(/-+/g, '-').slice(0, 72).toLowerCase();
+    for (const file of files) {
+      const base = path.basename(file, '.md');
+      if (base.startsWith(slug.slice(0, 8))) {
+        try {
+          const md = fs.readFileSync(file, 'utf-8');
+          return { markdown: md };
+        } catch {}
+      }
+    }
+    return null;
   };
 
   useEffect(() => {
@@ -763,21 +829,13 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             writeJson(res, 400, { ok: false, error: 'node_id is required' });
             return;
           }
-          const result = await agent.sendMempediaAction({
-            action: 'open_node',
-            node_id: nodeId,
-            markdown: true,
-            agent_id: 'ui-editor',
-          });
-          if ((result as any)?.kind === 'error') {
-            writeJson(res, 400, { ok: false, error: (result as any).message || 'Failed to open node' });
+          // Filesystem read — no binary required
+          const found = readNodeMarkdownFs(nodeId);
+          if (!found) {
+            writeJson(res, 404, { ok: false, error: `Node not found: ${nodeId}` });
             return;
           }
-          if ((result as any)?.kind !== 'markdown') {
-            writeJson(res, 500, { ok: false, error: 'Unexpected response while opening node' });
-            return;
-          }
-          writeJson(res, 200, { ok: true, ...(result as any) });
+          writeJson(res, 200, { ok: true, kind: 'markdown', node_id: nodeId, markdown: found.markdown, version: found.version || null });
         } catch (error: any) {
           writeJson(res, 500, { ok: false, error: error?.message || String(error) });
         }
@@ -801,7 +859,8 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             writeJson(res, 400, { ok: false, error: 'node_id is required in request or markdown frontmatter' });
             return;
           }
-          const result = await agent.sendMempediaAction({
+          // Use Rust binary for writes (versioning, indexing, audit)
+          const result = callMempediaBinary({
             action: 'sync_markdown',
             node_id: nodeId,
             markdown,
@@ -814,7 +873,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             writeJson(res, 400, { ok: false, error: (result as any).message || 'Failed to save markdown' });
             return;
           }
-          const linkResult = await agent.sendMempediaAction({
+          const linkResult = graphLinks.length > 0 ? callMempediaBinary({
             action: 'set_node_links',
             node_id: nodeId,
             links: graphLinks
@@ -828,27 +887,19 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             reason: `${reason} (graph links)`,
             source,
             importance: Number.isFinite(importance) ? importance : undefined,
-          });
+          }) : { kind: 'ack', message: 'no links to set' };
           if ((linkResult as any)?.kind === 'error') {
             writeJson(res, 400, { ok: false, error: (linkResult as any).message || 'Failed to save graph links' });
             return;
           }
-          const opened = await agent.sendMempediaAction({
-            action: 'open_node',
-            node_id: nodeId,
-            markdown: true,
-            agent_id: agentId,
-          });
-          if ((opened as any)?.kind === 'error') {
-            writeJson(res, 400, { ok: false, error: (opened as any).message || 'Saved but failed to reopen node' });
-            return;
-          }
+          // Re-read node from filesystem after save
+          const opened = readNodeMarkdownFs(nodeId);
           writeJson(res, 200, {
             ok: true,
             node_id: nodeId,
             result,
             linkResult,
-            opened,
+            opened: opened ? { kind: 'markdown', node_id: nodeId, markdown: opened.markdown, version: opened.version } : null,
             snapshot: await loadMemorySnapshot(),
           });
         } catch (error: any) {
@@ -863,16 +914,17 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             writeJson(res, 400, { ok: false, error: 'node_id is required' });
             return;
           }
-          const result = await agent.sendMempediaAction({
-            action: 'node_history',
-            node_id: nodeId,
-            limit: 50,
-          } as any);
-          if ((result as any)?.kind === 'error') {
-            writeJson(res, 400, { ok: false, error: (result as any).message || 'Failed to load history' });
-            return;
+          // Filesystem read — no binary required
+          const stateData = readJsonOptional(path.join(memoryRoot(), 'index', 'state.json')) || {};
+          const nodeEntry = (stateData as any).nodes?.[nodeId];
+          const branches: string[] = nodeEntry?.branches || [];
+          const items: any[] = [];
+          for (const hash of branches) {
+            const ver = readVersionObject(hash);
+            if (ver) items.push(ver);
           }
-          writeJson(res, 200, { ok: true, ...(result as any) });
+          items.sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+          writeJson(res, 200, { ok: true, kind: 'history', node_id: nodeId, items });
         } catch (error: any) {
           writeJson(res, 500, { ok: false, error: error?.message || String(error) });
         }
@@ -887,17 +939,39 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             writeJson(res, 400, { ok: false, error: 'query is required' });
             return;
           }
-          const result = await agent.sendMempediaAction({
-            action: 'search_nodes',
-            query,
-            limit,
-            include_highlight: true,
-          } as any);
-          if ((result as any)?.kind === 'error') {
-            writeJson(res, 400, { ok: false, error: (result as any).message || 'Search failed' });
-            return;
+          // Filesystem text search — no binary required
+          const stateData = readJsonOptional(path.join(memoryRoot(), 'index', 'state.json')) || {};
+          const heads: Record<string, string> = (stateData as any).heads || {};
+          const ql = query.toLowerCase();
+          const results: any[] = [];
+          for (const [nodeId, hash] of Object.entries(heads)) {
+            const ver = readVersionObject(hash);
+            if (!ver) continue;
+            const c: any = ver.content || {};
+            const corpusRaw = [c.title, c.summary, c.body, nodeId].filter(Boolean).join(' ');
+            const corpus = corpusRaw.toLowerCase();
+            if (!corpus.includes(ql)) continue;
+            // Simple TF score: count occurrences
+            const occurrences = (corpus.match(new RegExp(ql.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+            const score = Math.min(1, occurrences * 0.15 + (String(c.title || '').toLowerCase().includes(ql) ? 0.4 : 0));
+            // Find highlight snippet
+            const idx = corpusRaw.toLowerCase().indexOf(ql);
+            const snippet = idx >= 0
+              ? corpusRaw.slice(Math.max(0, idx - 40), idx + ql.length + 80)
+              : (String(c.summary || '')).slice(0, 120);
+            const highlight = snippet.replace(new RegExp(`(${ql.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi'), '**$1**');
+            results.push({
+              id: nodeId,
+              node_id: nodeId,
+              title: String(c.title || nodeId),
+              summary: String(c.summary || ''),
+              score: parseFloat(score.toFixed(3)),
+              highlight,
+              importance: typeof ver.importance === 'number' ? ver.importance : 0,
+            });
           }
-          writeJson(res, 200, { ok: true, ...(result as any) });
+          results.sort((a, b) => b.score - a.score || b.importance - a.importance);
+          writeJson(res, 200, { ok: true, kind: 'search_results', results: results.slice(0, limit) });
         } catch (error: any) {
           writeJson(res, 500, { ok: false, error: error?.message || String(error) });
         }
@@ -911,7 +985,8 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             writeJson(res, 400, { ok: false, error: 'action is required' });
             return;
           }
-          const result = await agent.sendMempediaAction(body as any);
+          // Use Rust binary for all generic actions (rollback, fork, merge, etc.)
+          const result = callMempediaBinary(body as Record<string, unknown>);
           if ((result as any)?.kind === 'error') {
             writeJson(res, 400, { ok: false, error: (result as any).message || 'Action failed' });
             return;
