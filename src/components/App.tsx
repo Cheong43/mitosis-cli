@@ -856,6 +856,72 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
         }
         return;
       }
+      if (rawPath === '/api/memory/node/history' && method === 'GET') {
+        try {
+          const nodeId = String(requestUrl.searchParams.get('node_id') || '').trim();
+          if (!nodeId) {
+            writeJson(res, 400, { ok: false, error: 'node_id is required' });
+            return;
+          }
+          const result = await agent.sendMempediaAction({
+            action: 'node_history',
+            node_id: nodeId,
+            limit: 50,
+          } as any);
+          if ((result as any)?.kind === 'error') {
+            writeJson(res, 400, { ok: false, error: (result as any).message || 'Failed to load history' });
+            return;
+          }
+          writeJson(res, 200, { ok: true, ...(result as any) });
+        } catch (error: any) {
+          writeJson(res, 500, { ok: false, error: error?.message || String(error) });
+        }
+        return;
+      }
+      if (rawPath === '/api/memory/search' && method === 'GET') {
+        try {
+          const query = String(requestUrl.searchParams.get('query') || '').trim();
+          const limitRaw = Number(requestUrl.searchParams.get('limit') || 20);
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 20;
+          if (!query) {
+            writeJson(res, 400, { ok: false, error: 'query is required' });
+            return;
+          }
+          const result = await agent.sendMempediaAction({
+            action: 'search_nodes',
+            query,
+            limit,
+            include_highlight: true,
+          } as any);
+          if ((result as any)?.kind === 'error') {
+            writeJson(res, 400, { ok: false, error: (result as any).message || 'Search failed' });
+            return;
+          }
+          writeJson(res, 200, { ok: true, ...(result as any) });
+        } catch (error: any) {
+          writeJson(res, 500, { ok: false, error: error?.message || String(error) });
+        }
+        return;
+      }
+      if (rawPath === '/api/memory/action' && method === 'POST') {
+        try {
+          const body = await readBody(req);
+          const action = String(body?.action || '').trim();
+          if (!action) {
+            writeJson(res, 400, { ok: false, error: 'action is required' });
+            return;
+          }
+          const result = await agent.sendMempediaAction(body as any);
+          if ((result as any)?.kind === 'error') {
+            writeJson(res, 400, { ok: false, error: (result as any).message || 'Action failed' });
+            return;
+          }
+          writeJson(res, 200, { ok: true, ...(result as any) });
+        } catch (error: any) {
+          writeJson(res, 500, { ok: false, error: error?.message || String(error) });
+        }
+        return;
+      }
       if (rawPath === '/api/cli/chat' && method === 'POST') {
         if (uiBusyRef.current) {
           writeJson(res, 409, { ok: false, error: 'CLI is busy.' });
