@@ -851,7 +851,7 @@ const GF_LEN    = 230;
 const GF_SPRING = 0.022;
 const GF_FRIC   = 0.87;
 const GF_GRAV   = 0.005;
-const GWCX = 2000, GWCY = 2000;
+let gWorldCX = 400, gWorldCY = 300; // gravity center — updated from wrap size in initSvgGraph
 
 // ── Physics ──────────────────────────────────────────────────────────────────
 function gTickSim() {
@@ -883,11 +883,11 @@ function gTickSim() {
     if (!t.pinned) { t.vx -= f * nx; t.vy -= f * ny; }
   }
   // Gravity + integrate
-  const maxW = GWCX * 2, maxH = GWCY * 2;
+  const maxW = gWorldCX * 4, maxH = gWorldCY * 4;
   for (const ni of gSimNodes) {
     if (ni.pinned) { ni.vx = 0; ni.vy = 0; continue; }
-    ni.vx += (GWCX - ni.x) * GF_GRAV;
-    ni.vy += (GWCY - ni.y) * GF_GRAV;
+    ni.vx += (gWorldCX - ni.x) * GF_GRAV;
+    ni.vy += (gWorldCY - ni.y) * GF_GRAV;
     ni.vx *= GF_FRIC; ni.vy *= GF_FRIC;
     ni.x = Math.max(80, Math.min(maxW - 80, ni.x + ni.vx));
     ni.y = Math.max(80, Math.min(maxH - 80, ni.y + ni.vy));
@@ -984,15 +984,17 @@ function gCenterView() {
   if (!gSimNodes.length) return;
   const wrap = document.getElementById('mg-canvas-wrap');
   if (!wrap) return;
-  const W = wrap.clientWidth, H = wrap.clientHeight;
-  if (W <= 0 || H <= 0) return;
+  const W = wrap.clientWidth  || wrap.offsetWidth  || 800;
+  const H = wrap.clientHeight || wrap.offsetHeight || 600;
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   for (const n of gSimNodes) {
     x0 = Math.min(x0, n.x); x1 = Math.max(x1, n.x);
     y0 = Math.min(y0, n.y); y1 = Math.max(y1, n.y);
   }
+  if (!isFinite(x0)) return;
   const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-  const gw = (x1 - x0) + 300, gh = (y1 - y0) + 240;
+  const gw = Math.max((x1 - x0) + 300, 300);
+  const gh = Math.max((y1 - y0) + 240, 240);
   gScale = Math.max(0.15, Math.min(1.5, Math.min(W / gw, H / gh) * 0.88));
   gTx = W / 2 - cx * gScale;
   gTy = H / 2 - cy * gScale;
@@ -1058,14 +1060,26 @@ function initSvgGraph() {
   const edges = state.edges;
   if (!nodes.length) return;
 
+  // Read viewport dimensions so nodes start in the visible area immediately.
+  // Fall back to reasonable defaults if wrap isn't sized yet.
+  const wrap = document.getElementById('mg-canvas-wrap');
+  const VW = (wrap && wrap.clientWidth  > 0) ? wrap.clientWidth  : 800;
+  const VH = (wrap && wrap.clientHeight > 0) ? wrap.clientHeight : 600;
+  gWorldCX = VW / 2;
+  gWorldCY = VH / 2;
+
+  // Start with identity transform (world coords = screen coords)
+  gTx = 0; gTy = 0; gScale = 1;
+  gApplyTransform();
+
   const nodeIdx = new Map(nodes.map((n, i) => [n.id, i]));
-  const R = Math.min(GWCX, GWCY) * 0.32;
+  const R = Math.min(VW, VH) * 0.33;
   gSimNodes = nodes.map((n, i) => {
     const a = (2 * Math.PI * i) / Math.max(1, nodes.length);
     return {
       id: n.id,
-      x: GWCX + R * Math.cos(a) + (Math.random() - 0.5) * 60,
-      y: GWCY + R * Math.sin(a) + (Math.random() - 0.5) * 60,
+      x: gWorldCX + R * Math.cos(a) + (Math.random() - 0.5) * 40,
+      y: gWorldCY + R * Math.sin(a) + (Math.random() - 0.5) * 40,
       vx: 0, vy: 0, pinned: false, card: null,
     };
   });
@@ -1095,7 +1109,8 @@ function initSvgGraph() {
     gSimRaf = requestAnimationFrame(loop);
   }
   gSimRaf = requestAnimationFrame(loop);
-  setTimeout(gCenterView, 50);
+  // After physics settles (~200ms), do an optimal fit
+  setTimeout(gCenterView, 250);
 }
 
 // ── Control buttons ───────────────────────────────────────────────────────────
