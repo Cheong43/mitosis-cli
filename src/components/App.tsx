@@ -617,8 +617,8 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
       }
       if (rawPath === '/api/memory/graph' && method === 'GET') {
         try {
-          const memoryRoot = path.join(projectRoot, '.mitosis');
-          const indexDir = path.join(memoryRoot, 'logs');
+          const memoryRoot = path.join(projectRoot, '.mempedia', 'memory');
+          const indexDir = path.join(memoryRoot, 'index');
           const objectsDir = path.join(memoryRoot, 'objects');
           const statePath = path.join(indexDir, 'state.json');
           const state = readJsonOptional(statePath) || {};
