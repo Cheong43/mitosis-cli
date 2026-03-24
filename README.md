@@ -6,7 +6,7 @@ A React-based CLI agent that interacts with Mempedia for context and knowledge m
 
 - Node.js
 - Rust (to build Mempedia)
-- OpenAI API Key OR Volcengine Ark (Doubao) API Key
+- OpenAI API Key or another OpenAI-compatible API key
 
 ## Setup
 
@@ -25,16 +25,10 @@ A React-based CLI agent that interacts with Mempedia for context and knowledge m
 3. Configure Environment:
    Create a `.env` file in `mitosis-cli`.
    
-   For Ark/Doubao (Recommended):
-   ```
-   ARK_API_KEY=your_key_here
-   ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
-   ARK_MODEL=Kimi-K2.5
-   ```
-
-   For OpenAI:
+   For OpenAI or any OpenAI-compatible endpoint:
    ```
    OPENAI_API_KEY=your_key_here
+   OPENAI_BASE_URL=https://api.openai.com/v1
    OPENAI_MODEL=gpt-4o
    ```
 

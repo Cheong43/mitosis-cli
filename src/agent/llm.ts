@@ -1,34 +1,67 @@
 /**
- * LLM factory — centralises all Vercel AI SDK provider construction.
+ * LLM factory and helpers built directly on the official OpenAI SDK.
  *
- * Call `buildLanguageModel()` with the relevant config fields and get back a
- * typed `LanguageModelV1` instance ready for `generateText()` / `streamText()`.
  * Auth priority: HMAC > Gateway > plain API key.
  */
 import crypto from 'crypto';
-import { createOpenAI } from '@ai-sdk/openai';
-import type { OpenAIProvider } from '@ai-sdk/openai';
-import type { LanguageModelV1 } from 'ai';
+import OpenAI from 'openai';
+import { zodResponseFormat } from 'openai/helpers/zod';
+import { z } from 'zod';
 
-type OpenAIChatSettings = Parameters<OpenAIProvider['chat']>[1];
+export interface OpenAIChatSettings {
+  structuredOutputs?: boolean;
+}
 
-export type { LanguageModelV1 };
+export interface LanguageModelV1 {
+  client: OpenAI;
+  model: string;
+  supportsStructuredOutputs: boolean;
+}
+
+interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+interface GenerateTextOptions {
+  model: LanguageModelV1;
+  messages: ChatMessage[];
+  providerOptions?: {
+    openai?: {
+      responseFormat?: {
+        type: 'json_object';
+      };
+    };
+  };
+}
+
+interface GenerateObjectOptions<TSchema extends z.ZodTypeAny> {
+  model: LanguageModelV1;
+  messages: ChatMessage[];
+  mode?: 'json';
+  schema: TSchema;
+}
+
+export class NoObjectGeneratedError extends Error {
+  static isInstance(error: unknown): error is NoObjectGeneratedError {
+    return error instanceof NoObjectGeneratedError;
+  }
+
+  constructor(message = 'No object generated') {
+    super(message);
+    this.name = 'NoObjectGeneratedError';
+  }
+}
 
 export interface LLMEndpointConfig {
   model: string;
   apiKey: string;
   baseURL?: string;
-  /** HMAC-SHA256 credentials (highest priority when both keys are present). */
   hmacAccessKey?: string;
   hmacSecretKey?: string;
-  /** Bearer-style gateway API key (used when HMAC keys are absent). */
   gatewayApiKey?: string;
 }
 
-/**
- * Returns a custom `fetch` that signs every request with HMAC-SHA256 headers
- * expected by internal API gateways.
- */
 export function buildHmacFetch(accessKey: string, secretKey: string): typeof globalThis.fetch {
   return async (input, init) => {
     const bodyStr = init?.body ? String(init.body) : '';
@@ -50,37 +83,156 @@ export function buildHmacFetch(accessKey: string, secretKey: string): typeof glo
   };
 }
 
-/**
- * Builds a `LanguageModelV1` from endpoint config.
- *
- * Auth resolution order:
- *   1. HMAC (hmacAccessKey + hmacSecretKey) — signs each request with SHA-256
- *   2. Gateway (gatewayApiKey) — adds x-gateway-apikey header
- *   3. Plain OpenAI-compatible key (apiKey)
- */
-export function buildLanguageModel(cfg: LLMEndpointConfig, chatSettings?: OpenAIChatSettings): LanguageModelV1 {
-  const { model, apiKey, baseURL, hmacAccessKey, hmacSecretKey, gatewayApiKey } = cfg;
+function extractTextParts(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') {
+          return part;
+        }
+        if (part && typeof part === 'object' && 'text' in part && typeof (part as { text?: unknown }).text === 'string') {
+          return (part as { text: string }).text;
+        }
+        return '';
+      })
+      .join('');
+  }
+  return '';
+}
+
+function extractMessageText(message: unknown): string {
+  if (!message || typeof message !== 'object') {
+    return '';
+  }
+  const msg = message as Record<string, unknown>;
+  if ('content' in msg) {
+    const text = extractTextParts(msg.content);
+    if (text.trim()) {
+      return text;
+    }
+  }
+  // Fallback: some models (e.g. Qwen3 thinking mode) return the answer in
+  // reasoning_content or thinking_content when content is null/empty.
+  for (const field of ['reasoning_content', 'thinking_content']) {
+    if (field in msg) {
+      const alt = extractTextParts((msg as Record<string, unknown>)[field]);
+      if (alt.trim()) {
+        return alt;
+      }
+    }
+  }
+  return '';
+}
+
+function normalizeMessages(messages: ChatMessage[]): Array<{ role: string; content: string }> {
+  return messages.map((message) => ({
+    role: message.role,
+    content: typeof message.content === 'string' ? message.content : String(message.content ?? ''),
+  }));
+}
+
+function parseJsonObjectText(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    throw new NoObjectGeneratedError('No object generated: empty response body.');
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    }
+    throw new NoObjectGeneratedError(`No object generated: ${trimmed.slice(0, 240)}`);
+  }
+}
+
+function buildClient(cfg: LLMEndpointConfig): OpenAI {
+  const { apiKey, baseURL, hmacAccessKey, hmacSecretKey, gatewayApiKey } = cfg;
 
   if (hmacAccessKey && hmacSecretKey) {
     if (!baseURL) throw new Error('HMAC auth requires baseURL');
-    return createOpenAI({
+    return new OpenAI({
+      apiKey: hmacAccessKey || apiKey || 'placeholder',
       baseURL,
-      apiKey: hmacAccessKey,
       fetch: buildHmacFetch(hmacAccessKey, hmacSecretKey),
-    }).chat(model, chatSettings);
+    });
   }
 
   if (gatewayApiKey) {
     if (!baseURL) throw new Error('Gateway auth requires baseURL');
-    return createOpenAI({
+    return new OpenAI({
+      apiKey: apiKey || gatewayApiKey || 'placeholder',
       baseURL,
-      apiKey: '',
-      headers: {
+      defaultHeaders: {
         'x-gatewat-apikey': `Bearer ${gatewayApiKey}`,
         'x-gateway-apikey': `Bearer ${gatewayApiKey}`,
       },
-    }).chat(model, chatSettings);
+    });
   }
 
-  return createOpenAI({ apiKey, baseURL }).chat(model, chatSettings);
+  return new OpenAI({ apiKey, baseURL });
+}
+
+export function buildLanguageModel(cfg: LLMEndpointConfig, chatSettings?: OpenAIChatSettings): LanguageModelV1 {
+  return {
+    client: buildClient(cfg),
+    model: cfg.model,
+    supportsStructuredOutputs: Boolean(chatSettings?.structuredOutputs),
+  };
+}
+
+export async function generateText(options: GenerateTextOptions): Promise<{ text: string }> {
+  const responseFormat = options.providerOptions?.openai?.responseFormat;
+  const completion = await options.model.client.chat.completions.create({
+    model: options.model.model,
+    messages: normalizeMessages(options.messages),
+    ...(responseFormat?.type === 'json_object'
+      ? { response_format: { type: 'json_object' as const } }
+      : {}),
+  } as any);
+
+  return {
+    text: extractMessageText(completion.choices?.[0]?.message),
+  };
+}
+
+export async function generateObject<TSchema extends z.ZodTypeAny>(options: GenerateObjectOptions<TSchema>): Promise<{ object: z.infer<TSchema> }> {
+  if (options.mode && options.mode !== 'json') {
+    throw new Error(`Unsupported object generation mode: ${options.mode}`);
+  }
+
+  if (options.model.supportsStructuredOutputs) {
+    const completion = await options.model.client.chat.completions.create({
+      model: options.model.model,
+      messages: normalizeMessages(options.messages),
+      response_format: zodResponseFormat(options.schema, 'response'),
+    } as any);
+
+    const text = extractMessageText(completion.choices?.[0]?.message);
+    if (!text.trim()) {
+      throw new NoObjectGeneratedError('No object generated in structured-output mode.');
+    }
+    const parsed = parseJsonObjectText(text);
+
+    return {
+      object: options.schema.parse(parsed),
+    };
+  }
+
+  const completion = await options.model.client.chat.completions.create({
+    model: options.model.model,
+    messages: normalizeMessages(options.messages),
+    response_format: { type: 'json_object' as const },
+  } as any);
+
+  const text = extractMessageText(completion.choices?.[0]?.message);
+  const parsed = parseJsonObjectText(text);
+  return {
+    object: options.schema.parse(parsed),
+  };
 }

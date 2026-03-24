@@ -46,7 +46,7 @@ export const TOOLS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'edit',
-      description: 'Edit workspace files only.',
+      description: 'Edit workspace source and project files only. NEVER use edit to write to Mempedia storage paths (core-knowledge/, episodic/, .mempedia/, preferences/). All Mempedia memory operations must use bash with the mempedia CLI binary instead.',
       parameters: {
         type: 'object',
         properties: {

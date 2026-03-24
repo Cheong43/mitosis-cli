@@ -1,7 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { generateText } from 'ai';
-import type { LanguageModelV1 } from './llm.js';
+import { generateText, type LanguageModelV1 } from './llm.js';
 import { ToolAction } from '../mempedia/types.js';
 
 export interface MemoryClassifierTraceEvent {
@@ -76,6 +75,7 @@ export class MemoryClassifierAgent {
   private readonly autoLinkEnabled: boolean;
   private readonly autoLinkMaxNodes: number;
   private readonly autoLinkLimit: number;
+  private jsonObjectResponseFormatSupported = true;
 
   constructor(options: MemoryClassifierOptions) {
     this.chatClient = options.chatClient;
@@ -130,18 +130,10 @@ export class MemoryClassifierAgent {
 
     const userPayload = `用户输入:\n${compactInput}\n\n执行轨迹:\n${compactTraces}\n\n最终回答:\n${compactAnswer}`;
     try {
-      const { text: _extractionText } = await this.withTimeout(
-        generateText({
-          model: this.chatClient,
-          messages: [
-            { role: 'system', content: extractionPrompt },
-            { role: 'user', content: userPayload },
-          ],
-          providerOptions: { openai: { responseFormat: { type: 'json_object' } } },
-        }),
-        this.memoryExtractTimeoutMs,
-        'memory extraction llm'
-      );
+      const _extractionText = await this.generateJsonPromptText([
+        { role: 'system', content: extractionPrompt },
+        { role: 'user', content: userPayload },
+      ]);
       const content = _extractionText || '{}';
       const parsed = JSON.parse(content);
       const preferences = Array.isArray(parsed.user_preferences)
@@ -249,6 +241,39 @@ export class MemoryClassifierAgent {
         return { user_preferences: [], agent_skills: [], atomic_knowledge: [] };
       }
       return this.fallbackExtractMemory(input, answer);
+    }
+  }
+
+  private isJsonObjectResponseFormatUnsupported(error: unknown): boolean {
+    const message = String((error as any)?.message || error || '');
+    return /response_format\.type/i.test(message)
+      && /json_object/i.test(message)
+      && /not supported/i.test(message);
+  }
+
+  private async generateJsonPromptText(messages: Array<{ role: 'system' | 'user'; content: string }>): Promise<string> {
+    const run = (useJsonObject: boolean) => this.withTimeout(
+      generateText({
+        model: this.chatClient,
+        messages,
+        ...(useJsonObject
+          ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
+          : {}),
+      }),
+      this.memoryExtractTimeoutMs,
+      'memory extraction llm'
+    );
+
+    try {
+      const { text } = await run(this.jsonObjectResponseFormatSupported);
+      return typeof text === 'string' ? text : String(text || '');
+    } catch (error) {
+      if (!this.jsonObjectResponseFormatSupported || !this.isJsonObjectResponseFormatUnsupported(error)) {
+        throw error;
+      }
+      this.jsonObjectResponseFormatSupported = false;
+      const { text } = await run(false);
+      return typeof text === 'string' ? text : String(text || '');
     }
   }
 

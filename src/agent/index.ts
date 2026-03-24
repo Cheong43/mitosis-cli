@@ -1,5 +1,10 @@
-import { NoObjectGeneratedError, generateObject, generateText, type LanguageModelV1 } from 'ai';
-import { buildLanguageModel } from './llm.js';
+import {
+  NoObjectGeneratedError,
+  buildLanguageModel,
+  generateObject,
+  generateText,
+  type LanguageModelV1,
+} from './llm.js';
 import { MempediaClient } from '../mempedia/client.js';
 import { ToolAction } from '../mempedia/types.js';
 import * as fs from 'fs';
@@ -35,11 +40,25 @@ const PlannerToolCallSchema = z.object({
   goal: z.string().trim().min(1).max(240).optional(),
 });
 
+// OpenAI structured outputs require all fields to be present.
+const PlannerToolCallStructuredSchema = z.object({
+  name: PlannerToolNameSchema,
+  arguments: z.record(z.any()),
+  goal: z.string().trim().min(1).max(240).nullable(),
+});
+
 const PlannerBranchSchema = z.object({
   label: z.string().trim().min(1).max(80),
   goal: z.string().trim().min(1).max(240),
   why: z.string().trim().min(1).max(240).optional(),
   priority: z.number().min(0).max(1).optional(),
+});
+
+const PlannerBranchStructuredSchema = z.object({
+  label: z.string().trim().min(1).max(80),
+  goal: z.string().trim().min(1).max(240),
+  why: z.string().trim().min(1).max(240).nullable(),
+  priority: z.number().min(0).max(1).nullable(),
 });
 
 const PlannerDecisionSchema = z.object({
@@ -50,6 +69,16 @@ const PlannerDecisionSchema = z.object({
   skills_to_load: z.array(z.string().trim().min(1)).max(2).optional(),
   final_answer: z.string().optional(),
   completion_summary: z.string().trim().min(1).max(280).optional(),
+});
+
+const PlannerDecisionStructuredSchema = z.object({
+  kind: z.enum(['tool', 'branch', 'final', 'skills']),
+  thought: z.string().trim().min(1),
+  tool_calls: z.array(PlannerToolCallStructuredSchema).nullable(),
+  branches: z.array(PlannerBranchStructuredSchema).nullable(),
+  skills_to_load: z.array(z.string().trim().min(1)).max(2).nullable(),
+  final_answer: z.string().nullable(),
+  completion_summary: z.string().trim().min(1).max(280).nullable(),
 });
 
 type PlannerDecision = z.infer<typeof PlannerDecisionSchema>;
@@ -182,8 +211,11 @@ export class Agent {
   private readonly projectRoot: string;
   private readonly codeCliRoot: string;
   private openai: LanguageModelV1;
-  private beamPlannerOpenai: LanguageModelV1;
+  private beamPlannerStructuredOpenai: LanguageModelV1;
+  private beamPlannerCompatOpenai: LanguageModelV1;
   private memoryOpenai: LanguageModelV1;
+  private beamStructuredResponseFormatSupported = true;
+  private jsonObjectResponseFormatSupported = true;
   private mempedia: MempediaClient;
   private model: string;
   private memoryModel: string;
@@ -236,7 +268,18 @@ export class Agent {
       hmacSecretKey: config.hmacSecretKey,
       gatewayApiKey: config.gatewayApiKey,
     });
-    this.beamPlannerOpenai = buildLanguageModel(
+    this.beamPlannerStructuredOpenai = buildLanguageModel(
+      {
+        model: this.model,
+        apiKey: config.apiKey,
+        baseURL: config.baseURL,
+        hmacAccessKey: config.hmacAccessKey,
+        hmacSecretKey: config.hmacSecretKey,
+        gatewayApiKey: config.gatewayApiKey,
+      },
+      { structuredOutputs: true }
+    );
+    this.beamPlannerCompatOpenai = buildLanguageModel(
       {
         model: this.model,
         apiKey: config.apiKey,
@@ -341,6 +384,55 @@ export class Agent {
 
   stop() {
     this.mempedia.stop();
+  }
+
+  private isJsonResponseFormatUnsupported(error: unknown): boolean {
+    const message = String((error as any)?.message || error || '');
+    return /(response_format|text\.format|structured outputs?)/i.test(message)
+      && /(json_object|json_schema|json|schema)/i.test(message)
+      && /(not supported|unsupported)/i.test(message);
+  }
+
+  private async generateJsonPromptText(options: {
+    model: LanguageModelV1;
+    messages: any;
+    timeoutMs: number;
+    timeoutLabel: string;
+    onFallback?: () => void | Promise<void>;
+  }): Promise<string> {
+    const run = (useJsonObject: boolean) => this.withTimeout(
+      generateText({
+        model: options.model,
+        messages: options.messages,
+        ...(useJsonObject
+          ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
+          : {}),
+      }),
+      options.timeoutMs,
+      options.timeoutLabel,
+    );
+
+    try {
+      const { text } = await run(this.jsonObjectResponseFormatSupported);
+      const resolved = typeof text === 'string' ? text : String(text || '');
+      // Empty response with json_object mode — retry without it (e.g., Qwen3 thinking mode
+      // may return null content when response_format constrains the output).
+      if (!resolved.trim() && this.jsonObjectResponseFormatSupported) {
+        this.jsonObjectResponseFormatSupported = false;
+        await options.onFallback?.();
+        const { text: text2 } = await run(false);
+        return typeof text2 === 'string' ? text2 : String(text2 || '');
+      }
+      return resolved;
+    } catch (error) {
+      if (!this.jsonObjectResponseFormatSupported || !this.isJsonResponseFormatUnsupported(error)) {
+        throw error;
+      }
+      this.jsonObjectResponseFormatSupported = false;
+      await options.onFallback?.();
+      const { text } = await run(false);
+      return typeof text === 'string' ? text : String(text || '');
+    }
   }
 
   async shutdown(timeoutMs = 12000): Promise<void> {
@@ -852,8 +944,18 @@ export class Agent {
   private async executeEditTool(args: Record<string, unknown>, runtimeHandle: RuntimeHandle): Promise<string> {
     const target = String(args.target || '').trim();
     if (target === 'workspace') {
+      const filePath = String(args.path || '').trim();
+      // Runtime guard: block writes to Mempedia storage paths regardless of prompt-level rules.
+      const mempediaStoragePrefixes = ['core-knowledge/', 'episodic/', '.mempedia/', 'preferences/'];
+      const normalizedPath = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+      if (mempediaStoragePrefixes.some((prefix) => normalizedPath.startsWith(prefix))) {
+        return JSON.stringify({
+          kind: 'error',
+          message: `edit is blocked for Mempedia storage path "${filePath}". Use bash with the mempedia CLI binary instead (e.g., mempedia agent_upsert_markdown ...).`,
+        });
+      }
       const toolRes = await runtimeHandle.executeTool('write_file', {
-        path: String(args.path || ''),
+        path: filePath,
         content: String(args.content || ''),
       });
       if (!toolRes.success) {
@@ -1584,25 +1686,22 @@ export class Agent {
       : '(none)';
 
     try {
-      const { text: _contextRaw } = await this.measure(perfEntries, 'context_selection', async () =>
-        this.withTimeout(
-          generateText({
-            model: this.openai,
-            messages: [
-              {
-                role: 'system',
-                content: 'You are a context selector. First assume all recalled context may be noisy. Then choose only the context candidates that are directly relevant to the current user request. Return JSON only: {"relevant_node_ids":[...],"rationale":"..."}. Select at most 3 node ids.',
-              },
-              {
-                role: 'user',
-                content: `Current user request:\n${input}\n\nSelected recent conversation turns:\n${recentTurnsText}\n\nRecalled context candidates:\n${candidateList}`,
-              },
-            ],
-            providerOptions: { openai: { responseFormat: { type: 'json_object' } } },
-          }),
-          this.agentLlmTimeoutMs,
-          'context_selection llm'
-        )
+      const _contextRaw = await this.measure(perfEntries, 'context_selection', async () =>
+        this.generateJsonPromptText({
+          model: this.openai,
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a context selector. First assume all recalled context may be noisy. Then choose only the context candidates that are directly relevant to the current user request. Return JSON only: {"relevant_node_ids":[...],"rationale":"..."}. Select at most 3 node ids.',
+            },
+            {
+              role: 'user',
+              content: `Current user request:\n${input}\n\nSelected recent conversation turns:\n${recentTurnsText}\n\nRecalled context candidates:\n${candidateList}`,
+            },
+          ],
+          timeoutMs: this.agentLlmTimeoutMs,
+          timeoutLabel: 'context_selection llm',
+        })
       );
       const parsed = (() => {
         const candidates = extractJsonishCandidates(_contextRaw);
@@ -1829,13 +1928,14 @@ export class Agent {
 
     const userPayload = `用户输入:\n${compactInput}\n\n执行轨迹:\n${compactTraces}\n\n最终回答:\n${compactAnswer}`;
     try {
-      const { text: _extractionText } = await generateText({
+      const _extractionText = await this.generateJsonPromptText({
         model: this.memoryOpenai,
         messages: [
           { role: 'system', content: extractionPrompt },
           { role: 'user', content: userPayload },
         ],
-        providerOptions: { openai: { responseFormat: { type: 'json_object' } } },
+        timeoutMs: this.agentLlmTimeoutMs,
+        timeoutLabel: 'memory extraction llm',
       });
       const content = _extractionText || '{}';
       const parsed = JSON.parse(content);
@@ -2103,6 +2203,7 @@ export class Agent {
     let selectedNodeIds: string[] = [];
     const soulsGuidance = this.loadSoulsMarkdown();
     const availableSkills = loadWorkspaceSkills(this.projectRoot, this.codeCliRoot);
+    const alwaysIncludeSkills = availableSkills.filter((s) => s.alwaysInclude);
     const localSkillsIndex = renderSkillCatalog(availableSkills);
     const rawAutoQueueMemorySave = String(process.env.AUTO_QUEUE_MEMORY_SAVE ?? '1').toLowerCase();
     const autoQueueMemorySave = rawAutoQueueMemorySave !== '0' && rawAutoQueueMemorySave !== 'false' && rawAutoQueueMemorySave !== 'off';
@@ -2136,6 +2237,10 @@ export class Agent {
       return `- ${fn.name}: ${fn.description}\n  params: ${JSON.stringify(fn.parameters)}`;
     }).join('\n');
 
+    const alwaysIncludeBlock = alwaysIncludeSkills.length > 0
+      ? `\n\n--- ALWAYS-ACTIVE SKILL POLICIES (pre-loaded, binding on every turn) ---\n${renderSkillGuidance(alwaysIncludeSkills)}\n--- END ALWAYS-ACTIVE SKILLS ---`
+      : '';
+
     const systemPrompt = `You are a branching ReAct agent.
 Treat ReAct as a functional loop. A branch is an independent child loop with its own thought -> action -> observation state.
 
@@ -2150,9 +2255,8 @@ Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md and ./
 ${localSkillsIndex ? `${localSkillsIndex}\n` : ''}Skills are guidance documents, not tool names. Never emit skill names such as project-discovery in tool_calls.name.
 If skill guidance has been injected for the turn, treat it as internal policy only. Do not inspect the skills directory, verify skill files, or summarize skill text back to the user unless the user explicitly asked about skills.
 When you save knowledge, prefer markdown-first notes that preserve concrete facts, numbers, data points, historical changes, viewpoints, evidence, and explicit uncertainties instead of terse summaries.
-Separate facts from opinions or viewpoints. Never fabricate facts; if something is uncertain, attribute it or mark it as uncertain.
+    Separate facts from opinions or viewpoints. Never fabricate facts; if something is uncertain, attribute it or mark it as uncertain.
 
-You must return exactly one JSON object on every loop iteration. Do not use markdown fences.
 
 Allowed JSON schema:
 {
@@ -2167,8 +2271,10 @@ Allowed JSON schema:
 
 Rules:
 1. Prefer kind="tool" when one next action is clearly best.
-2. Use kind="branch" only when there are multiple materially distinct strategies worth trying.
-3. A branch must represent a genuinely different hypothesis, search path, or execution strategy.
+2. Use kind="branch" in TWO situations:
+   a) Multiple materially distinct strategies — different hypotheses, search paths, or execution strategies worth exploring in parallel.
+   b) Multiple independent sub-tasks — when the user's request contains 2 or more clearly separable actions that do not depend on each other's output (e.g. "fetch X and also save Y", "research A and update B"). Spawn one branch per independent sub-task so they execute in parallel instead of serially in root.
+3. A branch must represent either a genuinely different strategy OR a distinct independent sub-task. Never bundle unrelated work into a single branch.
 4. Never create more than ${this.branchMaxWidth} child branches in one step.
 5. Prefer search before edit when the correct answer may already exist in repository files.
 6. For repository discovery, prefer read and search on workspace evidence before using web.
@@ -2179,11 +2285,17 @@ Rules:
 11. Use web only when repository evidence is insufficient.
 12. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
 13. When you finish, return kind="final" with a direct user-facing answer.
-14. If the skill catalog is insufficient and you need the full guidance of one or two local skills, return kind="skills" with skills_to_load and no tool_calls, branches, or final_answer.
-15. Request full skill guidance only when it materially changes the next step.
+18. NEVER use \`edit\` to write to Mempedia storage paths (core-knowledge/, episodic/, .mempedia/, preferences/, skills/). ALL Mempedia Layer 1/2/3/4 read and write operations MUST go through \`bash\` using the mempedia CLI binary. Using \`edit\` on these paths bypasses indexing, versioning, and embedding; the data will be invisible to the system.
+14. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via kind="skills". For other skills in the catalog whose description overlaps with the task, return kind="skills" to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to kind="tool" or kind="branch".
+15. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
 16. For questions about local Mempedia contents, workspace memory, or local skills, inspect local evidence first. Do not answer from generic model background knowledge.
 17. If the user asks what is in Mempedia or what skills are available, prefer search or read against local workspace evidence before final_answer.
+19. NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value. Saving a greeting or one-liner response wastes storage and pollutes search results.
+${alwaysIncludeBlock ? `
+${alwaysIncludeBlock}
 
+IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool_calls.arguments.command — they are NOT the planner response format. Your planner response must always follow the JSON schema above (kind/thought/tool_calls/etc.).
+` : ''}
 Available tools:
 ${toolCatalog}
 
@@ -2221,7 +2333,8 @@ ${soulsGuidance}
     const loadedSkillMarker = 'SKILL ROUTER LOAD:';
 
     const getLoadedSkillNames = (transcript: Array<{ role: string; content: string }>) => {
-      const loaded = new Set<string>();
+      // Always-active skills are pre-loaded in the system prompt; treat them as already loaded.
+      const loaded = new Set<string>(alwaysIncludeSkills.map((s) => s.name.toLowerCase()));
       for (const message of transcript) {
         if (message.role !== 'assistant' || typeof message.content !== 'string') {
           continue;
@@ -2369,7 +2482,30 @@ ${soulsGuidance}
       }
 
       if (!normalized) {
-        const looksLikePromptEcho = /Original user request:|Current branch state:|Skill:|MEMPEDIA_BINARY_PATH|agent_upsert_markdown|list_skills|record_episodic/i.test(rawTrimmed);
+        const looksLikePromptEcho = /Original user request:|Current branch state:|MEMPEDIA_BINARY_PATH|list_skills|record_episodic/i.test(rawTrimmed)
+          || (/agent_upsert_markdown/i.test(rawTrimmed) && !/"name"\s*:\s*"bash"/i.test(rawTrimmed));
+        // Log raw output to stderr for diagnosis.
+        process.stderr.write(`[parseDecision] no valid structured decision (looksLikePromptEcho=${looksLikePromptEcho}). Raw preview: ${rawTrimmed.slice(0, 400)}\n`);
+        // Detect mempedia-action JSON output: model confused by skill examples and
+        // output {"action":"agent_upsert_markdown",...} instead of planner JSON.
+        // Wrap it as a bash tool call so the action still executes.
+        if (!looksLikePromptEcho && rawTrimmed.startsWith('{')) {
+          try {
+            const maybeAction = JSON.parse(rawTrimmed) as Record<string, unknown>;
+            if (typeof maybeAction.action === 'string' && maybeAction.action.length > 0) {
+              return PlannerDecisionSchema.parse({
+                kind: 'tool',
+                thought: `Model output a mempedia action directly; wrapping as bash CLI call.`,
+                tool_calls: [{
+                  name: 'bash',
+                  arguments: {
+                    command: `BIN="\${MEMPEDIA_BINARY_PATH:-./target/debug/mempedia}"\n[[ -x "$BIN" ]] || BIN=./target/release/mempedia\nprintf '%s' ${JSON.stringify(rawTrimmed)} | "$BIN" --project "$PWD" --stdin`,
+                  },
+                }],
+              });
+            }
+          } catch { /* not JSON, fall through */ }
+        }
         const evidenceFirstDecision = buildEvidenceFirstFallbackDecision();
         if (evidenceFirstDecision && !looksLikePromptEcho) {
           emitTrace({
@@ -2482,11 +2618,35 @@ ${soulsGuidance}
 
     const planWithSkillRoutingObject = async (
       initialTranscript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-      invoke: (transcript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>) => Promise<PlannerDecision>,
+      invoke: (transcript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>) => Promise<unknown>,
     ): Promise<PlannerDecision> => {
       let workingTranscript = initialTranscript;
       for (let attempt = 0; attempt < 3; attempt += 1) {
-        const decision = PlannerDecisionSchema.parse(await invoke(workingTranscript));
+        const rawDecisionUnknown = await invoke(workingTranscript);
+        const rawDecision = (rawDecisionUnknown && typeof rawDecisionUnknown === 'object'
+          ? rawDecisionUnknown
+          : {}) as Record<string, unknown>;
+        const decision = PlannerDecisionSchema.parse({
+          ...rawDecision,
+          tool_calls: Array.isArray((rawDecision as any).tool_calls)
+            ? (rawDecision as any).tool_calls.map((call: any) => ({
+                ...call,
+                goal: call?.goal ?? undefined,
+              }))
+            : undefined,
+          branches: Array.isArray((rawDecision as any).branches)
+            ? (rawDecision as any).branches.map((branch: any) => ({
+                ...branch,
+                why: branch?.why ?? undefined,
+                priority: branch?.priority ?? undefined,
+              }))
+            : undefined,
+          skills_to_load: Array.isArray((rawDecision as any).skills_to_load)
+            ? (rawDecision as any).skills_to_load
+            : undefined,
+          final_answer: (rawDecision as any).final_answer ?? undefined,
+          completion_summary: (rawDecision as any).completion_summary ?? undefined,
+        });
         if (decision.kind !== 'skills') {
           return decision;
         }
@@ -2567,7 +2727,7 @@ ${soulsGuidance}
         ...transcriptMessages,
         {
           role: 'user',
-          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}/${this.branchMaxDepth}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- step_budget: ${branch.steps}/${this.branchMaxSteps}\n\nReturn exactly one JSON object. If branching is still useful, only emit materially distinct branches.`,
+          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}/${this.branchMaxDepth}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- step_budget: ${branch.steps}/${this.branchMaxSteps}\n\nReturn exactly one JSON object. Branch (kind="branch") when (a) you have materially distinct strategies to try in parallel, or (b) the remaining work has 2+ independent sub-tasks that do not depend on each other's output. Always provide at least 2 branches when branching, or use kind="tool" / kind="final" instead.`,
         },
       ];
     };
@@ -2692,48 +2852,127 @@ ${soulsGuidance}
       emitTrace({ type: 'thought', content: `Using beam-search mode (width=${this.beamWidth}, depth=${this.beamMaxDepth}, expansion=${this.beamExpansionFactor}).` });
       const beamPlanner = {
         plan: async (transcript: Array<{ role: string; content: string }>) => {
-          const decision = await planWithSkillRoutingObject(
-            transcript as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-            async (workingTranscript) => {
-              try {
-                const { object } = await this.measure(perfEntries, `beam_llm_plan`, async () =>
-                  this.withTimeout(
-                    generateObject({
-                      model: this.beamPlannerOpenai,
-                      messages: workingTranscript as any,
-                      mode: 'json',
-                      schema: PlannerDecisionSchema,
-                    }),
-                    this.agentLlmTimeoutMs,
-                    'beam_plan llm'
-                  )
-                );
-                return object;
-              } catch (error: any) {
-                const shouldFallback = NoObjectGeneratedError.isInstance(error)
-                  || /No object generated/i.test(String(error?.message || error));
-                if (!shouldFallback) {
-                  throw error;
+          const baseTranscript = transcript as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+
+          const planFromText = async (workingTranscript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>) =>
+            planWithSkillRouting(
+              workingTranscript,
+              async (textTranscript) => this.measure(perfEntries, `beam_llm_plan_fallback_text`, async () =>
+                this.generateJsonPromptText({
+                  model: this.openai,
+                  messages: textTranscript as any,
+                  timeoutMs: this.agentLlmTimeoutMs,
+                  timeoutLabel: 'beam_plan_fallback llm',
+                  onFallback: () => emitTrace({
+                    type: 'observation',
+                    content: `Model ${this.model} does not support response_format=json_object; switching planner JSON prompts to plain-text mode.`,
+                  }),
+                })
+              )
+            );
+
+          const decision = await (async () => {
+            try {
+              return await planWithSkillRoutingObject(
+                baseTranscript,
+                async (workingTranscript) => {
+              const runTextFallback = async () => {
+                return planFromText(workingTranscript);
+              };
+
+              const runCompatObjectMode = async () => {
+                try {
+                  const { object } = await this.measure(perfEntries, `beam_llm_plan_compat`, async () =>
+                    this.withTimeout(
+                      generateObject({
+                        model: this.beamPlannerCompatOpenai,
+                        messages: workingTranscript as any,
+                        mode: 'json',
+                        schema: PlannerDecisionStructuredSchema,
+                      }),
+                      this.agentLlmTimeoutMs,
+                      'beam_plan_compat llm'
+                    )
+                  );
+                  return object;
+                } catch (error: any) {
+                  if (this.isJsonResponseFormatUnsupported(error)) {
+                    this.jsonObjectResponseFormatSupported = false;
+                    emitTrace({
+                      type: 'observation',
+                      content: `Model ${this.model} does not support response_format=json_object; switching planner JSON prompts to plain-text mode.`,
+                    });
+                    return runTextFallback();
+                  }
+                  const shouldFallback = NoObjectGeneratedError.isInstance(error)
+                    || /No object generated/i.test(String(error?.message || error));
+                  if (!shouldFallback) {
+                    throw error;
+                  }
+                  emitTrace({
+                    type: 'observation',
+                    content: `Beam planner compat object mode returned no object; falling back to text JSON planning. ${String(error?.message || error)}`,
+                  });
+                  return runTextFallback();
                 }
-                emitTrace({
-                  type: 'observation',
-                  content: `Beam planner object mode returned no object; falling back to text JSON planning. ${String(error?.message || error)}`,
-                });
-                const { text: fallbackText } = await this.measure(perfEntries, `beam_llm_plan_fallback_text`, async () =>
-                  this.withTimeout(
-                    generateText({
-                      model: this.openai,
-                      messages: workingTranscript as any,
-                      providerOptions: { openai: { responseFormat: { type: 'json_object' } } },
-                    }),
-                    this.agentLlmTimeoutMs,
-                    'beam_plan_fallback llm'
-                  )
-                );
-                return parseDecision(extractText(fallbackText));
+              };
+
+              if (this.beamStructuredResponseFormatSupported) {
+                try {
+                  const { object } = await this.measure(perfEntries, `beam_llm_plan`, async () =>
+                    this.withTimeout(
+                      generateObject({
+                        model: this.beamPlannerStructuredOpenai,
+                        messages: workingTranscript as any,
+                        mode: 'json',
+                        schema: PlannerDecisionStructuredSchema,
+                      }),
+                      this.agentLlmTimeoutMs,
+                      'beam_plan llm'
+                    )
+                  );
+                  return object;
+                } catch (error: any) {
+                  if (this.isJsonResponseFormatUnsupported(error)) {
+                    this.beamStructuredResponseFormatSupported = false;
+                    emitTrace({
+                      type: 'observation',
+                      content: `Model ${this.model} rejected schema-based structured outputs; retrying beam planner with json_object mode.`,
+                    });
+                    if (!this.jsonObjectResponseFormatSupported) {
+                      return runTextFallback();
+                    }
+                    return runCompatObjectMode();
+                  }
+                  const shouldFallback = NoObjectGeneratedError.isInstance(error)
+                    || /No object generated/i.test(String(error?.message || error));
+                  if (!shouldFallback) {
+                    throw error;
+                  }
+                  emitTrace({
+                    type: 'observation',
+                    content: `Beam planner object mode returned no object; falling back to text JSON planning. ${String(error?.message || error)}`,
+                  });
+                  return runTextFallback();
+                }
               }
+
+              if (!this.jsonObjectResponseFormatSupported) {
+                return runTextFallback();
+              }
+
+              return runCompatObjectMode();
+                }
+              );
+            } catch (error: any) {
+              emitTrace({
+                type: 'observation',
+                content: `Beam planner object pipeline failed unexpectedly; falling back to text JSON planning. ${String(error?.message || error)}`,
+              });
+              return planFromText(baseTranscript);
             }
-          );
+          })();
+
           if (decision.kind === 'tool') {
             return { kind: 'tool' as const, thought: decision.thought, toolCalls: decision.tool_calls || [] };
           }
@@ -2794,18 +3033,18 @@ ${soulsGuidance}
         const decision = await planWithSkillRouting(
           buildMessages(branch as BranchState) as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
           async (workingTranscript) => {
-            const { text: _planText } = await this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
-              this.withTimeout(
-                generateText({
-                  model: this.openai,
-                  messages: workingTranscript as any,
-                  providerOptions: { openai: { responseFormat: { type: 'json_object' } } },
+            return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
+              this.generateJsonPromptText({
+                model: this.openai,
+                messages: workingTranscript as any,
+                timeoutMs: this.agentLlmTimeoutMs,
+                timeoutLabel: `planBranch_${branch.id} llm`,
+                onFallback: () => emitTrace({
+                  type: 'observation',
+                  content: `Model ${this.model} does not support response_format=json_object; switching planner JSON prompts to plain-text mode.`,
                 }),
-                this.agentLlmTimeoutMs,
-                `planBranch_${branch.id} llm`
-              )
+              })
             );
-            return extractText(_planText);
           }
         );
         return decision.kind === 'tool'
@@ -2851,7 +3090,7 @@ ${soulsGuidance}
         });
       }
     });
-    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. Branch only when multiple distinct approaches are worth exploring.`);
+    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. Branch (kind="branch") when (a) multiple distinct approaches are worth exploring in parallel, or (b) the request has 2 or more clearly independent sub-tasks. Always provide at least 2 branches, or do not branch.`);
     }
     if (this.hadExplicitMemoryWrite(traceBuffer)) {
       memoryQueuedThisRun = true;

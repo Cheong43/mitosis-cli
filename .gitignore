@@ -16,3 +16,4 @@ dist/
 
 # Editor
 .vscode/settings.json
+.mempedia/

@@ -6,28 +6,12 @@ import fs from 'node:fs';
 import { Agent, type TraceEvent } from './index.js';
 
 process.env.AUTO_QUEUE_MEMORY_SAVE = '0';
+process.env.REACT_BEAM_SEARCH_ENABLED = '0';
 
 function createTempProjectRoot(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   fs.mkdirSync(path.join(dir, '.mempedia', 'memory', 'index'), { recursive: true });
   return dir;
-}
-
-function createMockCompletionResponse(answer: string) {
-  return {
-    choices: [
-      {
-        message: {
-          content: JSON.stringify({
-            kind: 'final',
-            thought: 'Return final answer.',
-            final_answer: answer,
-            completion_summary: answer,
-          }),
-        },
-      },
-    ],
-  };
 }
 
 function installAgentTestDoubles(agent: Agent, answerForRequest: (request: string) => Promise<string> | string): void {
@@ -38,19 +22,19 @@ function installAgentTestDoubles(agent: Agent, answerForRequest: (request: strin
     selectedNodeIds: [],
     rationale: 'test',
   });
-  anyAgent.openai = {
-    chat: {
-      completions: {
-        create: async (args: any) => {
-          const messages = Array.isArray(args?.messages) ? args.messages : [];
-          const joined = messages.map((message: any) => String(message?.content || '')).join('\n\n');
-          const match = joined.match(/Original user request:\n([\s\S]*?)\n\nStart with the root loop\./);
-          const request = match?.[1]?.trim() || 'unknown';
-          const answer = await answerForRequest(request);
-          return createMockCompletionResponse(answer);
-        },
-      },
-    },
+  anyAgent.generateJsonPromptText = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+    const joined = Array.isArray(messages)
+      ? messages.map((message) => String(message?.content || '')).join('\n\n')
+      : '';
+    const requestMatch = joined.match(/Original user request:\n([\s\S]*?)(?:\n\nStart with the root loop\.|\n\nActive branch:|$)/);
+    const request = requestMatch?.[1]?.trim() || 'unknown';
+    const answer = await answerForRequest(request);
+    return JSON.stringify({
+      kind: 'final',
+      thought: 'Return final answer.',
+      final_answer: answer,
+      completion_summary: answer,
+    });
   };
 }
 
@@ -97,6 +81,17 @@ test('one Agent instance supports concurrent runs across different conversation 
   const tracesGamma: TraceEvent[] = [];
   await agent.run('继续', (event) => { tracesGamma.push(event); }, { conversationId: 'thread-gamma' });
   assert.ok(tracesGamma.some((event) => event.content.includes('Selected 0 recent conversation turns')));
+
+  agent.stop();
+});
+
+test('beam planner forces structured outputs for custom model ids', () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-structured-');
+  const agent = new Agent({ apiKey: 'test-key', model: 'Doubao-Seed-2.0-pro' }, projectRoot);
+  const anyAgent = agent as any;
+
+  assert.equal(anyAgent.beamPlannerStructuredOpenai.supportsStructuredOutputs, true);
+  assert.equal(anyAgent.beamPlannerCompatOpenai.supportsStructuredOutputs, false);
 
   agent.stop();
 });
