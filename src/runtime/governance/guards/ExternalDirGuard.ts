@@ -20,7 +20,7 @@ export class ExternalDirGuard {
   private readonly safeRootPrefix: string;
   private readonly outsideDecision: PolicyDecision;
 
-  constructor(projectRoot: string, outsideDecision: PolicyDecision = 'deny') {
+  constructor(projectRoot: string, outsideDecision: PolicyDecision = 'ask') {
     this.safeRoot = path.resolve(projectRoot);
     // Ensure the prefix ends with the path separator so that e.g. `/foo/bar`
     // does not accidentally match `/foo/barpoisoned`.

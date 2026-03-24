@@ -76,7 +76,7 @@ export const TOOLS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'web',
-      description: 'Search the web or fetch a specific web page when repository evidence is insufficient.',
+      description: 'Search the web (returns title + url + snippet per result) or fetch a specific web page. Use for external/current information not in the workspace.',
       parameters: {
         type: 'object',
         properties: {

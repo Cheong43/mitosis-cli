@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import { Agent, TraceEvent } from '../agent/index.js';
+import type { ApprovalPrompt } from '../runtime/index.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
@@ -36,6 +37,9 @@ interface AppProps {
   memoryApiKey?: string;
   memoryBaseURL?: string;
   memoryModel?: string;
+  anthropicAuthToken?: string;
+  anthropicBaseURL?: string;
+  anthropicModel?: string;
 }
 
 interface HistoryItem {
@@ -132,12 +136,25 @@ interface ConversationThread {
   rounds: ThreadRound[];
 }
 
-export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, memoryApiKey, memoryBaseURL, memoryModel }) => {
+export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, memoryApiKey, memoryBaseURL, memoryModel, anthropicAuthToken, anthropicBaseURL, anthropicModel }) => {
   const { exit } = useApp();
   // Keep stdin ref'd (raw mode enabled) at all times while the app is mounted.
   // Without this, when TextInput's focus=false during processing, the only
   // setRawMode(true) consumer is removed, causing stdin.unref() and process exit.
-  useInput(() => {});
+  useInput((input, key) => {
+    if (pendingApproval) {
+      const lower = input.toLowerCase();
+      if (lower === 'y' || key.return) {
+        const { resolve } = pendingApproval;
+        setPendingApproval(null);
+        resolve('allow');
+      } else if (lower === 'n' || key.escape) {
+        const { resolve } = pendingApproval;
+        setPendingApproval(null);
+        resolve('deny');
+      }
+    }
+  });
   const hmacAccessKey = process.env.HMAC_ACCESS_KEY?.trim();
   const hmacSecretKey = process.env.HMAC_SECRET_KEY?.trim();
   const memoryHmacAccessKey = process.env.MEMORY_HMAC_ACCESS_KEY?.trim();
@@ -160,7 +177,10 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
     memoryHmacAccessKey,
     memoryHmacSecretKey,
     gatewayApiKey,
-    memoryGatewayApiKey
+    memoryGatewayApiKey,
+    anthropicAuthToken,
+    anthropicBaseURL,
+    anthropicModel,
   }, projectRoot));
   const [backgroundTasks, setBackgroundTasks] = useState<string[]>([]);
   const [skills, setSkills] = useState<LocalSkill[]>([]);
@@ -175,6 +195,22 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   const activeThreadRunsRef = useRef<Set<string>>(new Set());
   const webConversationRef = useRef<WebConversationItem[]>([]);
   const branchStepSeenRef = useRef<Set<string>>(new Set());
+
+  // ── Governance approval prompt state ──────────────────────────────────────
+  const [pendingApproval, setPendingApproval] = useState<{
+    prompt: ApprovalPrompt;
+    resolve: (answer: 'allow' | 'deny') => void;
+  } | null>(null);
+
+  const cliApprovalCallback = useCallback(async (prompt: ApprovalPrompt): Promise<'allow' | 'deny'> => {
+    return new Promise<'allow' | 'deny'>((resolve) => {
+      setPendingApproval({ prompt, resolve });
+    });
+  }, []);
+
+  // ── Web UI governance approval pending map ────────────────────────────────
+  // Key: unique approval ID, Value: resolver function
+  const webApprovalPendingRef = useRef<Map<string, (answer: 'allow' | 'deny') => void>>(new Map());
 
   const envBranchMaxDepth = Number(process.env.REACT_BRANCH_MAX_DEPTH ?? 2);
   const branchMaxDepth = Number.isFinite(envBranchMaxDepth) ? Math.max(0, Math.min(4, Math.floor(envBranchMaxDepth))) : 2;
@@ -1234,7 +1270,17 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
               roundTraces.push({ type: event.type, content: event.content, metadata: event.metadata });
               roundBranchState = applyBranchTraceEvent(roundBranchState, event, roundBranchSeen);
               sendSSE({ kind: 'trace', event, branchState: roundBranchState });
-            }, { conversationId: `thread:${tId}`, sessionId: `thread-${tId}-${roundId}` });
+            }, {
+              conversationId: `thread:${tId}`,
+              sessionId: `thread-${tId}-${roundId}`,
+              onApproval: async (prompt: ApprovalPrompt) => {
+                const approvalId = `${tId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                sendSSE({ kind: 'approval_request', approvalId, prompt });
+                return new Promise<'allow' | 'deny'>((resolve) => {
+                  webApprovalPendingRef.current.set(approvalId, resolve);
+                });
+              },
+            });
 
             const round: ThreadRound = {
               id: roundId,
@@ -1263,6 +1309,30 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
           } finally {
             activeThreadRunsRef.current.delete(tId);
             if (!res.writableEnded) res.end();
+          }
+          return;
+        }
+
+        // POST /api/threads/:id/approve – resolve a pending governance approval
+        if (subPath === '/approve' && method === 'POST') {
+          try {
+            const body = await readBody(req);
+            const approvalId = String(body?.approvalId || '').trim();
+            const answer = String(body?.answer || '').trim();
+            if (!approvalId || (answer !== 'allow' && answer !== 'deny')) {
+              writeJson(res, 400, { ok: false, error: 'approvalId and answer (allow|deny) are required' });
+              return;
+            }
+            const resolver = webApprovalPendingRef.current.get(approvalId);
+            if (!resolver) {
+              writeJson(res, 404, { ok: false, error: 'No pending approval with this ID' });
+              return;
+            }
+            webApprovalPendingRef.current.delete(approvalId);
+            resolver(answer as 'allow' | 'deny');
+            writeJson(res, 200, { ok: true });
+          } catch (error: any) {
+            writeJson(res, 500, { ok: false, error: error?.message || String(error) });
           }
           return;
         }
@@ -1374,7 +1444,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
         traceType: event.type,
         traceMeta: event.metadata,
       }]);
-    }, { conversationId: 'terminal-main', sessionId: `terminal-${Date.now()}` });
+    }, { conversationId: 'terminal-main', sessionId: `terminal-${Date.now()}`, onApproval: cliApprovalCallback });
     setHistory((prev: HistoryItem[]) => [...prev, { type: 'agent', content: response }]);
   };
 
@@ -1808,7 +1878,38 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
       </Box>
 
       {isProcessing ? (
-        <Text color="cyan">⚙️ {status}</Text>
+        pendingApproval ? (
+          <Box flexDirection="column">
+            <Box marginBottom={1}>
+              <Text color="yellow" bold>⚠️  Governance approval required</Text>
+            </Box>
+            <Box>
+              <Text color="dim">Tool: </Text>
+              <Text color="white">{pendingApproval.prompt.toolName}</Text>
+            </Box>
+            <Box>
+              <Text color="dim">Reason: </Text>
+              <Text color="white">{pendingApproval.prompt.reason}</Text>
+            </Box>
+            {pendingApproval.prompt.args.path ? (
+              <Box>
+                <Text color="dim">Path: </Text>
+                <Text color="white">{String(pendingApproval.prompt.args.path)}</Text>
+              </Box>
+            ) : null}
+            {pendingApproval.prompt.args.command ? (
+              <Box>
+                <Text color="dim">Command: </Text>
+                <Text color="white">{String(pendingApproval.prompt.args.command).slice(0, 120)}</Text>
+              </Box>
+            ) : null}
+            <Box marginTop={1}>
+              <Text color="green" bold>Allow? [Y/n] </Text>
+            </Box>
+          </Box>
+        ) : (
+          <Text color="cyan">⚙️ {status}</Text>
+        )
       ) : (
         <Box>
           <Text color="blue">{'> '}</Text>

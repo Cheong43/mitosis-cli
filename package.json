@@ -7,13 +7,17 @@
     "start": "node --loader ts-node/esm src/index.tsx",
     "build": "tsc",
     "dev": "node --loader ts-node/esm src/index.tsx",
-    "test": "npm run build && node --test dist/runtime/agent/*.test.js dist/agent/*.test.js"
+    "test": "npm run build && node --test dist/runtime/agent/*.test.js dist/agent/*.test.js",
+    "test:budget": "npm run build && node --test dist/agent/contextBudget.test.js",
+    "test:budget:live": "npm run build && node --test dist/agent/contextBudget.integration.test.js",
+    "test:session": "npm run build && node --test dist/agent/sessionCompressor.test.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.80.0",
     "dotenv": "^16.4.7",
     "ink": "^5.0.1",
     "ink-text-input": "^6.0.0",

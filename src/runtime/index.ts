@@ -30,13 +30,15 @@ import { ToolExecutionResult } from './tools/types.js';
 import { ReadFileTool } from './tools/builtin/local/ReadFileTool.js';
 import { WriteFileTool } from './tools/builtin/local/WriteFileTool.js';
 import { RunShellTool } from './tools/builtin/local/RunShellTool.js';
-import { Policy } from './governance/types.js';
+import { Policy, ApprovalEngine } from './governance/types.js';
 
 export { ToolRuntime } from './tools/ToolRuntime.js';
 export { ToolRegistry } from './tools/ToolRegistry.js';
 export { GovernanceRuntime } from './governance/GovernanceRuntime.js';
 export { AuditLogger } from './governance/AuditLogger.js';
 export { InMemoryApprovalEngine } from './governance/InMemoryApprovalEngine.js';
+export { CallbackApprovalEngine } from './governance/CallbackApprovalEngine.js';
+export type { ApprovalPrompt, ApprovalCallback } from './governance/CallbackApprovalEngine.js';
 export { ExternalDirGuard } from './governance/guards/ExternalDirGuard.js';
 export { DoomLoopGuard } from './governance/guards/DoomLoopGuard.js';
 export { ShellSafetyGuard } from './governance/guards/ShellSafetyGuard.js';
@@ -49,6 +51,7 @@ export { BeamSearchAgentRuntime } from './agent/BeamSearchAgentRuntime.js';
 export { DefaultPathScorer } from './agent/DefaultPathScorer.js';
 
 export type { Policy } from './governance/types.js';
+export type { ApprovalEngine } from './governance/types.js';
 export type { ToolDefinition, ToolExecutionContext, ToolExecutionResult } from './tools/types.js';
 export type { AgentTraceEvent, BeamPath, PathScorer, PathHistoryEntry } from './agent/types.js';
 
@@ -62,8 +65,14 @@ export interface RuntimeConfig {
    * Default answer for the `ask` approval engine when running non-interactively.
    * Defaults to `'allow'` so that the new runtime is transparent by default
    * until a custom `ApprovalEngine` is wired in.
+   * Ignored if `approvalEngine` is provided.
    */
   askDefault?: 'allow' | 'deny';
+  /**
+   * Custom approval engine for interactive `ask` resolution.
+   * When provided, takes precedence over `askDefault`.
+   */
+  approvalEngine?: ApprovalEngine;
 }
 
 export interface RuntimeHandle {
@@ -85,10 +94,11 @@ export function createRuntime(config: RuntimeConfig): RuntimeHandle {
     sessionId = `session-${Date.now()}`,
     policy,
     askDefault = 'allow',
+    approvalEngine: customApprovalEngine,
   } = config;
 
   // 1. Governance layer
-  const approvalEngine = new InMemoryApprovalEngine(askDefault);
+  const approvalEngine = customApprovalEngine ?? new InMemoryApprovalEngine(askDefault);
   const governance = new GovernanceRuntime({ projectRoot, policy, approvalEngine });
 
   // 2. Tool registry

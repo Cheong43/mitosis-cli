@@ -1,6 +1,7 @@
 import {
   NoObjectGeneratedError,
   buildLanguageModel,
+  buildAnthropicLanguageModel,
   generateObject,
   generateText,
   type LanguageModelV1,
@@ -12,7 +13,8 @@ import * as path from 'path';
 import * as dotenv from 'dotenv';
 import { z } from 'zod';
 import { resolveCodeCliRoot } from '../config/projectPaths.js';
-import { AgentRuntime, createRuntime, RuntimeHandle, BeamSearchAgentRuntime } from '../runtime/index.js';
+import { AgentRuntime, createRuntime, RuntimeHandle, BeamSearchAgentRuntime, CallbackApprovalEngine } from '../runtime/index.js';
+import type { ApprovalCallback } from '../runtime/index.js';
 import type { AgentBranchState, BranchSynthesisInput } from '../runtime/agent/AgentRuntime.js';
 import { TOOLS, TOOL_NAMES } from '../tools/definitions.js';
 import { installWorkspaceSkillFromLibraryViaCli } from '../mempedia/cli.js';
@@ -26,6 +28,15 @@ import {
   resolveSkillsByName,
   type SkillRecord,
 } from '../skills/router.js';
+import {
+  computeContextBudget,
+  estimateTokens,
+  estimateTranscriptTokens,
+  compressTranscript,
+  getCompressionLevel,
+  type ContextBudgetResult,
+} from './contextBudget.js';
+import { SessionCompressor, isRunExhausted } from './sessionCompressor.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -150,12 +161,17 @@ export interface AgentConfig {
   hmacSecretKey?: string;
   memoryHmacAccessKey?: string;
   memoryHmacSecretKey?: string;
+  anthropicAuthToken?: string;
+  anthropicBaseURL?: string;
+  anthropicModel?: string;
 }
 
 export interface AgentRunOptions {
   conversationId?: string;
   agentId?: string;
   sessionId?: string;
+  /** Interactive approval callback for governance `ask` decisions. */
+  onApproval?: ApprovalCallback;
 }
 
 interface PerfEntry {
@@ -254,54 +270,80 @@ export class Agent {
   /** Governed runtime handle — routes mempedia actions through policy + guards. */
   private readonly runtimeHandle: RuntimeHandle;
   private readonly memoryClassifier: MemoryClassifierAgent;
+  /** Per-session compressor for exhausted-run carry-over. */
+  private readonly sessionCompressor: SessionCompressor;
 
   constructor(config: AgentConfig, projectRoot: string, binaryPath?: string) {
     this.projectRoot = projectRoot;
     this.codeCliRoot = resolveCodeCliRoot(__dirname);
-    this.model = config.model || 'gpt-4o';
+    this.model = config.anthropicModel || config.model || 'gpt-4o';
     this.memoryModel = config.memoryModel || this.model;
-    this.openai = buildLanguageModel({
-      model: this.model,
-      apiKey: config.apiKey,
-      baseURL: config.baseURL,
-      hmacAccessKey: config.hmacAccessKey,
-      hmacSecretKey: config.hmacSecretKey,
-      gatewayApiKey: config.gatewayApiKey,
-    });
-    this.beamPlannerStructuredOpenai = buildLanguageModel(
-      {
+
+    // ── Primary LLM: prefer Anthropic if configured ────────────────────
+    const useAnthropic = Boolean(config.anthropicAuthToken);
+    if (useAnthropic) {
+      const anthropicModel = buildAnthropicLanguageModel({
+        model: this.model,
+        authToken: config.anthropicAuthToken!,
+        baseURL: config.anthropicBaseURL,
+      });
+      this.openai = anthropicModel;
+      this.beamPlannerStructuredOpenai = anthropicModel;
+      this.beamPlannerCompatOpenai = anthropicModel;
+    } else {
+      this.openai = buildLanguageModel({
         model: this.model,
         apiKey: config.apiKey,
         baseURL: config.baseURL,
         hmacAccessKey: config.hmacAccessKey,
         hmacSecretKey: config.hmacSecretKey,
         gatewayApiKey: config.gatewayApiKey,
-      },
-      { structuredOutputs: true }
-    );
-    this.beamPlannerCompatOpenai = buildLanguageModel(
-      {
-        model: this.model,
-        apiKey: config.apiKey,
-        baseURL: config.baseURL,
-        hmacAccessKey: config.hmacAccessKey,
-        hmacSecretKey: config.hmacSecretKey,
-        gatewayApiKey: config.gatewayApiKey,
-      },
-      { structuredOutputs: false }
-    );
+      });
+      this.beamPlannerStructuredOpenai = buildLanguageModel(
+        {
+          model: this.model,
+          apiKey: config.apiKey,
+          baseURL: config.baseURL,
+          hmacAccessKey: config.hmacAccessKey,
+          hmacSecretKey: config.hmacSecretKey,
+          gatewayApiKey: config.gatewayApiKey,
+        },
+        { structuredOutputs: true }
+      );
+      this.beamPlannerCompatOpenai = buildLanguageModel(
+        {
+          model: this.model,
+          apiKey: config.apiKey,
+          baseURL: config.baseURL,
+          hmacAccessKey: config.hmacAccessKey,
+          hmacSecretKey: config.hmacSecretKey,
+          gatewayApiKey: config.gatewayApiKey,
+        },
+        { structuredOutputs: false }
+      );
+    }
+
+    // ── Memory LLM: reuse Anthropic if no separate memory config ───────
     const memoryBaseURL = config.memoryBaseURL || config.baseURL;
     const memoryAccessKey = config.memoryHmacAccessKey || config.hmacAccessKey;
     const memorySecretKey = config.memoryHmacSecretKey || config.hmacSecretKey;
     const memoryGatewayKey = config.memoryGatewayApiKey || config.gatewayApiKey;
-    this.memoryOpenai = buildLanguageModel({
-      model: this.memoryModel,
-      apiKey: config.memoryApiKey || config.apiKey,
-      baseURL: memoryBaseURL,
-      hmacAccessKey: memoryAccessKey,
-      hmacSecretKey: memorySecretKey,
-      gatewayApiKey: memoryGatewayKey,
-    });
+    if (useAnthropic && !config.memoryApiKey) {
+      this.memoryOpenai = buildAnthropicLanguageModel({
+        model: this.memoryModel,
+        authToken: config.anthropicAuthToken!,
+        baseURL: config.anthropicBaseURL,
+      });
+    } else {
+      this.memoryOpenai = buildLanguageModel({
+        model: this.memoryModel,
+        apiKey: config.memoryApiKey || config.apiKey,
+        baseURL: memoryBaseURL,
+        hmacAccessKey: memoryAccessKey,
+        hmacSecretKey: memorySecretKey,
+        gatewayApiKey: memoryGatewayKey,
+      });
+    }
     this.mempedia = new MempediaClient(projectRoot, binaryPath);
     this.interactionCounter = 0;
     this.maxConversationTurns = 5;
@@ -361,6 +403,7 @@ export class Agent {
       autoLinkMaxNodes: this.autoLinkMaxNodes,
       autoLinkLimit: this.autoLinkLimit,
     });
+    this.sessionCompressor = new SessionCompressor();
   }
 
   onBackgroundTask(callback: (task: string, status: 'started' | 'completed') => void) {
@@ -988,27 +1031,43 @@ export class Agent {
       if (!url) {
         return JSON.stringify({ kind: 'error', message: 'web fetch requires url' });
       }
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), safeWebTimeout);
-      try {
-        const response = await fetch(url, { headers: { 'User-Agent': 'mitosis-cli' }, signal: ac.signal });
-        const html = await response.text();
-        if (!response.ok) {
-          return JSON.stringify({ kind: 'error', message: `HTTP ${response.status} ${response.statusText}` });
+      const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+      const MAX_FETCH_RETRIES = 2;
+      for (let attempt = 0; attempt <= MAX_FETCH_RETRIES; attempt++) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), safeWebTimeout);
+        try {
+          const response = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' }, signal: ac.signal, redirect: 'follow' });
+          const html = await response.text();
+          if (!response.ok) {
+            // Retry on 429 / 5xx
+            if (attempt < MAX_FETCH_RETRIES && (response.status === 429 || response.status >= 500)) {
+              clearTimeout(timer);
+              await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+              continue;
+            }
+            return JSON.stringify({ kind: 'error', message: `HTTP ${response.status} ${response.statusText}` });
+          }
+          const title = html.match(/<title>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim() || url;
+          return JSON.stringify({
+            kind: 'web_fetch',
+            url,
+            title,
+            content: this.stripHtml(html).slice(0, 3000),
+          });
+        } catch (err: any) {
+          clearTimeout(timer);
+          const isAbort = err?.name === 'AbortError';
+          if (!isAbort && attempt < MAX_FETCH_RETRIES) {
+            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+            continue;
+          }
+          return JSON.stringify({ kind: 'error', message: isAbort ? `web fetch timed out after ${safeWebTimeout}ms` : String(err?.message || err) });
+        } finally {
+          clearTimeout(timer);
         }
-        const title = html.match(/<title>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim() || url;
-        return JSON.stringify({
-          kind: 'web_fetch',
-          url,
-          title,
-          content: this.stripHtml(html).slice(0, 3000),
-        });
-      } catch (err: any) {
-        const isAbort = err?.name === 'AbortError';
-        return JSON.stringify({ kind: 'error', message: isAbort ? `web fetch timed out after ${safeWebTimeout}ms` : String(err?.message || err) });
-      } finally {
-        clearTimeout(timer);
       }
+      return JSON.stringify({ kind: 'error', message: 'web fetch exhausted retries' });
     }
 
     if (mode === 'search') {
@@ -1018,22 +1077,41 @@ export class Agent {
       }
       const limit = Math.max(1, Math.min(10, Number.isFinite(Number(args.limit)) ? Math.floor(Number(args.limit)) : 5));
       const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+      const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), safeWebTimeout);
       try {
-        const response = await fetch(url, { headers: { 'User-Agent': 'mitosis-cli' }, signal: ac.signal });
+        const response = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' }, signal: ac.signal });
         const html = await response.text();
         if (!response.ok) {
           return JSON.stringify({ kind: 'error', message: `HTTP ${response.status} ${response.statusText}` });
         }
-        const results: Array<{ title: string; url: string }> = [];
+        const results: Array<{ title: string; url: string; snippet: string }> = [];
+        // Extract link titles + raw hrefs (DuckDuckGo redirect URLs).
         const linkRegex = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+        const rawLinks: Array<{ rawUrl: string; title: string }> = [];
         let match: RegExpExecArray | null = null;
-        while ((match = linkRegex.exec(html)) && results.length < limit) {
-          results.push({
-            url: match[1],
-            title: this.stripHtml(match[2]),
-          });
+        while ((match = linkRegex.exec(html)) && rawLinks.length < limit) {
+          rawLinks.push({ rawUrl: match[1], title: this.stripHtml(match[2]) });
+        }
+        // Extract snippets.
+        const snippetRegex = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
+        const snippets: string[] = [];
+        let sm: RegExpExecArray | null = null;
+        while ((sm = snippetRegex.exec(html)) && snippets.length < limit) {
+          snippets.push(this.stripHtml(sm[1]).slice(0, 300));
+        }
+        // Resolve real URLs from DuckDuckGo redirect `uddg` param.
+        for (let i = 0; i < rawLinks.length; i++) {
+          const { rawUrl, title } = rawLinks[i];
+          let realUrl = rawUrl;
+          const uddgMatch = rawUrl.match(/[?&]uddg=([^&]+)/);
+          if (uddgMatch) {
+            try { realUrl = decodeURIComponent(uddgMatch[1]); } catch { /* keep rawUrl */ }
+          } else if (realUrl.startsWith('//')) {
+            realUrl = 'https:' + realUrl;
+          }
+          results.push({ title, url: realUrl, snippet: snippets[i] || '' });
         }
         return JSON.stringify({ kind: 'web_search', query, results });
       } catch (err: any) {
@@ -2183,7 +2261,12 @@ export class Agent {
     const conversationId = options.conversationId || 'default';
     const runAgentId = options.agentId || 'agent-main';
     const runSessionId = options.sessionId || `agent-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const runRuntimeHandle = createRuntime({ projectRoot: this.projectRoot, agentId: runAgentId, sessionId: runSessionId });
+    const runRuntimeHandle = createRuntime({
+      projectRoot: this.projectRoot,
+      agentId: runAgentId,
+      sessionId: runSessionId,
+      ...(options.onApproval ? { approvalEngine: new CallbackApprovalEngine(options.onApproval) } : {}),
+    });
     const emitTrace = (event: TraceEvent) => {
       traceBuffer.push(event);
       onTrace(event);
@@ -2224,6 +2307,16 @@ export class Agent {
       context = 'Failed to retrieve context from Mempedia.';
     }
 
+    // ── Session carry-over from previous exhausted runs ─────────────────
+    const carryOver = this.sessionCompressor.getCarryOver(conversationId);
+    if (carryOver) {
+      context = `${context}\n\n--- CARRY-OVER FROM PREVIOUS EXHAUSTED RUN(S) ---\n${carryOver.text}\n--- END CARRY-OVER ---`;
+      emitTrace({
+        type: 'observation',
+        content: `Injected carry-over from ${carryOver.runCount} previous exhausted run(s) (≈${carryOver.tokenEstimate} tokens). The agent should continue from these findings rather than re-exploring.`,
+      });
+    }
+
     const recentConversationMessages = selectedConversationTurns.flatMap((turn) => [
       { role: 'user', content: turn.user },
       { role: 'assistant', content: turn.assistant }
@@ -2249,7 +2342,7 @@ You only use five top-level tools:
   search -> grep/glob workspace files
   edit   -> edit workspace files
   bash   -> run sandboxed shell commands
-  web    -> search/fetch external web content when repository evidence is insufficient
+  web    -> search the web (returns title+url+snippet) or fetch a page; use for external/current information
 
 Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md and ./.github/skills/*/SKILL.md.
 ${localSkillsIndex ? `${localSkillsIndex}\n` : ''}Skills are guidance documents, not tool names. Never emit skill names such as project-discovery in tool_calls.name.
@@ -2282,7 +2375,9 @@ Rules:
 8. The skill catalog is lightweight; request full skill guidance only when it materially changes the next step.
 9. Do not answer a project-overview question by listing local skills unless the user explicitly asked about the skill system.
 10. Use bash whenever shell is the practical tool, but remember dangerous shell operations are sandboxed and should require confirmation.
-11. Use web only when repository evidence is insufficient.
+11. Use web for questions about external topics, current events, APIs, libraries, or anything not answerable from workspace files. Prefer workspace evidence only for project-specific questions. When web search returns results, read the snippet field first — only fetch a page if the snippet is insufficient.
+11a. web mode=search returns {title, url, snippet} — use snippets to decide which results are relevant before fetching full pages.
+11b. When you need current/external information, use web proactively — do not guess or rely on training data when a quick search would give a definitive answer.
 12. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
 13. When you finish, return kind="final" with a direct user-facing answer.
 18. NEVER use \`edit\` to write to Mempedia storage paths (core-knowledge/, episodic/, .mempedia/, preferences/, skills/). ALL Mempedia Layer 1/2/3/4 read and write operations MUST go through \`bash\` using the mempedia CLI binary. Using \`edit\` on these paths bypasses indexing, versioning, and embedding; the data will be invisible to the system.
@@ -2308,6 +2403,34 @@ ${selectedNodeIds.length > 0 ? selectedNodeIds.join(', ') : '(none)'}
 ${soulsGuidance ? `Global souls.md guidance:
 ${soulsGuidance}
 ` : ''}`;
+
+    // ── Dynamic context budget computation ──────────────────────────────
+    const systemPromptTokens = estimateTokens(systemPrompt);
+    const conversationContextTokens = estimateTranscriptTokens(recentConversationMessages);
+    const memoryContextTokens = estimateTokens(context);
+    const ctxBudget = computeContextBudget({
+      model: this.model,
+      systemPromptTokens,
+      conversationContextTokens,
+      memoryContextTokens,
+    });
+    emitTrace({
+      type: 'observation',
+      content: `Context budget: model=${this.model} limit=${ctxBudget.modelLimit} committed=${ctxBudget.committedTokens} residual=${ctxBudget.residualBudget} → maxSteps=${ctxBudget.maxSteps} depth=${ctxBudget.maxBranchDepth} width=${ctxBudget.maxBranchWidth} totalSteps=${ctxBudget.maxTotalSteps} transcriptChars=${ctxBudget.transcriptBudgetChars} beamDepth=${ctxBudget.beamMaxDepth} beamWidth=${ctxBudget.beamWidth}`,
+    });
+
+    // Effective parameters: take the minimum of env-configured and budget-computed values.
+    const effectiveMaxSteps = Math.min(this.branchMaxSteps, ctxBudget.maxSteps);
+    const effectiveMaxDepth = Math.min(this.branchMaxDepth, ctxBudget.maxBranchDepth);
+    const effectiveMaxWidth = Math.min(this.branchMaxWidth, ctxBudget.maxBranchWidth);
+    const effectiveMaxTotalSteps = Math.min(
+      this.branchMaxSteps * this.branchMaxWidth * (this.branchMaxDepth + 1),
+      ctxBudget.maxTotalSteps,
+    );
+    const effectiveTranscriptBudgetChars = ctxBudget.transcriptBudgetChars;
+    const effectiveBeamMaxDepth = Math.min(this.beamMaxDepth, ctxBudget.beamMaxDepth);
+    const effectiveBeamWidth = Math.min(this.beamWidth, ctxBudget.beamWidth);
+    const effectiveBeamExpansionFactor = Math.min(this.beamExpansionFactor, ctxBudget.beamExpansionFactor);
 
     const extractText = (content: any): string => {
       if (typeof content === 'string') {
@@ -2445,8 +2568,12 @@ ${soulsGuidance}
           continue;
         }
         const probe: Record<string, unknown> = { ...obj as Record<string, unknown> };
-        const inferredKind = typeof probe.kind === 'string'
-          ? probe.kind
+        const VALID_KINDS = new Set(['tool', 'branch', 'final', 'skills']);
+        const rawKind = typeof probe.kind === 'string' ? probe.kind.trim().toLowerCase() : null;
+        const inferredKind = rawKind && VALID_KINDS.has(rawKind)
+          ? rawKind
+          : rawKind && !VALID_KINDS.has(rawKind) && (Array.isArray(probe.tool_calls) || TOOL_NAMES.includes(rawKind as any))
+            ? 'tool'
           : Array.isArray(probe.skills_to_load) && probe.skills_to_load.length > 0
             ? 'skills'
           : typeof probe.final_answer === 'string' || typeof probe.finalAnswer === 'string' || typeof probe.answer === 'string' || typeof probe.content === 'string'
@@ -2572,6 +2699,18 @@ ${soulsGuidance}
         } else {
           normalizedRecord.final_answer = '抱歉，当前没有生成有效回答。请重试一次。';
         }
+      }
+
+      // Deduplicate tool_calls: some models (e.g. MiniMax via Anthropic format)
+      // occasionally return each tool call twice in the JSON response.
+      if (Array.isArray(normalizedRecord.tool_calls) && normalizedRecord.tool_calls.length > 1) {
+        const seen = new Set<string>();
+        normalizedRecord.tool_calls = (normalizedRecord.tool_calls as Array<Record<string, unknown>>).filter((call) => {
+          const key = JSON.stringify({ n: call.name, a: call.arguments });
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
       }
 
       return PlannerDecisionSchema.parse(normalizedRecord);
@@ -2703,31 +2842,18 @@ ${soulsGuidance}
       };
     };
 
-    const transcriptBudgetChars = 12000;
     const buildMessages = (branch: BranchState) => {
-      let transcriptMessages = branch.transcript;
-      const totalLen = branch.transcript.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content).length), 0);
-      if (totalLen > transcriptBudgetChars) {
-        // Always keep the first message (user request), then fill from the end to stay within budget
-        const first = branch.transcript.slice(0, 1);
-        const rest = branch.transcript.slice(1);
-        const firstLen = typeof first[0]?.content === 'string' ? first[0].content.length : JSON.stringify(first[0]?.content ?? '').length;
-        let budget = transcriptBudgetChars - firstLen;
-        const kept: typeof branch.transcript = [];
-        for (let i = rest.length - 1; i >= 0 && budget > 0; i--) {
-          const len = typeof rest[i].content === 'string' ? rest[i].content.length : JSON.stringify(rest[i].content).length;
-          budget -= len;
-          if (budget >= 0) kept.unshift(rest[i]);
-        }
-        transcriptMessages = [...first, ...kept];
-      }
+      const compressed = compressTranscript(
+        branch.transcript,
+        effectiveTranscriptBudgetChars,
+      );
       return [
         { role: 'system', content: systemPrompt },
         ...recentConversationMessages,
-        ...transcriptMessages,
+        ...compressed,
         {
           role: 'user',
-          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}/${this.branchMaxDepth}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- step_budget: ${branch.steps}/${this.branchMaxSteps}\n\nReturn exactly one JSON object. Branch (kind="branch") when (a) you have materially distinct strategies to try in parallel, or (b) the remaining work has 2+ independent sub-tasks that do not depend on each other's output. Always provide at least 2 branches when branching, or use kind="tool" / kind="final" instead.`,
+          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}/${effectiveMaxDepth}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- step_budget: ${branch.steps}/${effectiveMaxSteps}\n- context_budget_residual: ${ctxBudget.residualBudget} tokens\n\nReturn exactly one JSON object. Branch (kind="branch") when (a) you have materially distinct strategies to try in parallel, or (b) the remaining work has 2+ independent sub-tasks that do not depend on each other's output. Always provide at least 2 branches when branching, or use kind="tool" / kind="final" instead.`,
         },
       ];
     };
@@ -2849,7 +2975,7 @@ ${soulsGuidance}
 
     if (this.useBeamSearch) {
       // ── Beam Search ReAct mode ──────────────────────────────────────────
-      emitTrace({ type: 'thought', content: `Using beam-search mode (width=${this.beamWidth}, depth=${this.beamMaxDepth}, expansion=${this.beamExpansionFactor}).` });
+      emitTrace({ type: 'thought', content: `Using beam-search mode (width=${effectiveBeamWidth}, depth=${effectiveBeamMaxDepth}, expansion=${effectiveBeamExpansionFactor}).` });
       const beamPlanner = {
         plan: async (transcript: Array<{ role: string; content: string }>) => {
           const baseTranscript = transcript as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
@@ -3004,9 +3130,9 @@ ${soulsGuidance}
           },
           resetSession: () => runRuntimeHandle.toolRuntime.resetSession(),
         },
-        beamWidth: this.beamWidth,
-        maxDepth: this.beamMaxDepth,
-        expansionFactor: this.beamExpansionFactor,
+        beamWidth: effectiveBeamWidth,
+        maxDepth: effectiveBeamMaxDepth,
+        expansionFactor: effectiveBeamExpansionFactor,
         onTrace: (event) => {
           if (event.type === 'final') return;
           emitTrace({ type: event.type, content: event.content, metadata: event.metadata });
@@ -3024,11 +3150,12 @@ ${soulsGuidance}
         execute: async () => ({ success: false, error: 'unreachable tool runtime fallback', durationMs: 0 }),
         resetSession: () => runRuntimeHandle.toolRuntime.resetSession(),
       },
-      maxSteps: this.branchMaxSteps,
-      maxBranchDepth: this.branchMaxDepth,
-      maxBranchWidth: this.branchMaxWidth,
+      maxSteps: effectiveMaxSteps,
+      maxBranchDepth: effectiveMaxDepth,
+      maxBranchWidth: effectiveMaxWidth,
       maxCompletedBranches: this.branchMaxCompleted,
       branchConcurrency: this.branchConcurrency,
+      maxTotalSteps: effectiveMaxTotalSteps,
       planBranch: async ({ branch }) => {
         const decision = await planWithSkillRouting(
           buildMessages(branch as BranchState) as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
@@ -3092,6 +3219,30 @@ ${soulsGuidance}
     });
     finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. Branch (kind="branch") when (a) multiple distinct approaches are worth exploring in parallel, or (b) the request has 2 or more clearly independent sub-tasks. Always provide at least 2 branches, or do not branch.`);
     }
+
+    // ── Session carry-over: detect exhaustion and record/clear ──────────
+    if (isRunExhausted(traceBuffer, finalAnswer)) {
+      const record = this.sessionCompressor.recordExhaustedRun(
+        conversationId,
+        input,
+        traceBuffer,
+        finalAnswer,
+      );
+      emitTrace({
+        type: 'observation',
+        content: `Run exhausted step budget. Compressed carry-over recorded (≈${record.tokenEstimate} tokens, ${record.toolTrace.length} tools traced). Next turn for this conversation will continue from these findings.`,
+      });
+    } else {
+      // Normal completion — clear any accumulated carry-over.
+      if (this.sessionCompressor.hasCarryOver(conversationId)) {
+        this.sessionCompressor.clearCarryOver(conversationId);
+        emitTrace({
+          type: 'observation',
+          content: 'Run completed normally. Cleared session carry-over.',
+        });
+      }
+    }
+
     if (this.hadExplicitMemoryWrite(traceBuffer)) {
       memoryQueuedThisRun = true;
     }

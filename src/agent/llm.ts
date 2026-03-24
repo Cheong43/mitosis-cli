@@ -1,10 +1,11 @@
 /**
- * LLM factory and helpers built directly on the official OpenAI SDK.
+ * LLM factory and helpers for OpenAI and Anthropic format APIs.
  *
- * Auth priority: HMAC > Gateway > plain API key.
+ * Auth priority (OpenAI): HMAC > Gateway > plain API key.
  */
 import crypto from 'crypto';
 import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
 import { zodResponseFormat } from 'openai/helpers/zod';
 import { z } from 'zod';
 
@@ -12,8 +13,11 @@ export interface OpenAIChatSettings {
   structuredOutputs?: boolean;
 }
 
+export type LLMProvider = 'openai' | 'anthropic';
+
 export interface LanguageModelV1 {
-  client: OpenAI;
+  provider: LLMProvider;
+  client: OpenAI | Anthropic;
   model: string;
   supportsStructuredOutputs: boolean;
 }
@@ -60,6 +64,12 @@ export interface LLMEndpointConfig {
   hmacAccessKey?: string;
   hmacSecretKey?: string;
   gatewayApiKey?: string;
+}
+
+export interface AnthropicEndpointConfig {
+  model: string;
+  authToken: string;
+  baseURL?: string;
 }
 
 export function buildHmacFetch(accessKey: string, secretKey: string): typeof globalThis.fetch {
@@ -180,15 +190,118 @@ function buildClient(cfg: LLMEndpointConfig): OpenAI {
 
 export function buildLanguageModel(cfg: LLMEndpointConfig, chatSettings?: OpenAIChatSettings): LanguageModelV1 {
   return {
+    provider: 'openai',
     client: buildClient(cfg),
     model: cfg.model,
     supportsStructuredOutputs: Boolean(chatSettings?.structuredOutputs),
   };
 }
 
+export function buildAnthropicLanguageModel(cfg: AnthropicEndpointConfig): LanguageModelV1 {
+  const client = new Anthropic({
+    apiKey: cfg.authToken,
+    ...(cfg.baseURL ? { baseURL: cfg.baseURL } : {}),
+  });
+  return {
+    provider: 'anthropic',
+    client,
+    model: cfg.model,
+    supportsStructuredOutputs: false,
+  };
+}
+
+/* ── Anthropic helpers ────────────────────────────────────────────────────── */
+
+function splitSystemAndMessages(
+  messages: ChatMessage[],
+): { system: string | undefined; messages: Array<{ role: 'user' | 'assistant'; content: string }> } {
+  let system: string | undefined;
+  const out: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  for (const m of messages) {
+    if (m.role === 'system') {
+      system = system ? `${system}\n\n${m.content}` : m.content;
+    } else {
+      out.push({ role: m.role, content: typeof m.content === 'string' ? m.content : String(m.content ?? '') });
+    }
+  }
+  // Anthropic requires at least one message and it must start with 'user'.
+  if (out.length === 0) {
+    out.push({ role: 'user', content: system || '' });
+    system = undefined;
+  }
+  return { system, messages: out };
+}
+
+function extractAnthropicText(response: Anthropic.Message): string {
+  if (!Array.isArray(response.content)) {
+    // Some proxies return content as a plain string or undefined
+    if (typeof response.content === 'string') return response.content;
+    return '';
+  }
+  for (const block of response.content) {
+    if (block.type === 'text') {
+      return block.text;
+    }
+  }
+  return '';
+}
+
+async function anthropicGenerateText(
+  client: Anthropic,
+  model: string,
+  messages: ChatMessage[],
+  jsonMode?: boolean,
+): Promise<string> {
+  const { system, messages: anthropicMsgs } = splitSystemAndMessages(messages);
+  const systemText = jsonMode && system
+    ? `${system}\n\nIMPORTANT: You MUST respond with valid JSON only. No other text.`
+    : jsonMode
+      ? 'You MUST respond with valid JSON only. No other text.'
+      : system;
+
+  const maxRetries = 3;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const response = await client.messages.create({
+        model,
+        max_tokens: 8192,
+        ...(systemText ? { system: systemText } : {}),
+        messages: anthropicMsgs,
+      });
+      return extractAnthropicText(response);
+    } catch (error: any) {
+      const status = error?.status ?? error?.statusCode;
+      const isRetryable = status === 429 || status === 500 || status === 502 || status === 503 || status === 520;
+      if (isRetryable && attempt < maxRetries - 1) {
+        const baseDelay = status === 429 ? 1000 : 2000;
+        const delay = Math.min(baseDelay * Math.pow(2, attempt), 16000);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error('anthropicGenerateText: exhausted retries');
+}
+
+/* ── Public API ───────────────────────────────────────────────────────────── */
+
 export async function generateText(options: GenerateTextOptions): Promise<{ text: string }> {
+  if (options.model.provider === 'anthropic') {
+    const jsonMode = options.providerOptions?.openai?.responseFormat?.type === 'json_object';
+    const text = await anthropicGenerateText(
+      options.model.client as Anthropic,
+      options.model.model,
+      options.messages,
+      jsonMode,
+    );
+    return { text };
+  }
+
+  // OpenAI path
+  const client = options.model.client as OpenAI;
   const responseFormat = options.providerOptions?.openai?.responseFormat;
-  const completion = await options.model.client.chat.completions.create({
+  const completion = await client.chat.completions.create({
     model: options.model.model,
     messages: normalizeMessages(options.messages),
     ...(responseFormat?.type === 'json_object'
@@ -206,8 +319,22 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(options: Gene
     throw new Error(`Unsupported object generation mode: ${options.mode}`);
   }
 
+  if (options.model.provider === 'anthropic') {
+    const text = await anthropicGenerateText(
+      options.model.client as Anthropic,
+      options.model.model,
+      options.messages,
+      true,
+    );
+    const parsed = parseJsonObjectText(text);
+    return { object: options.schema.parse(parsed) };
+  }
+
+  // OpenAI path
+  const client = options.model.client as OpenAI;
+
   if (options.model.supportsStructuredOutputs) {
-    const completion = await options.model.client.chat.completions.create({
+    const completion = await client.chat.completions.create({
       model: options.model.model,
       messages: normalizeMessages(options.messages),
       response_format: zodResponseFormat(options.schema, 'response'),
@@ -224,7 +351,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(options: Gene
     };
   }
 
-  const completion = await options.model.client.chat.completions.create({
+  const completion = await client.chat.completions.create({
     model: options.model.model,
     messages: normalizeMessages(options.messages),
     response_format: { type: 'json_object' as const },

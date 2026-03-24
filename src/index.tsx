@@ -40,10 +40,14 @@ if (args[0] === 'import-doc') {
   const memoryBaseURL = process.env.MEMORY_BASE_URL;
   const memoryModel = process.env.MEMORY_MODEL;
 
-  if (!apiKey) {
+  const anthropicAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+  const anthropicBaseURL = process.env.ANTHROPIC_BASE_URL;
+  const anthropicModel = process.env.ANTHROPIC_MODEL;
+
+  if (!apiKey && !anthropicAuthToken) {
     render(
       <Text>
-        Missing API key. Please set `OPENAI_API_KEY` in `mitosis-cli/.env`.
+        Missing API key. Please set `OPENAI_API_KEY` or `ANTHROPIC_AUTH_TOKEN` in `mitosis-cli/.env`.
       </Text>
     );
     process.exit(1);
@@ -58,6 +62,9 @@ if (args[0] === 'import-doc') {
       memoryApiKey={memoryApiKey}
       memoryBaseURL={memoryBaseURL}
       memoryModel={memoryModel}
+      anthropicAuthToken={anthropicAuthToken}
+      anthropicBaseURL={anthropicBaseURL}
+      anthropicModel={anthropicModel}
     />
   );
 }
