@@ -290,6 +290,8 @@ export class Agent {
   private readonly branchMaxCompleted: number;
   private readonly branchConcurrency: number;
   private readonly agentLlmTimeoutMs: number;
+  private readonly plannerTemperature: number;
+  private readonly responseTemperature: number;
   /** When true the agent uses the beam-search loop instead of branching. */
   private readonly useBeamSearch: boolean;
   private readonly beamWidth: number;
@@ -406,6 +408,10 @@ export class Agent {
     this.branchConcurrency = Number.isFinite(rawBranchConcurrency) ? Math.max(1, Math.min(8, Math.floor(rawBranchConcurrency))) : 3;
     const rawAgentLlmTimeoutMs = Number(process.env.AGENT_LLM_TIMEOUT_MS ?? 120000);
     this.agentLlmTimeoutMs = Number.isFinite(rawAgentLlmTimeoutMs) ? Math.max(5000, Math.floor(rawAgentLlmTimeoutMs)) : 120000;
+    const rawPlannerTemperature = Number(process.env.PLANNER_TEMPERATURE ?? 0.1);
+    this.plannerTemperature = Number.isFinite(rawPlannerTemperature) ? Math.max(0, Math.min(1, rawPlannerTemperature)) : 0.1;
+    const rawResponseTemperature = Number(process.env.RESPONSE_TEMPERATURE ?? 0.3);
+    this.responseTemperature = Number.isFinite(rawResponseTemperature) ? Math.max(0, Math.min(1, rawResponseTemperature)) : 0.3;
     const rawUseBeamSearch = String(process.env.REACT_BEAM_SEARCH_ENABLED ?? '0').toLowerCase();
     this.useBeamSearch = rawUseBeamSearch === '1' || rawUseBeamSearch === 'true' || rawUseBeamSearch === 'on';
     const rawBeamWidth = Number(process.env.REACT_BEAM_WIDTH ?? 3);
@@ -468,12 +474,15 @@ export class Agent {
     messages: any;
     timeoutMs: number;
     timeoutLabel: string;
+    temperature?: number;
     onFallback?: () => void | Promise<void>;
   }): Promise<string> {
     const run = (messages: any, useJsonObject: boolean) => this.withTimeout(
       generateText({
         model: options.model,
         messages,
+        temperature: options.temperature ?? this.plannerTemperature,
+        maxTokens: 1200,
         ...(useJsonObject
           ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
           : {}),
@@ -1783,6 +1792,102 @@ export class Agent {
     return lines.join('\n');
   }
 
+  private shouldPreferSingleToolPlan(request: string): boolean {
+    const normalized = request.replace(/\s+/g, ' ').trim();
+    if (!normalized || normalized.length > 80) {
+      return false;
+    }
+    if (/保存|save|写入|persist|update|修改|编辑|compare|对比|分别|并且|同时|以及|and also|deep|深度|综合|多渠道|研究|research|方案|计划书|实现|重构/i.test(normalized)) {
+      return false;
+    }
+    if (/[\n\r]/.test(normalized)) {
+      return false;
+    }
+    return /好看|值得|怎么样|评分|评价|口碑|推荐|最新|今天|最近|新闻|票房|影评|电影|演员|歌手|review|rating|recommend|worth|latest|news|movie|actor|celebrity/i.test(normalized);
+  }
+
+  private buildSingleToolPlanForSimpleRequest(request: string): z.infer<typeof PlannerToolCallSchema> | null {
+    if (!this.shouldPreferSingleToolPlan(request)) {
+      return null;
+    }
+    return {
+      name: 'web',
+      arguments: {
+        mode: 'search',
+        query: request,
+        limit: 6,
+      },
+      goal: 'Gather the most relevant external evidence first for this simple request.',
+    };
+  }
+
+  private normalizeLegacyToolCallProbe(
+    toolNameRaw: unknown,
+    rawArgs: unknown,
+    rawGoal: unknown,
+  ): z.infer<typeof PlannerToolCallSchema> | null {
+    const toolName = typeof toolNameRaw === 'string' ? toolNameRaw.trim() : '';
+    if (!toolName) {
+      return null;
+    }
+    const args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
+      ? { ...(rawArgs as Record<string, unknown>) }
+      : {};
+    const goal = typeof rawGoal === 'string' && rawGoal.trim()
+      ? rawGoal.trim().slice(0, 240)
+      : undefined;
+
+    if (TOOL_NAMES.includes(toolName as any)) {
+      return { name: toolName as z.infer<typeof PlannerToolNameSchema>, arguments: args, ...(goal ? { goal } : {}) };
+    }
+
+    const pseudoKind = String(args['--kind'] || args.kind || '').trim().toLowerCase();
+    const pseudoQuery = args['--query'] ?? args.query;
+    const pseudoUrl = args['--url'] ?? args.url;
+    const pseudoLimit = Number(args['--limit'] ?? args.limit ?? 6);
+
+    if ((toolName === 'search' || toolName === 'web_search' || pseudoKind === 'web_search') && typeof pseudoQuery === 'string' && pseudoQuery.trim()) {
+      return {
+        name: 'web',
+        arguments: {
+          mode: 'search',
+          query: pseudoQuery.trim(),
+          limit: Number.isFinite(pseudoLimit) ? Math.max(1, Math.min(10, Math.floor(pseudoLimit))) : 6,
+        },
+        ...(goal ? { goal } : {}),
+      };
+    }
+
+    if ((toolName === 'fetch' || toolName === 'web_fetch' || pseudoKind === 'web_fetch') && typeof pseudoUrl === 'string' && pseudoUrl.trim()) {
+      return {
+        name: 'web',
+        arguments: {
+          mode: 'fetch',
+          url: pseudoUrl.trim(),
+        },
+        ...(goal ? { goal } : {}),
+      };
+    }
+
+    return null;
+  }
+
+  private adjustPlannerDecisionForRootTurn(decision: PlannerDecision, input: string): PlannerDecision {
+    if (decision.kind !== 'branch') {
+      return decision;
+    }
+    const request = this.extractOriginalUserRequest(input);
+    const singleToolPlan = this.buildSingleToolPlanForSimpleRequest(request);
+    if (!singleToolPlan) {
+      return decision;
+    }
+    return {
+      kind: 'tool',
+      thought: 'This is a simple single-question request; start with one high-confidence tool call before considering branching.',
+      tool_calls: [singleToolPlan],
+    } as PlannerDecision;
+  }
+
   private isTrivialMemoryCandidate(text: string): boolean {
     const compact = text.replace(/\s+/g, ' ').trim().toLowerCase();
     if (!compact) {
@@ -2623,13 +2728,18 @@ Allowed JSON schema:
 
 STRICT OUTPUT CONTRACT:
 - Return exactly one JSON object.
+- Start the reply with "{" and end it with "}".
 - Do not wrap the JSON in Markdown fences.
 - Do not add explanation text before or after the JSON object.
 - Do not output raw shell commands, pseudo-code, or checklists as the top-level reply.
 - If you need to show commands to the user, place them inside "final_answer" as a JSON string.
 
+VALID EXAMPLES:
+{"kind":"tool","thought":"Use web search first.","tool_calls":[{"name":"web","arguments":{"mode":"search","query":"Ryan Gosling review","limit":5},"goal":"Gather current external evidence."}]}
+{"kind":"final","thought":"Enough evidence is available.","final_answer":"我查到的主流评价是正面的。"}
+
 Rules:
-1. Prefer kind="tool" when one next action is clearly best.
+1. Prefer kind="tool" when one next action is clearly best. Most turns should not branch.
 2. Use kind="branch" in TWO situations:
    a) Multiple materially distinct strategies — different hypotheses, search paths, or execution strategies worth exploring in parallel.
    b) Multiple independent sub-tasks — when the user's request contains 2 or more clearly separable actions that do not depend on each other's output (e.g. "fetch X and also save Y", "research A and update B"). Spawn one branch per independent sub-task so they execute in parallel instead of serially in root.
@@ -2652,6 +2762,8 @@ Rules:
 16. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
 17. If the user asks what is in Mempedia or what skills are available, prefer \`search/read\` with \`target=memory\` or \`target=skills\` before final_answer.
 19. NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value. Saving a greeting or one-liner response wastes storage and pollutes search results.
+20. For a simple single-question request that can be answered by one best next tool call, NEVER branch on the first step. Do one tool call first, then reassess.
+21. If the request is about an external movie/book/person/product/news topic, default to one \`web\` tool call before branching. Do not create parallel "workspace + web" branches unless the user explicitly asked to compare local context with external evidence.
 ${alwaysIncludeBlock ? `
 ${alwaysIncludeBlock}
 
@@ -2834,6 +2946,15 @@ ${soulsGuidance}
           continue;
         }
         const probe: Record<string, unknown> = { ...obj as Record<string, unknown> };
+        const legacyToolCall = this.normalizeLegacyToolCallProbe(
+          probe.tool ?? probe.tool_name ?? probe.name,
+          probe.args ?? probe.arguments,
+          probe.goal ?? probe.reason,
+        );
+        if (legacyToolCall && !Array.isArray(probe.tool_calls)) {
+          probe.kind = 'tool';
+          probe.tool_calls = [legacyToolCall];
+        }
         const VALID_KINDS = new Set(['tool', 'branch', 'final', 'skills']);
         const rawKind = typeof probe.kind === 'string' ? probe.kind.trim().toLowerCase() : null;
         const inferredKind = rawKind && VALID_KINDS.has(rawKind)
@@ -3166,6 +3287,8 @@ ${soulsGuidance}
         this.withTimeout(
           generateText({
             model: this.openai,
+            temperature: this.responseTemperature,
+            maxTokens: 1600,
             messages: ([
               { role: 'system', content: `${systemPrompt}\nYou must now finish. Do not branch. Do not call tools. Return plain text only.` },
               ...recentConversationMessages,
@@ -3200,6 +3323,8 @@ ${soulsGuidance}
         this.withTimeout(
           generateText({
             model: this.openai,
+            temperature: this.responseTemperature,
+            maxTokens: 1800,
             messages: [
               {
                 role: 'system',
@@ -3260,6 +3385,8 @@ ${soulsGuidance}
                     this.withTimeout(
                       generateObject({
                         model: this.beamPlannerCompatOpenai,
+                        temperature: this.plannerTemperature,
+                        maxTokens: 1200,
                         messages: workingTranscript as any,
                         mode: 'json',
                         schema: PlannerDecisionStructuredSchema,
@@ -3297,6 +3424,8 @@ ${soulsGuidance}
                     this.withTimeout(
                       generateObject({
                         model: this.beamPlannerStructuredOpenai,
+                        temperature: this.plannerTemperature,
+                        maxTokens: 1200,
                         messages: workingTranscript as any,
                         mode: 'json',
                         schema: PlannerDecisionStructuredSchema,
@@ -3414,6 +3543,7 @@ ${soulsGuidance}
                 messages: workingTranscript as any,
                 timeoutMs: this.agentLlmTimeoutMs,
                 timeoutLabel: `planBranch_${branch.id} llm`,
+                temperature: this.plannerTemperature,
                 onFallback: () => emitTrace({
                   type: 'observation',
                   content: `Model ${this.model} does not support response_format=json_object; switching planner JSON prompts to plain-text mode.`,
@@ -3422,11 +3552,21 @@ ${soulsGuidance}
             );
           }
         );
-        return decision.kind === 'tool'
-          ? { kind: 'tool', thought: decision.thought, toolCalls: decision.tool_calls || [] }
-          : decision.kind === 'branch'
-            ? { kind: 'branch', thought: decision.thought, branches: decision.branches || [] }
-            : { kind: 'final', thought: decision.thought, content: String(decision.final_answer || ''), completionSummary: decision.completion_summary };
+        const adjustedDecision = branch.id === 'B0'
+          ? this.adjustPlannerDecisionForRootTurn(decision, input)
+          : decision;
+        if (adjustedDecision !== decision) {
+          emitTrace({
+            type: 'observation',
+            content: 'Collapsed a root branching plan into a single-tool plan because the request looks like a simple external query.',
+            metadata: { branchId: branch.id, parentBranchId: branch.parentId, branchLabel: branch.label, depth: branch.depth, step: branch.steps },
+          });
+        }
+        return adjustedDecision.kind === 'tool'
+          ? { kind: 'tool', thought: adjustedDecision.thought, toolCalls: adjustedDecision.tool_calls || [] }
+          : adjustedDecision.kind === 'branch'
+            ? { kind: 'branch', thought: adjustedDecision.thought, branches: adjustedDecision.branches || [] }
+            : { kind: 'final', thought: adjustedDecision.thought, content: String(adjustedDecision.final_answer || ''), completionSummary: adjustedDecision.completion_summary };
       },
       executeToolCall: async ({ branch, toolCall }) => {
         const result = await executeToolCall(branch as BranchState, toolCall as z.infer<typeof PlannerToolCallSchema>);

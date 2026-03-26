@@ -127,6 +127,43 @@ test('planner fallback returns natural language error instead of echoing raw bas
   agent.stop();
 });
 
+test('normalizes pseudo tool_call planner output into a real tool execution', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-pseudo-tool-call-');
+  fs.writeFileSync(path.join(projectRoot, 'note.txt'), 'hello from note\n', 'utf-8');
+
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+  anyAgent.generateJsonPromptText = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+    const joined = Array.isArray(messages)
+      ? messages.map((message) => String(message?.content || '')).join('\n\n')
+      : '';
+    if (joined.includes('TOOL OBSERVATION for read:')) {
+      return JSON.stringify({
+        kind: 'final',
+        thought: 'Done.',
+        final_answer: '已读取 note 文件。',
+        completion_summary: '已读取 note 文件。',
+      });
+    }
+    return '```tool_call\n{"tool":"read","args":{"target":"workspace","path":"note.txt"},"goal":"Read the note file"}\n```';
+  };
+
+  const traces: TraceEvent[] = [];
+  const answer = await agent.run('读取 note 文件', (event) => { traces.push(event); }, { conversationId: 'thread-pseudo-tool-call' });
+
+  assert.equal(answer, '已读取 note 文件。');
+  assert.ok(traces.some((event) => event.type === 'action' && event.content.includes('Calling read')));
+  assert.ok(traces.some((event) => event.type === 'observation' && event.content.includes('hello from note')));
+
+  agent.stop();
+});
+
 test('persists recent conversation context across agent instances for the same conversation id', async () => {
   const projectRoot = createTempProjectRoot('mempedia-agent-persisted-context-');
   const conversationId = 'thread:persisted-context';

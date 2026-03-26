@@ -30,6 +30,8 @@ interface ChatMessage {
 interface GenerateTextOptions {
   model: LanguageModelV1;
   messages: ChatMessage[];
+  temperature?: number;
+  maxTokens?: number;
   providerOptions?: {
     openai?: {
       responseFormat?: {
@@ -42,6 +44,8 @@ interface GenerateTextOptions {
 interface GenerateObjectOptions<TSchema extends z.ZodTypeAny> {
   model: LanguageModelV1;
   messages: ChatMessage[];
+  temperature?: number;
+  maxTokens?: number;
   mode?: 'json';
   schema: TSchema;
 }
@@ -251,6 +255,8 @@ async function anthropicGenerateText(
   model: string,
   messages: ChatMessage[],
   jsonMode?: boolean,
+  temperature?: number,
+  maxTokens?: number,
 ): Promise<string> {
   const { system, messages: anthropicMsgs } = splitSystemAndMessages(messages);
   const systemText = jsonMode && system
@@ -264,7 +270,8 @@ async function anthropicGenerateText(
     try {
       const response = await client.messages.create({
         model,
-        max_tokens: 8192,
+        max_tokens: maxTokens ?? 8192,
+        ...(typeof temperature === 'number' ? { temperature } : {}),
         ...(systemText ? { system: systemText } : {}),
         messages: anthropicMsgs,
       });
@@ -294,6 +301,8 @@ export async function generateText(options: GenerateTextOptions): Promise<{ text
       options.model.model,
       options.messages,
       jsonMode,
+      options.temperature,
+      options.maxTokens,
     );
     return { text };
   }
@@ -304,6 +313,8 @@ export async function generateText(options: GenerateTextOptions): Promise<{ text
   const completion = await client.chat.completions.create({
     model: options.model.model,
     messages: normalizeMessages(options.messages),
+    ...(typeof options.temperature === 'number' ? { temperature: options.temperature } : {}),
+    ...(typeof options.maxTokens === 'number' ? { max_completion_tokens: options.maxTokens } : {}),
     ...(responseFormat?.type === 'json_object'
       ? { response_format: { type: 'json_object' as const } }
       : {}),
@@ -325,6 +336,8 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(options: Gene
       options.model.model,
       options.messages,
       true,
+      options.temperature,
+      options.maxTokens,
     );
     const parsed = parseJsonObjectText(text);
     return { object: options.schema.parse(parsed) };
@@ -337,6 +350,8 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(options: Gene
     const completion = await client.chat.completions.create({
       model: options.model.model,
       messages: normalizeMessages(options.messages),
+      ...(typeof options.temperature === 'number' ? { temperature: options.temperature } : {}),
+      ...(typeof options.maxTokens === 'number' ? { max_completion_tokens: options.maxTokens } : {}),
       response_format: zodResponseFormat(options.schema, 'response'),
     } as any);
 
@@ -354,6 +369,8 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(options: Gene
   const completion = await client.chat.completions.create({
     model: options.model.model,
     messages: normalizeMessages(options.messages),
+    ...(typeof options.temperature === 'number' ? { temperature: options.temperature } : {}),
+    ...(typeof options.maxTokens === 'number' ? { max_completion_tokens: options.maxTokens } : {}),
     response_format: { type: 'json_object' as const },
   } as any);
 

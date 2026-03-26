@@ -10,6 +10,7 @@
     "test": "npm run build && node --test dist/runtime/agent/*.test.js dist/agent/*.test.js dist/mempedia/*.test.js",
     "test:budget": "npm run build && node --test dist/agent/contextBudget.test.js",
     "test:budget:live": "npm run build && node --test dist/agent/contextBudget.integration.test.js",
+    "test:planner:live": "npm run build && node --test dist/agent/plannerReplay.integration.test.js",
     "test:session": "npm run build && node --test dist/agent/sessionCompressor.test.js"
   },
   "keywords": [],
