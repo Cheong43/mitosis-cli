@@ -106,3 +106,23 @@ test('unwraps raw planner JSON from final answer before returning to user', asyn
 
   agent.stop();
 });
+
+test('planner fallback returns natural language error instead of echoing raw bash blocks', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-fallback-natural-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+  anyAgent.generateJsonPromptText = async () => '```bash\nfind . -name "mempedia"\nls -la ./target/release/\n```';
+
+  const answer = await agent.run('我已经重新build', () => {}, { conversationId: 'thread-fallback-natural' });
+  assert.match(answer, /内部规划器输出成了命令或草稿/);
+  assert.doesNotMatch(answer, /```bash/);
+  assert.doesNotMatch(answer, /find \./);
+
+  agent.stop();
+});

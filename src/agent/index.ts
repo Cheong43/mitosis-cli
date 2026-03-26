@@ -441,10 +441,10 @@ export class Agent {
     timeoutLabel: string;
     onFallback?: () => void | Promise<void>;
   }): Promise<string> {
-    const run = (useJsonObject: boolean) => this.withTimeout(
+    const run = (messages: any, useJsonObject: boolean) => this.withTimeout(
       generateText({
         model: options.model,
-        messages: options.messages,
+        messages,
         ...(useJsonObject
           ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
           : {}),
@@ -453,26 +453,44 @@ export class Agent {
       options.timeoutLabel,
     );
 
+    const maybeRepairInvalidJsonReply = async (text: string, useJsonObject: boolean): Promise<string> => {
+      if (this.hasParseableJsonishPayload(text) || !Array.isArray(options.messages)) {
+        return text;
+      }
+      const repairedMessages = [
+        ...options.messages,
+        {
+          role: 'user',
+          content: 'Your previous reply was invalid because it was not exactly one JSON object. Reply again with exactly one JSON object and nothing else. No markdown fences. No prose before or after the JSON. Do not output raw shell commands or code unless they are escaped inside a JSON string value.',
+        },
+      ];
+      const { text: repairedText } = await run(repairedMessages, useJsonObject);
+      const normalized = typeof repairedText === 'string' ? repairedText : String(repairedText || '');
+      return normalized.trim() ? normalized : text;
+    };
+
     try {
-      const { text } = await run(this.jsonObjectResponseFormatSupported);
+      const { text } = await run(options.messages, this.jsonObjectResponseFormatSupported);
       const resolved = typeof text === 'string' ? text : String(text || '');
       // Empty response with json_object mode — retry without it (e.g., Qwen3 thinking mode
       // may return null content when response_format constrains the output).
       if (!resolved.trim() && this.jsonObjectResponseFormatSupported) {
         this.jsonObjectResponseFormatSupported = false;
         await options.onFallback?.();
-        const { text: text2 } = await run(false);
-        return typeof text2 === 'string' ? text2 : String(text2 || '');
+        const { text: text2 } = await run(options.messages, false);
+        const retried = typeof text2 === 'string' ? text2 : String(text2 || '');
+        return maybeRepairInvalidJsonReply(retried, false);
       }
-      return resolved;
+      return maybeRepairInvalidJsonReply(resolved, this.jsonObjectResponseFormatSupported);
     } catch (error) {
       if (!this.jsonObjectResponseFormatSupported || !this.isJsonResponseFormatUnsupported(error)) {
         throw error;
       }
       this.jsonObjectResponseFormatSupported = false;
       await options.onFallback?.();
-      const { text } = await run(false);
-      return typeof text === 'string' ? text : String(text || '');
+      const { text } = await run(options.messages, false);
+      const resolved = typeof text === 'string' ? text : String(text || '');
+      return maybeRepairInvalidJsonReply(resolved, false);
     }
   }
 
@@ -818,6 +836,48 @@ export class Agent {
     }
 
     return current;
+  }
+
+  private hasParseableJsonishPayload(raw: string): boolean {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    const candidates = extractJsonishCandidates(trimmed);
+    for (const candidate of candidates) {
+      try {
+        parseJsonish(candidate);
+        return true;
+      } catch {
+        continue;
+      }
+    }
+    return false;
+  }
+
+  private looksLikeNonUserFacingPlannerOutput(raw: string): boolean {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) {
+      return false;
+    }
+    if (/^```[\s\S]*```$/u.test(trimmed)) {
+      return true;
+    }
+    if (/^\s*[{[][\s\S]*[}\]]\s*$/u.test(trimmed) && !this.hasParseableJsonishPayload(trimmed)) {
+      return true;
+    }
+    return /(^|\n)\s*(find|ls|cat|grep|rg|echo|printf|cd|pwd|npm|pnpm|yarn|cargo|python|python3|node|git|curl|BIN=|\[\[)\b/m.test(trimmed);
+  }
+
+  private buildPlannerFallbackFinalAnswer(raw: string, looksLikePromptEcho: boolean): string {
+    if (looksLikePromptEcho || !raw.trim()) {
+      return '抱歉，刚才内部规划结果格式异常，没有生成可展示的回答。请重试一次。';
+    }
+    if (this.looksLikeNonUserFacingPlannerOutput(raw)) {
+      return '抱歉，刚才内部规划器输出成了命令或草稿，而不是正式答复。我没有继续把那段代码直接返回给你。请重试一次；如果你愿意，我也可以继续根据上一步结果接着处理。';
+    }
+    return '抱歉，刚才内部规划结果格式异常，没有生成可展示的自然语言回答。请重试一次。';
   }
 
   private extractFinalAnswerFromJsonPayload(raw: string): string | null {
@@ -2164,6 +2224,13 @@ Allowed JSON schema:
   "completion_summary": "optional short summary"
 }
 
+STRICT OUTPUT CONTRACT:
+- Return exactly one JSON object.
+- Do not wrap the JSON in Markdown fences.
+- Do not add explanation text before or after the JSON object.
+- Do not output raw shell commands, pseudo-code, or checklists as the top-level reply.
+- If you need to show commands to the user, place them inside "final_answer" as a JSON string.
+
 Rules:
 1. Prefer kind="tool" when one next action is clearly best.
 2. Use kind="branch" in TWO situations:
@@ -2446,9 +2513,7 @@ ${soulsGuidance}
         return PlannerDecisionSchema.parse({
           kind: 'final',
           thought: 'Planner returned no valid structured decision; using fallback final answer.',
-          final_answer: rawTrimmed && !looksLikePromptEcho
-            ? this.normalizeUserFacingAnswer(rawTrimmed)
-            : '抱歉，当前没有生成有效回答。请重试一次。',
+          final_answer: this.buildPlannerFallbackFinalAnswer(rawTrimmed, looksLikePromptEcho),
         });
       }
 
