@@ -126,3 +126,73 @@ test('planner fallback returns natural language error instead of echoing raw bas
 
   agent.stop();
 });
+
+test('persists recent conversation context across agent instances for the same conversation id', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-persisted-context-');
+  const conversationId = 'thread:persisted-context';
+
+  const agent1 = new Agent({ apiKey: 'test-key' }, projectRoot);
+  installAgentTestDoubles(agent1, () => '第一轮回答');
+  await agent1.run('请记住这个话题：美光财报保存到 Mempedia', () => {}, { conversationId });
+  agent1.stop();
+
+  const statePath = path.join(projectRoot, '.mitosis', 'conversation_state', 'thread_persisted-context.json');
+  assert.ok(fs.existsSync(statePath), 'expected persisted conversation state file to be created');
+
+  const agent2 = new Agent({ apiKey: 'test-key' }, projectRoot);
+  installAgentTestDoubles(agent2, (request) => `follow-up:${request}`);
+  const traces: TraceEvent[] = [];
+  await agent2.run('继续', (event) => { traces.push(event); }, { conversationId });
+
+  assert.ok(traces.some((event) => event.content.includes('Recovered persisted thread context with 1 recent turn(s).')));
+  assert.ok(traces.some((event) => event.content.includes('Selected 1 relevant recent conversation turn(s)')));
+  assert.ok(traces.some((event) => event.content.includes('Injected persisted thread working state into the current run context.')));
+
+  agent2.stop();
+});
+
+test('writes a turn summary journal entry for each persisted turn', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-turn-summary-');
+  const conversationId = 'thread:journal-check';
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  installAgentTestDoubles(agent, () => '这是用于摘要日志的回答。');
+
+  await agent.run('记录这轮摘要', () => {}, { conversationId });
+
+  const journalPath = path.join(projectRoot, '.mitosis', 'logs', 'thread_turn_summaries.jsonl');
+  assert.ok(fs.existsSync(journalPath), 'expected turn summary journal to exist');
+  const rows = fs.readFileSync(journalPath, 'utf-8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].conversation_id, conversationId);
+  assert.equal(rows[0].user_intent, '记录这轮摘要');
+  assert.match(rows[0].assistant_outcome, /这是用于摘要日志的回答/);
+  assert.ok(Array.isArray(rows[0].tool_findings));
+
+  agent.stop();
+});
+
+test('reconstructs thread context from turn summary journal when state file is missing', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-journal-recovery-');
+  const conversationId = 'thread:journal-recovery';
+
+  const agent1 = new Agent({ apiKey: 'test-key' }, projectRoot);
+  installAgentTestDoubles(agent1, () => '上一轮已经确认目标是继续保存美光财报。');
+  await agent1.run('请继续跟进美光财报保存', () => {}, { conversationId });
+  agent1.stop();
+
+  const statePath = path.join(projectRoot, '.mitosis', 'conversation_state', 'thread_journal-recovery.json');
+  if (fs.existsSync(statePath)) {
+    fs.unlinkSync(statePath);
+  }
+
+  const agent2 = new Agent({ apiKey: 'test-key' }, projectRoot);
+  installAgentTestDoubles(agent2, () => '已从 journal 恢复上下文。');
+  const traces: TraceEvent[] = [];
+  await agent2.run('继续', (event) => { traces.push(event); }, { conversationId });
+
+  assert.ok(traces.some((event) => event.content.includes('Recovered persisted thread context with 1 recent turn(s).')));
+  assert.ok(traces.some((event) => event.content.includes('Selected 1 relevant turn summary record(s) from journal replay.')));
+  assert.ok(traces.some((event) => event.content.includes('Injected journal replay summaries into the current run context.')));
+
+  agent2.stop();
+});

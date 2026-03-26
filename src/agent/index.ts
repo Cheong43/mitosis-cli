@@ -185,6 +185,31 @@ interface ConversationTurn {
   assistant: string;
 }
 
+interface PersistedConversationState {
+  conversation_id: string;
+  recent_turns: ConversationTurn[];
+  active_topic: string;
+  current_goal: string;
+  status: 'active' | 'blocked' | 'completed' | 'failed';
+  open_loops: string[];
+  referenced_entities: string[];
+  last_user_request: string;
+  last_assistant_summary: string;
+  updated_at: string;
+}
+
+interface TurnSummaryRecord {
+  ts: string;
+  conversation_id: string;
+  user_input: string;
+  user_intent: string;
+  assistant_outcome: string;
+  status: 'active' | 'blocked' | 'completed' | 'failed';
+  next_expected_user_action: string;
+  referenced_entities: string[];
+  tool_findings: string[];
+}
+
 interface MemoryExtraction {
   user_preferences: Array<{ topic: string; preference: string; evidence: string }>;
   agent_skills: Array<{ skill_id: string; title: string; content: string; tags: string[] }>;
@@ -254,6 +279,8 @@ export class Agent {
   private readonly memoryLogPath: string;
   private readonly conversationLogDir: string;
   private readonly nodeConversationMapPath: string;
+  private readonly persistedConversationStateDir: string;
+  private readonly turnSummaryLogPath: string;
   private readonly relationSearchMinScore: number;
   private readonly relationSearchLimit: number;
   private readonly relationMax: number;
@@ -390,6 +417,8 @@ export class Agent {
     this.memoryLogPath = path.join(projectRoot, '.mitosis', 'logs', 'mitosis_save.log');
     this.conversationLogDir = path.join(projectRoot, '.mitosis', 'conversations');
     this.nodeConversationMapPath = path.join(projectRoot, '.mitosis', 'logs', 'node_conversations.jsonl');
+    this.persistedConversationStateDir = path.join(projectRoot, '.mitosis', 'conversation_state');
+    this.turnSummaryLogPath = path.join(projectRoot, '.mitosis', 'logs', 'thread_turn_summaries.jsonl');
 
     this.memoryClassifier = new MemoryClassifierAgent({
       chatClient: this.memoryOpenai,
@@ -1422,6 +1451,338 @@ export class Agent {
     return (match?.[1] || input).trim();
   }
 
+  private sanitizeConversationId(conversationId: string): string {
+    const cleaned = String(conversationId || 'default').replace(/[^a-zA-Z0-9_-]+/g, '_');
+    return cleaned || 'default';
+  }
+
+  private getPersistedConversationStatePath(conversationId: string): string {
+    return path.join(this.persistedConversationStateDir, `${this.sanitizeConversationId(conversationId)}.json`);
+  }
+
+  private classifyTurnStatus(answer: string, traces: TraceEvent[]): 'active' | 'blocked' | 'completed' | 'failed' {
+    const normalizedAnswer = answer.replace(/\s+/g, ' ').trim();
+    if (/抱歉|请重试|没有生成有效回答|没有找到之前的具体上下文/i.test(normalizedAnswer)) {
+      return 'failed';
+    }
+    if (this.looksLikeNonUserFacingPlannerOutput(answer)) {
+      return 'blocked';
+    }
+    if (traces.some((trace) => /^Error:/i.test(trace.content) || /permission denied|not found|binary not found|governance deny|timeout/i.test(trace.content))) {
+      return 'blocked';
+    }
+    if (/需要确认|请描述一下|请选择|二选一|blocked|受阻|无法|不可用/i.test(normalizedAnswer)) {
+      return 'blocked';
+    }
+    if (/已完成|完成了|保存成功|done|success|成功/i.test(normalizedAnswer)) {
+      return 'completed';
+    }
+    return 'active';
+  }
+
+  private deriveToolFindings(traces: TraceEvent[], limit = 3): string[] {
+    const findings: string[] = [];
+    const seen = new Set<string>();
+    for (const trace of traces) {
+      if (trace.type !== 'observation') {
+        continue;
+      }
+      const cleaned = trace.content.replace(/\s+/g, ' ').trim();
+      if (cleaned.length < 12) {
+        continue;
+      }
+      if (/^(Selected |Recalled |Injected carry-over|Context budget|Run completed normally|Auto-queued |Perf total=|Recovered persisted thread context|Injected persisted thread working state)/i.test(cleaned)) {
+        continue;
+      }
+      const key = cleaned.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      findings.push(cleaned.slice(0, 220));
+      if (findings.length >= limit) {
+        break;
+      }
+    }
+    return findings;
+  }
+
+  private deriveConversationGoal(input: string, traces: TraceEvent[], answer: string): string {
+    const thought = [...traces]
+      .reverse()
+      .find((trace) => trace.type === 'thought' && !/Initializing branching ReAct context|Planner returned/i.test(trace.content));
+    if (thought) {
+      return thought.content.replace(/\s+/g, ' ').trim().slice(0, 200);
+    }
+    return this.firstSentence(this.extractOriginalUserRequest(input))
+      || this.firstSentence(answer)
+      || 'Continue the current thread task.';
+  }
+
+  private deriveOpenLoops(status: 'active' | 'blocked' | 'completed' | 'failed', input: string, traces: TraceEvent[], answer: string): string[] {
+    if (status === 'completed') {
+      return [];
+    }
+    const loops: string[] = [];
+    const push = (value: string) => {
+      const cleaned = value.replace(/\s+/g, ' ').trim();
+      if (!cleaned || loops.includes(cleaned)) {
+        return;
+      }
+      loops.push(cleaned.slice(0, 200));
+    };
+
+    const lastAction = [...traces].reverse().find((trace) => trace.type === 'action');
+    if (lastAction?.metadata?.toolName) {
+      push(`Continue from the last attempted tool step: ${String(lastAction.metadata.toolName)}.`);
+    }
+    for (const finding of this.deriveToolFindings(traces, 2)) {
+      push(finding);
+    }
+    if (status === 'failed') {
+      push('Recover the previous thread context and resume the task without asking the user to restate everything.');
+    } else if (status === 'blocked') {
+      push('Resolve the blocking issue before continuing the original task.');
+    } else {
+      push(this.firstSentence(answer) || this.firstSentence(this.extractOriginalUserRequest(input)) || 'Continue the current thread task.');
+    }
+    return loops.slice(0, 4);
+  }
+
+  private deriveActiveTopic(input: string, answer: string, recentTurns: ConversationTurn[]): string {
+    const requestSentence = this.firstSentence(this.extractOriginalUserRequest(input));
+    if (requestSentence && requestSentence.length >= 8) {
+      return requestSentence;
+    }
+    const priorUser = [...recentTurns].reverse().map((turn) => this.firstSentence(turn.user)).find((value) => value.length >= 8);
+    if (priorUser) {
+      return priorUser;
+    }
+    return this.firstSentence(answer) || 'Current conversation thread';
+  }
+
+  private buildPersistedConversationState(
+    conversationId: string,
+    input: string,
+    answer: string,
+    traces: TraceEvent[],
+    recentTurns: ConversationTurn[],
+  ): PersistedConversationState {
+    const status = this.classifyTurnStatus(answer, traces);
+    const referencedEntities = this.collectAtomicCandidates(this.extractOriginalUserRequest(input), answer).slice(0, 8);
+    return {
+      conversation_id: conversationId,
+      recent_turns: recentTurns,
+      active_topic: this.deriveActiveTopic(input, answer, recentTurns),
+      current_goal: this.deriveConversationGoal(input, traces, answer),
+      status,
+      open_loops: this.deriveOpenLoops(status, input, traces, answer),
+      referenced_entities: referencedEntities,
+      last_user_request: this.extractOriginalUserRequest(input).slice(0, 600),
+      last_assistant_summary: this.firstSentence(answer).slice(0, 280),
+      updated_at: new Date().toISOString(),
+    };
+  }
+
+  private readPersistedConversationState(conversationId: string): PersistedConversationState | null {
+    try {
+      const filePath = this.getPersistedConversationStatePath(conversationId);
+      if (!fs.existsSync(filePath)) {
+        return null;
+      }
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.recent_turns)) {
+        return null;
+      }
+      return parsed as PersistedConversationState;
+    } catch {
+      return null;
+    }
+  }
+
+  private writePersistedConversationState(state: PersistedConversationState): void {
+    try {
+      fs.mkdirSync(this.persistedConversationStateDir, { recursive: true });
+      fs.writeFileSync(
+        this.getPersistedConversationStatePath(state.conversation_id),
+        JSON.stringify(state, null, 2),
+        'utf-8',
+      );
+    } catch {}
+  }
+
+  private appendTurnSummaryRecord(record: TurnSummaryRecord): void {
+    try {
+      fs.mkdirSync(path.dirname(this.turnSummaryLogPath), { recursive: true });
+      fs.appendFileSync(this.turnSummaryLogPath, `${JSON.stringify(record)}\n`, 'utf-8');
+    } catch {}
+  }
+
+  private readTurnSummaryRecords(conversationId: string, limit = 12): TurnSummaryRecord[] {
+    try {
+      if (!fs.existsSync(this.turnSummaryLogPath)) {
+        return [];
+      }
+      const rows = fs.readFileSync(this.turnSummaryLogPath, 'utf-8')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          try {
+            return JSON.parse(line) as unknown;
+          } catch {
+            return null;
+          }
+        })
+        .filter((row): row is TurnSummaryRecord => {
+          if (!row || typeof row !== 'object') {
+            return false;
+          }
+          const candidate = row as Partial<TurnSummaryRecord>;
+          return typeof candidate.conversation_id === 'string'
+            && candidate.conversation_id === conversationId
+            && typeof candidate.user_input === 'string'
+            && typeof candidate.assistant_outcome === 'string'
+            && typeof candidate.user_intent === 'string'
+            && typeof candidate.status === 'string'
+            && typeof candidate.next_expected_user_action === 'string'
+            && Array.isArray(candidate.referenced_entities)
+            && Array.isArray(candidate.tool_findings);
+        });
+      return rows.slice(-Math.max(1, limit));
+    } catch {
+      return [];
+    }
+  }
+
+  private buildStateFromTurnSummaries(
+    conversationId: string,
+    summaries: TurnSummaryRecord[],
+  ): PersistedConversationState | null {
+    if (summaries.length === 0) {
+      return null;
+    }
+    const recent = summaries.slice(-this.maxConversationTurns);
+    const latest = recent[recent.length - 1];
+    const entities = Array.from(new Set(recent.flatMap((row) => Array.isArray(row.referenced_entities) ? row.referenced_entities : []))).slice(0, 8);
+    const openLoops = Array.from(new Set(
+      recent
+        .map((row) => row.next_expected_user_action)
+        .filter((value) => typeof value === 'string' && value.trim().length > 0)
+    )).slice(-4);
+    return {
+      conversation_id: conversationId,
+      recent_turns: recent.map((row) => ({
+        user: row.user_input,
+        assistant: row.assistant_outcome,
+      })),
+      active_topic: this.firstSentence(latest.user_intent || latest.user_input) || 'Recovered conversation thread',
+      current_goal: this.firstSentence(latest.next_expected_user_action || latest.user_intent || latest.user_input) || 'Continue the recovered thread task.',
+      status: latest.status || 'active',
+      open_loops: openLoops,
+      referenced_entities: entities,
+      last_user_request: latest.user_intent || latest.user_input,
+      last_assistant_summary: latest.assistant_outcome,
+      updated_at: latest.ts || new Date().toISOString(),
+    };
+  }
+
+  private selectRelevantTurnSummaryRecords(input: string, conversationId: string): TurnSummaryRecord[] {
+    const rows = this.readTurnSummaryRecords(conversationId, 12);
+    if (rows.length === 0) {
+      return [];
+    }
+    const followUp = this.isLikelyFollowUp(input);
+    const scored = rows
+      .map((row, index) => {
+        const combined = [
+          row.user_input,
+          row.user_intent,
+          row.assistant_outcome,
+          row.next_expected_user_action,
+          ...(Array.isArray(row.referenced_entities) ? row.referenced_entities : []),
+          ...(Array.isArray(row.tool_findings) ? row.tool_findings : []),
+        ].join('\n');
+        const overlap = this.lexicalOverlapScore(input, combined);
+        const recency = (index + 1) / Math.max(1, rows.length) * 0.18;
+        return { row, score: overlap + (followUp ? recency : recency * 0.5), index };
+      })
+      .sort((a, b) => b.score - a.score || b.index - a.index);
+
+    const threshold = followUp ? 0.04 : 0.1;
+    const selected = scored.filter((item) => item.score >= threshold).slice(0, followUp ? 3 : 2);
+    if (selected.length > 0) {
+      return selected.sort((a, b) => a.index - b.index).map((item) => item.row);
+    }
+    if (followUp) {
+      return rows.slice(-Math.min(2, rows.length));
+    }
+    return [];
+  }
+
+  private renderTurnSummaryReplay(records: TurnSummaryRecord[]): string {
+    if (records.length === 0) {
+      return '';
+    }
+    return [
+      'Recent turn summary replay:',
+      ...records.map((row, index) => [
+        `Turn ${index + 1}:`,
+        `- user_intent: ${row.user_intent || row.user_input || '(none)'}`,
+        `- assistant_outcome: ${row.assistant_outcome || '(none)'}`,
+        `- status: ${row.status || 'active'}`,
+        `- next_expected_user_action: ${row.next_expected_user_action || '(none)'}`,
+        `- referenced_entities: ${Array.isArray(row.referenced_entities) && row.referenced_entities.length > 0 ? row.referenced_entities.join(', ') : '(none)'}`,
+        `- tool_findings: ${Array.isArray(row.tool_findings) && row.tool_findings.length > 0 ? row.tool_findings.join(' | ') : '(none)'}`,
+      ].join('\n')),
+    ].join('\n');
+  }
+
+  private ensureConversationTurnsLoaded(conversationId: string): PersistedConversationState | null {
+    if (this.conversationTurnsByConversation.has(conversationId)) {
+      return this.readPersistedConversationState(conversationId);
+    }
+    const persisted = this.readPersistedConversationState(conversationId);
+    if (persisted?.recent_turns?.length) {
+      this.conversationTurnsByConversation.set(
+        conversationId,
+        persisted.recent_turns.slice(-this.maxConversationTurns),
+      );
+      return persisted;
+    }
+    const recoveredFromJournal = this.buildStateFromTurnSummaries(
+      conversationId,
+      this.readTurnSummaryRecords(conversationId, this.maxConversationTurns),
+    );
+    if (recoveredFromJournal?.recent_turns?.length) {
+      this.conversationTurnsByConversation.set(
+        conversationId,
+        recoveredFromJournal.recent_turns.slice(-this.maxConversationTurns),
+      );
+      return recoveredFromJournal;
+    }
+    return persisted;
+  }
+
+  private renderPersistedConversationState(state: PersistedConversationState | null): string {
+    if (!state) {
+      return '';
+    }
+    const lines = [
+      'Persisted thread working state:',
+      `- active_topic: ${state.active_topic || '(unknown)'}`,
+      `- current_goal: ${state.current_goal || '(unknown)'}`,
+      `- status: ${state.status || 'active'}`,
+      `- last_user_request: ${state.last_user_request || '(none)'}`,
+      `- last_assistant_summary: ${state.last_assistant_summary || '(none)'}`,
+      `- referenced_entities: ${state.referenced_entities.length > 0 ? state.referenced_entities.join(', ') : '(none)'}`,
+      state.open_loops.length > 0
+        ? `- open_loops:\n${state.open_loops.map((item) => `  - ${item}`).join('\n')}`
+        : '- open_loops: (none)',
+    ];
+    return lines.join('\n');
+  }
+
   private isTrivialMemoryCandidate(text: string): boolean {
     const compact = text.replace(/\s+/g, ' ').trim().toLowerCase();
     if (!compact) {
@@ -1498,6 +1859,9 @@ export class Agent {
     if (this.isTrivialMemoryCandidate(request)) {
       return false;
     }
+    if (this.looksLikeNonUserFacingPlannerOutput(answer)) {
+      return false;
+    }
     // Don't record episodic entries for error/failure answers — they have no useful knowledge.
     if (/\b(no such file or directory|binary not found|inaccessible or invalid|failed to fetch|connection refused|permission denied|requested wikipedia url)\b/i.test(normalizedAnswer)) {
       return false;
@@ -1529,6 +1893,7 @@ export class Agent {
   }
 
   private getConversationTurns(conversationId = 'default'): ConversationTurn[] {
+    this.ensureConversationTurnsLoaded(conversationId);
     return this.conversationTurnsByConversation.get(conversationId) || [];
   }
 
@@ -2129,12 +2494,27 @@ export class Agent {
     };
     emitTrace({ type: 'thought', content: 'Initializing branching ReAct context...' });
 
+    const persistedConversationState = this.ensureConversationTurnsLoaded(conversationId);
+    if (persistedConversationState?.recent_turns?.length) {
+      emitTrace({
+        type: 'observation',
+        content: `Recovered persisted thread context with ${persistedConversationState.recent_turns.length} recent turn(s).`,
+      });
+    }
+
     const selectedConversationTurns = this.selectRelevantConversationTurns(input, conversationId);
     emitTrace({
       type: 'observation',
       content: selectedConversationTurns.length > 0
         ? `Selected ${selectedConversationTurns.length} relevant recent conversation turn(s) for follow-up grounding.`
         : 'Selected 0 recent conversation turns; treating this request as context-isolated.',
+    });
+    const selectedTurnSummaries = this.selectRelevantTurnSummaryRecords(input, conversationId);
+    emitTrace({
+      type: 'observation',
+      content: selectedTurnSummaries.length > 0
+        ? `Selected ${selectedTurnSummaries.length} relevant turn summary record(s) from journal replay.`
+        : 'Selected 0 turn summary records from journal replay.',
     });
 
     let context = '';
@@ -2170,6 +2550,23 @@ export class Agent {
       emitTrace({
         type: 'observation',
         content: `Injected carry-over from ${carryOver.runCount} previous exhausted run(s) (≈${carryOver.tokenEstimate} tokens). The agent should continue from these findings rather than re-exploring.`,
+      });
+    }
+
+    const persistedContextBlock = this.renderPersistedConversationState(persistedConversationState);
+    if (persistedContextBlock) {
+      context = `${persistedContextBlock}${context ? `\n\n${context}` : ''}`;
+      emitTrace({
+        type: 'observation',
+        content: 'Injected persisted thread working state into the current run context.',
+      });
+    }
+    const journalReplayBlock = this.renderTurnSummaryReplay(selectedTurnSummaries);
+    if (journalReplayBlock) {
+      context = `${journalReplayBlock}${context ? `\n\n${context}` : ''}`;
+      emitTrace({
+        type: 'observation',
+        content: 'Injected journal replay summaries into the current run context.',
       });
     }
 
@@ -3145,6 +3542,26 @@ ${soulsGuidance}
     }
     finalAnswer = this.normalizeUserFacingAnswer(finalAnswer);
     this.appendConversationTurn(conversationId, { user: input, assistant: finalAnswer });
+    const persistedTurns = this.getConversationTurns(conversationId);
+    const nextPersistedState = this.buildPersistedConversationState(
+      conversationId,
+      input,
+      finalAnswer,
+      traceBuffer,
+      persistedTurns,
+    );
+    this.writePersistedConversationState(nextPersistedState);
+    this.appendTurnSummaryRecord({
+      ts: new Date().toISOString(),
+      conversation_id: conversationId,
+      user_input: this.clipText(this.extractOriginalUserRequest(input), 600),
+      user_intent: nextPersistedState.last_user_request,
+      assistant_outcome: this.clipText(finalAnswer.replace(/\s+/g, ' ').trim(), 600),
+      status: nextPersistedState.status,
+      next_expected_user_action: nextPersistedState.open_loops[0] || nextPersistedState.current_goal,
+      referenced_entities: nextPersistedState.referenced_entities.slice(0, 8),
+      tool_findings: this.deriveToolFindings(traceBuffer, 4),
+    });
     if (perfEntries && perfEntries.length > 0) {
       const totalMs = perfEntries.reduce((sum, item) => sum + item.ms, 0);
       const top = [...perfEntries]
