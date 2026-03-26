@@ -67,8 +67,8 @@ test('budget: compute produces valid parameters for real model', () => {
 
   assert.ok(budget.maxSteps >= 2, `maxSteps should be >= 2, got ${budget.maxSteps}`);
   assert.ok(budget.maxSteps <= 20, `maxSteps should be <= 20, got ${budget.maxSteps}`);
-  assert.ok(budget.maxBranchDepth >= 0 && budget.maxBranchDepth <= 3, `depth 0-3, got ${budget.maxBranchDepth}`);
-  assert.ok(budget.maxBranchWidth >= 2 && budget.maxBranchWidth <= 4, `width 2-4, got ${budget.maxBranchWidth}`);
+  assert.ok(budget.maxBranchDepth >= 0 && budget.maxBranchDepth <= 4, `depth 0-4, got ${budget.maxBranchDepth}`);
+  assert.ok(budget.maxBranchWidth >= 2 && budget.maxBranchWidth <= 5, `width 2-5, got ${budget.maxBranchWidth}`);
   assert.ok(budget.transcriptBudgetChars >= 4000, `chars >= 4000, got ${budget.transcriptBudgetChars}`);
   assert.ok(budget.beamMaxDepth >= 2, `beamDepth >= 2, got ${budget.beamMaxDepth}`);
   assert.ok(budget.beamWidth >= 2, `beamWidth >= 2, got ${budget.beamWidth}`);

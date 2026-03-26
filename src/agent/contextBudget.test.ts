@@ -7,6 +7,7 @@ import {
   computeContextBudget,
   compressTranscript,
   getCompressionLevel,
+  checkContextAndCompress,
 } from './contextBudget.js';
 
 // ── estimateTokens ─────────────────────────────────────────────────────────
@@ -139,7 +140,7 @@ test('computeContextBudget: medium residual gives moderate params', () => {
   // committed = 40000 + 30000 + 16000 + 4000 = 90000
   // residual = 38000
   assert.equal(result.residualBudget, 38_000);
-  assert.ok(result.maxBranchDepth <= 2, `38k residual should give depth <= 2, got ${result.maxBranchDepth}`);
+  assert.ok(result.maxBranchDepth <= 3, `38k residual should give depth <= 3, got ${result.maxBranchDepth}`);
   assert.ok(result.maxSteps >= 2 && result.maxSteps <= 20, `maxSteps in valid range, got ${result.maxSteps}`);
 });
 
@@ -154,7 +155,7 @@ test('computeContextBudget: very large model (gemini) gives generous params', ()
   assert.equal(result.modelLimit, 1_000_000);
   assert.ok(result.residualBudget > 900_000);
   assert.ok(result.maxSteps === 20, `1M context should max out steps at 20, got ${result.maxSteps}`);
-  assert.ok(result.maxBranchDepth === 3, `1M context should allow depth=3, got ${result.maxBranchDepth}`);
+  assert.ok(result.maxBranchDepth === 4, `1M context should allow depth=4, got ${result.maxBranchDepth}`);
 });
 
 // ── getCompressionLevel ────────────────────────────────────────────────────
@@ -246,4 +247,48 @@ test('compressTranscript: single message returned as-is', () => {
   const result = compressTranscript(messages, 10);
   assert.equal(result.length, 1);
   assert.equal(result[0].content, 'Just one message');
+});
+
+// ── checkContextAndCompress ────────────────────────────────────────────────
+
+test('checkContextAndCompress: under threshold → no compression', () => {
+  const messages = [
+    { role: 'user', content: 'Hello' },
+    { role: 'assistant', content: 'Hi there' },
+  ];
+  const result = checkContextAndCompress(messages, 200_000, 10_000);
+  assert.equal(result.compressed, false);
+  assert.equal(result.canContinue, true);
+  assert.ok(result.usageRatio < 0.92, `Expected under threshold, got ${result.usageRatio}`);
+});
+
+test('checkContextAndCompress: over threshold → compresses and can continue', () => {
+  // Build a transcript that pushes past 92% of a small model limit.
+  // With modelLimit=1000, committed=900, even a small transcript exceeds 92%.
+  const messages = [
+    { role: 'user', content: 'Original request' },
+    { role: 'user', content: 'TOOL OBSERVATION for read:\n' + 'x'.repeat(800) },
+    { role: 'assistant', content: JSON.stringify({ kind: 'tool', tool_calls: [{ name: 'read' }] }) },
+    { role: 'user', content: 'TOOL OBSERVATION for search:\n' + 'y'.repeat(800) },
+    { role: 'assistant', content: JSON.stringify({ kind: 'tool', tool_calls: [{ name: 'search' }] }) },
+    { role: 'user', content: 'Recent message 1' },
+    { role: 'user', content: 'Recent message 2' },
+    { role: 'user', content: 'Recent message 3' },
+  ];
+  // Set limits so transcript is ~92%+
+  const modelLimit = 1000;
+  const committed = 500;
+  const result = checkContextAndCompress(messages, modelLimit, committed);
+  assert.equal(result.compressed, true);
+  // Compressed transcript should be shorter
+  const originalLen = messages.reduce((s, m) => s + m.content.length, 0);
+  const compressedLen = result.transcript.reduce((s, m) => s + m.content.length, 0);
+  assert.ok(compressedLen <= originalLen, `Expected compressed (${compressedLen}) <= original (${originalLen})`);
+});
+
+test('checkContextAndCompress: modelLimit=0 → fallback (usage 100%, can not continue)', () => {
+  const messages = [{ role: 'user', content: 'Hello' }];
+  const result = checkContextAndCompress(messages, 0, 0);
+  // With modelLimit=0, usageRatio = 1; triggers compression, canContinue = false
+  assert.equal(result.canContinue, false);
 });

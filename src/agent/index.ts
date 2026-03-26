@@ -33,6 +33,7 @@ import {
   estimateTokens,
   estimateTranscriptTokens,
   compressTranscript,
+  compressBranchTranscript,
   getCompressionLevel,
   type ContextBudgetResult,
 } from './contextBudget.js';
@@ -397,9 +398,9 @@ export class Agent {
     const rawRelationMax = Number(process.env.MEMORY_RELATION_MAX ?? 6);
     this.relationMax = Number.isFinite(rawRelationMax) ? Math.max(0, Math.min(20, Math.floor(rawRelationMax))) : 6;
     const rawBranchMaxDepth = Number(process.env.REACT_BRANCH_MAX_DEPTH ?? 2);
-    this.branchMaxDepth = Number.isFinite(rawBranchMaxDepth) ? Math.max(0, Math.min(4, Math.floor(rawBranchMaxDepth))) : 2;
+    this.branchMaxDepth = Number.isFinite(rawBranchMaxDepth) ? Math.max(0, Math.min(6, Math.floor(rawBranchMaxDepth))) : 2;
     const rawBranchMaxWidth = Number(process.env.REACT_BRANCH_MAX_WIDTH ?? 3);
-    this.branchMaxWidth = Number.isFinite(rawBranchMaxWidth) ? Math.max(1, Math.min(5, Math.floor(rawBranchMaxWidth))) : 3;
+    this.branchMaxWidth = Number.isFinite(rawBranchMaxWidth) ? Math.max(1, Math.min(6, Math.floor(rawBranchMaxWidth))) : 3;
     const rawBranchMaxSteps = Number(process.env.REACT_BRANCH_MAX_STEPS ?? 8);
     this.branchMaxSteps = Number.isFinite(rawBranchMaxSteps) ? Math.max(2, Math.min(24, Math.floor(rawBranchMaxSteps))) : 8;
     const rawBranchMaxCompleted = Number(process.env.REACT_BRANCH_MAX_COMPLETED ?? 4);
@@ -482,7 +483,7 @@ export class Agent {
         model: options.model,
         messages,
         temperature: options.temperature ?? this.plannerTemperature,
-        maxTokens: 1200,
+        maxTokens: 2400,
         ...(useJsonObject
           ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
           : {}),
@@ -915,7 +916,35 @@ export class Agent {
     if (this.looksLikeNonUserFacingPlannerOutput(raw)) {
       return '抱歉，刚才内部规划器输出成了命令或草稿，而不是正式答复。我没有继续把那段代码直接返回给你。请重试一次；如果你愿意，我也可以继续根据上一步结果接着处理。';
     }
+    // If the raw text looks like a natural-language answer (not JSON, not code,
+    // not a prompt echo), use it directly instead of losing the content.
+    const stripped = raw.replace(/^```[\s\S]*?```$/gm, '').trim();
+    if (stripped.length >= 20) {
+      return stripped;
+    }
     return '抱歉，刚才内部规划结果格式异常，没有生成可展示的自然语言回答。请重试一次。';
+  }
+
+  private isPlannerFormatFallbackAnswer(answer: string): boolean {
+    const normalized = String(answer || '').trim();
+    if (!normalized) {
+      return false;
+    }
+    return normalized.includes('内部规划结果格式异常')
+      || normalized.includes('内部规划器输出成了命令或草稿');
+  }
+
+  private buildPlannerSchemaRepairPrompt(): string {
+    return [
+      'Your previous planner reply could not be normalized into the required planner schema.',
+      'Reply again with exactly one JSON object and nothing else.',
+      'Allowed shapes only:',
+      '{"kind":"tool","thought":"...","tool_calls":[{"name":"read|search|edit|bash|web","arguments":{},"goal":"optional"}]}',
+      '{"kind":"branch","thought":"...","branches":[{"label":"...","goal":"...","why":"optional","priority":0.5}]}',
+      '{"kind":"final","thought":"...","final_answer":"...","completion_summary":"optional"}',
+      '{"kind":"skills","thought":"...","skills_to_load":["skill-name"]}',
+      'No markdown fences. No prose before or after the JSON. Do not output raw shell commands unless they are inside tool_calls[].arguments.command.',
+    ].join('\n');
   }
 
   private extractFinalAnswerFromJsonPayload(raw: string): string | null {
@@ -1792,35 +1821,6 @@ export class Agent {
     return lines.join('\n');
   }
 
-  private shouldPreferSingleToolPlan(request: string): boolean {
-    const normalized = request.replace(/\s+/g, ' ').trim();
-    if (!normalized || normalized.length > 80) {
-      return false;
-    }
-    if (/保存|save|写入|persist|update|修改|编辑|compare|对比|分别|并且|同时|以及|and also|deep|深度|综合|多渠道|研究|research|方案|计划书|实现|重构/i.test(normalized)) {
-      return false;
-    }
-    if (/[\n\r]/.test(normalized)) {
-      return false;
-    }
-    return /好看|值得|怎么样|评分|评价|口碑|推荐|最新|今天|最近|新闻|票房|影评|电影|演员|歌手|review|rating|recommend|worth|latest|news|movie|actor|celebrity/i.test(normalized);
-  }
-
-  private buildSingleToolPlanForSimpleRequest(request: string): z.infer<typeof PlannerToolCallSchema> | null {
-    if (!this.shouldPreferSingleToolPlan(request)) {
-      return null;
-    }
-    return {
-      name: 'web',
-      arguments: {
-        mode: 'search',
-        query: request,
-        limit: 6,
-      },
-      goal: 'Gather the most relevant external evidence first for this simple request.',
-    };
-  }
-
   private normalizeLegacyToolCallProbe(
     toolNameRaw: unknown,
     rawArgs: unknown,
@@ -1870,22 +1870,6 @@ export class Agent {
     }
 
     return null;
-  }
-
-  private adjustPlannerDecisionForRootTurn(decision: PlannerDecision, input: string): PlannerDecision {
-    if (decision.kind !== 'branch') {
-      return decision;
-    }
-    const request = this.extractOriginalUserRequest(input);
-    const singleToolPlan = this.buildSingleToolPlanForSimpleRequest(request);
-    if (!singleToolPlan) {
-      return decision;
-    }
-    return {
-      kind: 'tool',
-      thought: 'This is a simple single-question request; start with one high-confidence tool call before considering branching.',
-      tool_calls: [singleToolPlan],
-    } as PlannerDecision;
   }
 
   private isTrivialMemoryCandidate(text: string): boolean {
@@ -2736,14 +2720,13 @@ STRICT OUTPUT CONTRACT:
 
 VALID EXAMPLES:
 {"kind":"tool","thought":"Use web search first.","tool_calls":[{"name":"web","arguments":{"mode":"search","query":"Ryan Gosling review","limit":5},"goal":"Gather current external evidence."}]}
+{"kind":"branch","thought":"The task has independent parts that benefit from parallel exploration.","branches":[{"label":"Chinese sources","goal":"Search Chinese financial news channels","priority":0.8},{"label":"English sources","goal":"Search English financial news channels","priority":0.8}]}
 {"kind":"final","thought":"Enough evidence is available.","final_answer":"我查到的主流评价是正面的。"}
 
 Rules:
-1. Prefer kind="tool" when one next action is clearly best. Most turns should not branch.
-2. Use kind="branch" in TWO situations:
-   a) Multiple materially distinct strategies — different hypotheses, search paths, or execution strategies worth exploring in parallel.
-   b) Multiple independent sub-tasks — when the user's request contains 2 or more clearly separable actions that do not depend on each other's output (e.g. "fetch X and also save Y", "research A and update B"). Spawn one branch per independent sub-task so they execute in parallel instead of serially in root.
-3. A branch must represent either a genuinely different strategy OR a distinct independent sub-task. Never bundle unrelated work into a single branch.
+1. Prefer kind="tool" when one next action is clearly best.
+2. Use kind="branch" when there are multiple possibilities to explore, independent tasks that can run in parallel, or different strategies worth trying concurrently.
+3. Each branch should have a distinct purpose. Do not create branches that duplicate the same work.
 4. Never create more than ${this.branchMaxWidth} child branches in one step.
 5. Prefer search before edit when the correct answer may already exist in repository files.
 6. For repository discovery, prefer read and search on workspace evidence before using web.
@@ -2762,8 +2745,6 @@ Rules:
 16. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
 17. If the user asks what is in Mempedia or what skills are available, prefer \`search/read\` with \`target=memory\` or \`target=skills\` before final_answer.
 19. NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value. Saving a greeting or one-liner response wastes storage and pollutes search results.
-20. For a simple single-question request that can be answered by one best next tool call, NEVER branch on the first step. Do one tool call first, then reassess.
-21. If the request is about an external movie/book/person/product/news topic, default to one \`web\` tool call before branching. Do not create parallel "workspace + web" branches unless the user explicitly asked to compare local context with external evidence.
 ${alwaysIncludeBlock ? `
 ${alwaysIncludeBlock}
 
@@ -2794,7 +2775,7 @@ ${soulsGuidance}
     });
     emitTrace({
       type: 'observation',
-      content: `Context budget: model=${this.model} limit=${ctxBudget.modelLimit} committed=${ctxBudget.committedTokens} residual=${ctxBudget.residualBudget} → maxSteps=${ctxBudget.maxSteps} depth=${ctxBudget.maxBranchDepth} width=${ctxBudget.maxBranchWidth} totalSteps=${ctxBudget.maxTotalSteps} transcriptChars=${ctxBudget.transcriptBudgetChars} beamDepth=${ctxBudget.beamMaxDepth} beamWidth=${ctxBudget.beamWidth}`,
+      content: `Context budget: model=${this.model} limit=${ctxBudget.modelLimit} committed=${ctxBudget.committedTokens} residual=${ctxBudget.residualBudget} → maxSteps=${ctxBudget.maxSteps} depth=${ctxBudget.maxBranchDepth} width=${ctxBudget.maxBranchWidth} totalSteps=${ctxBudget.maxTotalSteps} transcriptChars=${ctxBudget.transcriptBudgetChars} beamDepth=${ctxBudget.beamMaxDepth} beamWidth=${ctxBudget.beamWidth} [dynamic-budget: ON, compress@92%]`,
     });
 
     // Effective parameters: take the minimum of env-configured and budget-computed values.
@@ -2931,6 +2912,8 @@ ${soulsGuidance}
 
     const parseDecision = (raw: string): PlannerDecision => {
       const rawTrimmed = raw.trim();
+      // Diagnostic: log every planner raw output for debugging parse failures.
+      emitTrace({ type: 'observation', content: `[planner-raw] ${rawTrimmed.slice(0, 500)}${rawTrimmed.length > 500 ? '...[truncated]' : ''}` });
       const candidates = extractJsonishCandidates(raw);
       let normalized: Record<string, unknown> | null = null;
 
@@ -3098,7 +3081,32 @@ ${soulsGuidance}
         });
       }
 
-      return PlannerDecisionSchema.parse(normalizedRecord);
+      try {
+        const result = PlannerDecisionSchema.parse(normalizedRecord);
+        const branchCount = Array.isArray(result.branches) ? result.branches.length : 0;
+        emitTrace({ type: 'observation', content: `[planner-parsed] kind=${result.kind}${branchCount > 0 ? ` branches=${branchCount}` : ''}${result.kind === 'tool' && result.tool_calls ? ` tools=${result.tool_calls.map(t => t.name).join(',')}` : ''}` });
+        return result;
+      } catch (zodError: any) {
+        // Zod validation failed on the normalized record — typically branch
+        // objects with out-of-range fields (priority > 1, label too long, etc.).
+        // Fall back to a safe decision instead of crashing the planner.
+        process.stderr.write(`[parseDecision] Zod validation failed: ${zodError?.message?.slice?.(0, 300) ?? zodError}\n`);
+        if (normalizedRecord.kind === 'branch' && Array.isArray(normalizedRecord.branches)) {
+          // Try to salvage: strip invalid branches and re-parse, or downgrade to final.
+          const salvaged = (normalizedRecord.branches as any[]).filter((b: any) => {
+            try { PlannerBranchSchema.parse(b); return true; } catch { return false; }
+          });
+          if (salvaged.length > 0) {
+            normalizedRecord.branches = salvaged;
+            try { return PlannerDecisionSchema.parse(normalizedRecord); } catch { /* fall through */ }
+          }
+        }
+        return PlannerDecisionSchema.parse({
+          kind: 'final',
+          thought: 'Planner output failed schema validation; using fallback.',
+          final_answer: typeof normalizedRecord.thought === 'string' ? normalizedRecord.thought : '抱歉，刚才内部规划结果格式异常，请重试。',
+        });
+      }
     };
 
     const planWithSkillRouting = async (
@@ -3109,6 +3117,21 @@ ${soulsGuidance}
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const raw = await invoke(workingTranscript);
         const decision = parseDecision(raw);
+        if (
+          decision.kind === 'final'
+          && this.isPlannerFormatFallbackAnswer(decision.final_answer || '')
+          && attempt < 2
+        ) {
+          emitTrace({
+            type: 'observation',
+            content: 'Planner returned no valid structured decision; retrying the same branch with a stricter JSON-only repair prompt.',
+          });
+          workingTranscript = [
+            ...workingTranscript,
+            { role: 'user', content: this.buildPlannerSchemaRepairPrompt() },
+          ];
+          continue;
+        }
         if (decision.kind !== 'skills') {
           return decision;
         }
@@ -3238,7 +3261,7 @@ ${soulsGuidance}
         ...compressed,
         {
           role: 'user',
-          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}/${effectiveMaxDepth}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- step_budget: ${branch.steps}/${effectiveMaxSteps}\n- context_budget_residual: ${ctxBudget.residualBudget} tokens\n\nReturn exactly one JSON object. Branch (kind="branch") when (a) you have materially distinct strategies to try in parallel, or (b) the remaining work has 2+ independent sub-tasks that do not depend on each other's output. Always provide at least 2 branches when branching, or use kind="tool" / kind="final" instead.`,
+          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}\n- remaining_branch_depth: ${Math.max(0, effectiveMaxDepth - branch.depth)}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- step_budget: ${branch.steps}/${effectiveMaxSteps}\n- context_budget_residual: ${ctxBudget.residualBudget} tokens\n\nReturn exactly one JSON object.`,
         },
       ];
     };
@@ -3283,6 +3306,7 @@ ${soulsGuidance}
 
     const finalizeFromBranch = async (branch: BranchState, reason: string): Promise<string> => {
       emitBranchTrace('thought', branch, `Forcing finalization for ${branch.id}: ${reason}`);
+      const compressedTranscript = compressBranchTranscript(branch.transcript, { tailKeep: 6, maxSummaryChars: 2000 });
       const { text: _finalizeText } = await this.measure(perfEntries, `finalize_${branch.id}`, async () =>
         this.withTimeout(
           generateText({
@@ -3292,7 +3316,7 @@ ${soulsGuidance}
             messages: ([
               { role: 'system', content: `${systemPrompt}\nYou must now finish. Do not branch. Do not call tools. Return plain text only.` },
               ...recentConversationMessages,
-              ...branch.transcript,
+              ...compressedTranscript,
               { role: 'user', content: `Finalize branch ${branch.id}. User request:\n${input}\n\nReason: ${reason}` },
             ] as any),
           }),
@@ -3533,6 +3557,9 @@ ${soulsGuidance}
       maxCompletedBranches: this.branchMaxCompleted,
       branchConcurrency: this.branchConcurrency,
       maxTotalSteps: effectiveMaxTotalSteps,
+      transcriptBudgetChars: effectiveTranscriptBudgetChars,
+      modelLimit: ctxBudget.modelLimit,
+      committedTokens: ctxBudget.committedTokens,
       planBranch: async ({ branch }) => {
         const decision = await planWithSkillRouting(
           buildMessages(branch as BranchState) as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
@@ -3552,23 +3579,26 @@ ${soulsGuidance}
             );
           }
         );
-        const adjustedDecision = branch.id === 'B0'
-          ? this.adjustPlannerDecisionForRootTurn(decision, input)
-          : decision;
-        if (adjustedDecision !== decision) {
-          emitTrace({
-            type: 'observation',
-            content: 'Collapsed a root branching plan into a single-tool plan because the request looks like a simple external query.',
-            metadata: { branchId: branch.id, parentBranchId: branch.parentId, branchLabel: branch.label, depth: branch.depth, step: branch.steps },
-          });
+        if (decision.kind === 'tool') {
+          return { kind: 'tool' as const, thought: decision.thought, toolCalls: decision.tool_calls || [] };
         }
-        return adjustedDecision.kind === 'tool'
-          ? { kind: 'tool', thought: adjustedDecision.thought, toolCalls: adjustedDecision.tool_calls || [] }
-          : adjustedDecision.kind === 'branch'
-            ? { kind: 'branch', thought: adjustedDecision.thought, branches: adjustedDecision.branches || [] }
-            : { kind: 'final', thought: adjustedDecision.thought, content: String(adjustedDecision.final_answer || ''), completionSummary: adjustedDecision.completion_summary };
+        if (decision.kind === 'branch') {
+          const branches = decision.branches || [];
+          if (branches.length === 0) {
+            // Model chose branch but provided no branches — treat as thought-only step,
+            // push a correction into the transcript so the model can retry.
+            emitTrace({ type: 'observation', content: `Planner returned kind="branch" but branches array was empty for ${branch.id}; asking for retry.` });
+            branch.transcript.push({
+              role: 'user' as const,
+              content: 'You selected kind="branch" but provided an empty branches array. Either provide concrete branches, use kind="tool", or finish with kind="final".',
+            });
+            return { kind: 'tool' as const, thought: decision.thought, toolCalls: [] };
+          }
+          return { kind: 'branch' as const, thought: decision.thought, branches };
+        }
+        return { kind: 'final' as const, thought: decision.thought, content: String(decision.final_answer || ''), completionSummary: decision.completion_summary };
       },
-      executeToolCall: async ({ branch, toolCall }) => {
+      executeToolCall: async ({branch, toolCall }) => {
         const result = await executeToolCall(branch as BranchState, toolCall as z.infer<typeof PlannerToolCallSchema>);
         return {
           toolName: toolCall.name,
@@ -3605,7 +3635,7 @@ ${soulsGuidance}
         });
       }
     });
-    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. Branch (kind="branch") when (a) multiple distinct approaches are worth exploring in parallel, or (b) the request has 2 or more clearly independent sub-tasks. Always provide at least 2 branches, or do not branch.`);
+    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. Choose tool, branch, or final based on the task structure.`);
     }
 
     // ── Session carry-over: detect exhaustion and record/clear ──────────
@@ -3681,6 +3711,13 @@ ${soulsGuidance}
       });
     }
     finalAnswer = this.normalizeUserFacingAnswer(finalAnswer);
+    // Save the complete conversation trace (all branches) for diagnosis.
+    this.appendConversationLog(
+      `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      input,
+      traceBuffer,
+      finalAnswer,
+    );
     this.appendConversationTurn(conversationId, { user: input, assistant: finalAnswer });
     const persistedTurns = this.getConversationTurns(conversationId);
     const nextPersistedState = this.buildPersistedConversationState(

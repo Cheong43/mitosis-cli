@@ -127,6 +127,79 @@ test('planner fallback returns natural language error instead of echoing raw bas
   agent.stop();
 });
 
+test('planner retries malformed structured reply before failing a branch', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-format-retry-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+
+  let plannerCalls = 0;
+  anyAgent.generateJsonPromptText = async () => {
+    plannerCalls += 1;
+    if (plannerCalls === 1) {
+      return '{"tool":"read","args":{"filePath":"note.txt"}}';
+    }
+    return JSON.stringify({
+      kind: 'final',
+      thought: 'Recovered after schema retry.',
+      final_answer: '恢复成功',
+      completion_summary: '恢复成功',
+    });
+  };
+
+  const traces: TraceEvent[] = [];
+  const answer = await agent.run('测试格式重试', (event) => { traces.push(event); }, { conversationId: 'thread-format-retry' });
+
+  assert.equal(answer, '恢复成功');
+  assert.ok(plannerCalls >= 2, `Expected planner to be retried, got ${plannerCalls} call(s)`);
+  assert.ok(
+    !traces.some((event) => event.content.includes('内部规划结果格式异常')),
+    'Did not expect branch to terminate with planner format fallback after retry',
+  );
+
+  agent.stop();
+});
+
+test('planner prompt keeps branching guidance principle-based without root coercion', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-branch-guidance-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+
+  let capturedPrompt = '';
+  anyAgent.generateJsonPromptText = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+    capturedPrompt = Array.isArray(messages)
+      ? messages.map((message) => String(message?.content || '')).join('\n\n')
+      : '';
+    return JSON.stringify({
+      kind: 'final',
+      thought: 'Done.',
+      final_answer: 'ok',
+      completion_summary: 'ok',
+    });
+  };
+
+  const answer = await agent.run('竭尽所能收集中英今天的盘前信源', () => {}, { conversationId: 'thread-branch-guidance' });
+  assert.equal(answer, 'ok');
+  assert.match(capturedPrompt, /multiple viable possibilities are worth exploring in parallel/i);
+  assert.match(capturedPrompt, /parallel execution would materially help/i);
+  assert.doesNotMatch(capturedPrompt, /Always provide at least 2 branches/i);
+  assert.doesNotMatch(capturedPrompt, /NEVER branch on the first step/i);
+  assert.doesNotMatch(capturedPrompt, /default to one `web` tool call before branching/i);
+
+  agent.stop();
+});
+
 test('normalizes pseudo tool_call planner output into a real tool execution', async () => {
   const projectRoot = createTempProjectRoot('mempedia-agent-pseudo-tool-call-');
   fs.writeFileSync(path.join(projectRoot, 'note.txt'), 'hello from note\n', 'utf-8');

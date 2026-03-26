@@ -182,30 +182,35 @@ export function computeContextBudget(input: ContextBudgetInput): ContextBudgetRe
   const maxSteps = clamp(rawMaxSteps, 2, 20);
 
   // maxBranchDepth: deeper branching multiplies token usage exponentially.
-  // We scale by residual budget tiers.
-  const maxBranchDepth = residual >= 80_000 ? 3
-    : residual >= 40_000 ? 2
-    : residual >= 15_000 ? 1
+  // With branch-spawn transcript compression (~75% savings per depth level),
+  // effective per-depth cost is much lower, so we can afford deeper trees.
+  const maxBranchDepth = residual >= 60_000 ? 4
+    : residual >= 35_000 ? 3
+    : residual >= 18_000 ? 2
+    : residual >= 8_000 ? 1
     : 0;
 
-  // maxBranchWidth: more branches = more parallel token consumption.
-  const maxBranchWidth = residual >= 60_000 ? 4
-    : residual >= 30_000 ? 3
+  // maxBranchWidth: transcript compression on spawn reduces inherited cost.
+  const maxBranchWidth = residual >= 40_000 ? 5
+    : residual >= 25_000 ? 4
+    : residual >= 12_000 ? 3
     : 2;
 
   // maxTotalSteps: global ceiling on total work.
+  // With compression, branches are cheaper — use 0.45 multiplier instead of 0.6.
   const maxTotalSteps = clamp(
-    Math.floor(residual / (TOKENS_PER_STEP.total * 0.6)),
+    Math.floor(residual / (TOKENS_PER_STEP.total * 0.45)),
     maxSteps,
     maxSteps * maxBranchWidth * (maxBranchDepth + 1),
   );
 
   // transcriptBudgetChars: character budget for buildMessages windowing.
   // ~4 chars per token (with mixed content assumption).
+  // Raise cap for large context models (Gemini 1M, Claude 200k).
   const transcriptBudgetChars = clamp(
     Math.floor(residual * 3.5),
     4000,
-    120_000,
+    200_000,
   );
 
   // ── Beam Search parameters ─────────────────────────────────────────────
@@ -356,4 +361,203 @@ function fitFromEnd(
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+// ── Branch-spawn transcript compression ────────────────────────────────────
+
+/**
+ * Compress a parent branch's transcript before passing to child branches.
+ * This dramatically reduces token inheritance cost, enabling deeper/wider branching.
+ *
+ * Strategy:
+ *   - Always keep the first message (original user request).
+ *   - Compress middle messages into a compact parent-activity summary.
+ *   - Keep the last `tailKeep` messages verbatim for recency.
+ *   - Tool observations in middle messages are reduced to one-line markers.
+ */
+export function compressBranchTranscript(
+  messages: TranscriptMessage[],
+  options: { tailKeep?: number; maxSummaryChars?: number } = {},
+): TranscriptMessage[] {
+  const tailKeep = options.tailKeep ?? 4;
+  const maxSummaryChars = options.maxSummaryChars ?? 1500;
+
+  if (messages.length <= tailKeep + 1) return messages;
+
+  const first = messages[0];
+  const middle = messages.slice(1, messages.length - tailKeep);
+  const tail = messages.slice(messages.length - tailKeep);
+
+  const summaryLines: string[] = [];
+  let toolCallCount = 0;
+  let branchCount = 0;
+
+  for (const m of middle) {
+    if (m.role === 'assistant') {
+      try {
+        const parsed = JSON.parse(m.content);
+        if (parsed.kind === 'tool' && Array.isArray(parsed.tool_calls)) {
+          for (const tc of parsed.tool_calls) {
+            toolCallCount++;
+            const goal = tc.goal ? ` — ${tc.goal}` : '';
+            summaryLines.push(`> ${tc.name}${goal}`);
+          }
+        } else if (parsed.kind === 'branch') {
+          branchCount++;
+          summaryLines.push(`>> branched into ${parsed.branches?.length ?? '?'} children`);
+        }
+      } catch {
+        const line = m.content.split('\n')[0].slice(0, 120);
+        if (line) summaryLines.push(`# ${line}`);
+      }
+    } else if (m.role === 'user' && m.content.startsWith('TOOL OBSERVATION')) {
+      const firstLine = m.content.split('\n')[0];
+      const hasError = m.content.includes('ERROR:');
+      summaryLines.push(`  ${firstLine}${hasError ? ' [ERROR]' : ' [OK]'} (${m.content.length}ch)`);
+    }
+  }
+
+  let summary = summaryLines.join('\n');
+  if (summary.length > maxSummaryChars) {
+    summary = summary.slice(0, maxSummaryChars) + '\n...[parent history truncated]';
+  }
+
+  const parentSummary: TranscriptMessage = {
+    role: 'user',
+    content: `[PARENT BRANCH CONTEXT — ${toolCallCount} tool calls, ${branchCount} branching steps compressed]\n${summary}`,
+  };
+
+  return [first, parentSummary, ...tail];
+}
+
+/**
+ * Apply progressive compression to a branch's transcript during execution.
+ * Called after each step to keep the transcript within budget, allowing
+ * more steps before hitting context limits.
+ */
+export function progressiveCompressBranch(
+  messages: TranscriptMessage[],
+  budgetChars: number,
+  recentKeep: number = 6,
+): TranscriptMessage[] {
+  const totalLen = messages.reduce((s, m) => s + m.content.length, 0);
+  if (totalLen <= budgetChars) return messages;
+
+  if (messages.length <= recentKeep + 1) {
+    return compressTranscript(messages, budgetChars, 'medium');
+  }
+
+  const first = messages[0];
+  const middle = messages.slice(1, messages.length - recentKeep);
+  const tail = messages.slice(messages.length - recentKeep);
+
+  // Aggressively compress middle: tool observations → one-liners,
+  // assistant tool-call messages → name-only summaries.
+  const compressed = middle.map((m) => {
+    if (m.role === 'user' && m.content.startsWith('TOOL OBSERVATION')) {
+      const firstLine = m.content.split('\n')[0];
+      return { ...m, content: `${firstLine} [compressed]` };
+    }
+    if (m.role === 'assistant') {
+      try {
+        const parsed = JSON.parse(m.content);
+        if (parsed.kind === 'tool' && Array.isArray(parsed.tool_calls)) {
+          const names = parsed.tool_calls.map((tc: { name: string }) => tc.name).join(', ');
+          return { ...m, content: JSON.stringify({ kind: 'tool', tool_calls_summary: names }) };
+        }
+      } catch { /* keep as-is */ }
+    }
+    return m;
+  });
+
+  const result = [first, ...compressed, ...tail];
+  const resultLen = result.reduce((s, m) => s + m.content.length, 0);
+
+  if (resultLen > budgetChars) {
+    return compressTranscript(result, budgetChars, 'hard');
+  }
+
+  return result;
+}
+
+// ── Dynamic context auto-compression ───────────────────────────────────────
+
+export interface ContextCheckResult {
+  /** Transcript after potential compression. */
+  transcript: Array<{ role: string; content: string }>;
+  /** Whether compression was applied. */
+  compressed: boolean;
+  /** Whether more steps can safely be taken. */
+  canContinue: boolean;
+  /** Usage ratio (0–1) after any compression. */
+  usageRatio: number;
+  /** Estimated transcript tokens after any compression. */
+  transcriptTokens: number;
+}
+
+/**
+ * Check actual context utilization and auto-compress if the threshold is
+ * exceeded.  Called at the top of each branch loop iteration when model
+ * limits are available.
+ *
+ * Behaviour:
+ *   1. Estimate real token count of the transcript.
+ *   2. If usage < `compressThreshold` (default 92%) → no-op, continue.
+ *   3. If usage ≥ threshold → progressive compress aiming at `targetRatio`
+ *      (default 75%).  If still over threshold → hard compress.
+ *   4. After hard compression, if usage still ≥ 95% → `canContinue = false`.
+ *
+ * Branch structure (depth / width) is never changed — only the transcript
+ * is compacted so execution can keep going.
+ */
+export function checkContextAndCompress(
+  transcript: Array<{ role: string; content: string }>,
+  modelLimit: number,
+  committedTokens: number,
+  options: {
+    /** Usage ratio at which compression kicks in. Default 0.92 */
+    compressThreshold?: number;
+    /** Target usage ratio after compression. Default 0.75 */
+    targetRatio?: number;
+    /** Recent messages to always keep verbatim. Default 6 */
+    recentKeep?: number;
+  } = {},
+): ContextCheckResult {
+  const compressThreshold = options.compressThreshold ?? 0.92;
+  const targetRatio = options.targetRatio ?? 0.75;
+  const recentKeep = options.recentKeep ?? 6;
+
+  const transcriptTokens = estimateTranscriptTokens(transcript);
+  const totalUsed = committedTokens + transcriptTokens;
+  const usageRatio = modelLimit > 0 ? totalUsed / modelLimit : 1;
+
+  if (usageRatio < compressThreshold) {
+    return { transcript, compressed: false, canContinue: true, usageRatio, transcriptTokens };
+  }
+
+  // Over threshold — compress to targetRatio
+  const targetTranscriptTokens = Math.max(0, Math.floor(modelLimit * targetRatio) - committedTokens);
+  const targetBudgetChars = Math.max(4000, targetTranscriptTokens * 4);
+
+  // Progressive compression first
+  let result = progressiveCompressBranch(transcript, targetBudgetChars, recentKeep);
+  let newTokens = estimateTranscriptTokens(result);
+  let newRatio = modelLimit > 0 ? (committedTokens + newTokens) / modelLimit : 1;
+
+  if (newRatio < compressThreshold) {
+    return { transcript: result, compressed: true, canContinue: true, usageRatio: newRatio, transcriptTokens: newTokens };
+  }
+
+  // Hard compression
+  result = compressTranscript(result, targetBudgetChars, 'hard');
+  newTokens = estimateTranscriptTokens(result);
+  newRatio = modelLimit > 0 ? (committedTokens + newTokens) / modelLimit : 1;
+
+  return {
+    transcript: result,
+    compressed: true,
+    canContinue: newRatio < 0.95,
+    usageRatio: newRatio,
+    transcriptTokens: newTokens,
+  };
 }

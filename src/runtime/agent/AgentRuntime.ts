@@ -1,6 +1,7 @@
 import { AgentTraceEvent, PlannedBranch, PlannedToolCall, ToolObservation, TranscriptMessage } from './types.js';
 import { Planner } from './SimplePlanner.js';
 import { ToolExecutionResult } from '../tools/types.js';
+import { compressBranchTranscript, progressiveCompressBranch, checkContextAndCompress } from '../../agent/contextBudget.js';
 
 interface AgentToolRuntime {
   execute(toolName: string, args: Record<string, unknown>): Promise<ToolExecutionResult>;
@@ -28,7 +29,6 @@ export interface BranchPlanInput {
 export interface BranchToolExecutionInput {
   branch: AgentBranchState;
   toolCall: PlannedToolCall;
-  deferTrace?: boolean;
 }
 
 export interface BranchFinalizeInput {
@@ -64,6 +64,12 @@ export interface AgentRuntimeOptions {
   branchConcurrency?: number;
   /** Optional override for total work budget across all branches. */
   maxTotalSteps?: number;
+  /** Character budget for per-branch transcript compression. */
+  transcriptBudgetChars?: number;
+  /** Model context window in tokens. Enables dynamic budget mode when > 0. */
+  modelLimit?: number;
+  /** Tokens already committed (system prompt + conversation + memory + margin). */
+  committedTokens?: number;
   /** Optional branch-aware planner override. */
   planBranch?: (input: BranchPlanInput) => Promise<import('./types.js').AgentStep>;
   /** Optional branch-aware tool execution override. */
@@ -97,6 +103,9 @@ export class AgentRuntime {
   private readonly maxCompletedBranches: number;
   private readonly branchConcurrency: number;
   private readonly maxTotalSteps: number | null;
+  private readonly transcriptBudgetChars: number;
+  private readonly modelLimit: number;
+  private readonly committedTokens: number;
   private readonly planBranch?: (input: BranchPlanInput) => Promise<import('./types.js').AgentStep>;
   private readonly executeToolCall?: (input: BranchToolExecutionInput) => Promise<ToolObservation>;
   private readonly finalizeBranch?: (input: BranchFinalizeInput) => Promise<string>;
@@ -112,6 +121,9 @@ export class AgentRuntime {
     this.maxCompletedBranches = options.maxCompletedBranches ?? 4;
     this.branchConcurrency = options.branchConcurrency ?? 3;
     this.maxTotalSteps = options.maxTotalSteps ?? null;
+    this.transcriptBudgetChars = options.transcriptBudgetChars ?? 80_000;
+    this.modelLimit = options.modelLimit ?? 0;
+    this.committedTokens = options.committedTokens ?? 0;
     this.planBranch = options.planBranch;
     this.executeToolCall = options.executeToolCall;
     this.finalizeBranch = options.finalizeBranch;
@@ -181,15 +193,16 @@ export class AgentRuntime {
       success: execResult.success,
     });
 
-    const shouldRuntimeTraceTool = (deferTrace: boolean) => !this.executeToolCall || deferTrace;
+    // When a custom executeToolCall hook is provided, the hook is responsible
+    // for emitting its own action/observation traces.  The runtime should NOT
+    // double-emit — only trace when there is no hook.
+    const shouldRuntimeTraceTool = () => !this.executeToolCall;
 
     const executeSingleToolCall = async (
       branch: AgentBranchState,
       toolCall: PlannedToolCall,
-      options: { deferTrace?: boolean } = {},
     ): Promise<ToolObservation> => {
-      const deferTrace = options.deferTrace === true;
-      if (shouldRuntimeTraceTool(deferTrace)) {
+      if (shouldRuntimeTraceTool()) {
         emitBranchTrace(
           'action',
           branch,
@@ -199,7 +212,7 @@ export class AgentRuntime {
       }
 
       if (this.executeToolCall) {
-        return this.executeToolCall({ branch, toolCall, deferTrace });
+        return this.executeToolCall({ branch, toolCall });
       }
 
       const execResult = await this.toolRuntime.execute(toolCall.name, toolCall.arguments);
@@ -218,15 +231,17 @@ export class AgentRuntime {
       let observations: ToolObservation[];
       if (canRunToolCallsConcurrently(toolCalls)) {
         observations = await Promise.all(
-          toolCalls.map((toolCall) => executeSingleToolCall(branch, toolCall, { deferTrace: true })),
+          toolCalls.map((toolCall) => executeSingleToolCall(branch, toolCall)),
         );
-        observations.forEach((observation) => emitObservationTrace(branch, observation));
+        if (shouldRuntimeTraceTool()) {
+          observations.forEach((observation) => emitObservationTrace(branch, observation));
+        }
       } else {
         observations = [];
         for (const toolCall of toolCalls) {
           const observation = await executeSingleToolCall(branch, toolCall);
           observations.push(observation);
-          if (shouldRuntimeTraceTool(false)) {
+          if (shouldRuntimeTraceTool()) {
             emitObservationTrace(branch, observation);
           }
         }
@@ -247,39 +262,84 @@ export class AgentRuntime {
     const buildChildBranches = (
       branch: AgentBranchState,
       branches: PlannedBranch[],
-    ): AgentBranchState[] => branches.map((child, index) => ({
-      id: `${branch.id}.${index + 1}`,
-      parentId: branch.id,
-      depth: branch.depth + 1,
-      label: child.label,
-      goal: child.goal,
-      priority: Math.max(0.05, branch.priority * (child.priority ?? Math.max(0.2, 1 - index * 0.2))),
-      steps: 0,
-      savedNodeIds: branch.savedNodeIds.slice(),
-      transcript: [
-        ...branch.transcript,
-        {
-          role: 'assistant',
-          content: JSON.stringify({ kind: 'branch', branches }),
-        },
-        {
-          role: 'user',
-          content: `Continue only this child branch.\nChild label: ${child.label}\nChild goal: ${child.goal}\nWhy this branch exists: ${child.why || 'Distinct strategy'}\nDo not repeat sibling work unless needed.`,
-        },
-      ],
-    }));
+    ): AgentBranchState[] => {
+      // Compress the parent transcript before inheriting \u2014 this is the key
+      // strategy that allows deeper/wider branching without blowing the budget.
+      const compressedParentTranscript = compressBranchTranscript(branch.transcript, {
+        tailKeep: 4,
+        maxSummaryChars: 1500,
+      }) as TranscriptMessage[];
+
+      return branches.map((child, index) => ({
+        id: `${branch.id}.${index + 1}`,
+        parentId: branch.id,
+        depth: branch.depth + 1,
+        label: child.label,
+        goal: child.goal,
+        priority: Math.max(0.05, branch.priority * (child.priority ?? Math.max(0.2, 1 - index * 0.2))),
+        steps: 0,
+        savedNodeIds: branch.savedNodeIds.slice(),
+        transcript: [
+          ...compressedParentTranscript,
+          {
+            role: 'assistant',
+            content: JSON.stringify({ kind: 'branch', branches }),
+          },
+          {
+            role: 'user',
+            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nYou may use tool calls, branch further if the goal benefits from parallel exploration, or return a final answer. Avoid repeating sibling work.`,
+          },
+        ],
+      }));
+    };
 
     const runBranch = async (branch: AgentBranchState): Promise<AgentBranchState[]> => {
       while (true) {
-        if (branch.steps >= this.maxSteps || totalLoopSteps >= totalLoopBudget) {
-          const reason = totalLoopSteps >= totalLoopBudget ? 'total budget reached' : 'step budget reached';
-          if (this.finalizeBranch) {
-            branch.finalAnswer = await this.finalizeBranch({ branch, reason });
+        // ── Context / budget gate ──────────────────────────────────────
+        if (this.modelLimit > 0) {
+          // Dynamic mode: check actual context utilisation, compress at 92%
+          const check = checkContextAndCompress(
+            branch.transcript, this.modelLimit, this.committedTokens,
+          );
+          if (check.compressed) {
+            branch.transcript = check.transcript as TranscriptMessage[];
+            emitBranchTrace('observation', branch,
+              `Context ${(check.usageRatio * 100).toFixed(1)}% — auto-compressed transcript.`);
           }
-          branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped because ${reason}.`;
-          completed.push(branch);
-          emitBranchTrace('observation', branch, `Branch completed after hitting ${reason}.`);
-          return [];
+          if (!check.canContinue) {
+            const reason = 'context window exhausted after compression';
+            if (this.finalizeBranch) {
+              branch.finalAnswer = await this.finalizeBranch({ branch, reason });
+            }
+            branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped: context window full.`;
+            completed.push(branch);
+            emitBranchTrace('observation', branch,
+              `Branch completed: context exhausted (${(check.usageRatio * 100).toFixed(1)}%).`);
+            return [];
+          }
+          // Absolute safety cap (3× per-branch, 2× global)
+          if (branch.steps >= this.maxSteps * 3 || totalLoopSteps >= totalLoopBudget * 2) {
+            const reason = 'absolute safety step limit reached';
+            if (this.finalizeBranch) {
+              branch.finalAnswer = await this.finalizeBranch({ branch, reason });
+            }
+            branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped: ${reason}.`;
+            completed.push(branch);
+            emitBranchTrace('observation', branch, `Branch completed after hitting ${reason}.`);
+            return [];
+          }
+        } else {
+          // Legacy mode: hard step budget
+          if (branch.steps >= this.maxSteps || totalLoopSteps >= totalLoopBudget) {
+            const reason = totalLoopSteps >= totalLoopBudget ? 'total budget reached' : 'step budget reached';
+            if (this.finalizeBranch) {
+              branch.finalAnswer = await this.finalizeBranch({ branch, reason });
+            }
+            branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped because ${reason}.`;
+            completed.push(branch);
+            emitBranchTrace('observation', branch, `Branch completed after hitting ${reason}.`);
+            return [];
+          }
         }
 
         branch.steps += 1;
@@ -311,14 +371,24 @@ export class AgentRuntime {
             continue;
           }
           await executeToolStep(branch, toolCalls);
+
+          // In dynamic mode, compression is handled by checkContextAndCompress
+          // at the top of the loop.  Legacy mode: progressive compression fallback.
+          if (this.modelLimit <= 0 && branch.steps >= 3) {
+            branch.transcript = progressiveCompressBranch(
+              branch.transcript,
+              this.transcriptBudgetChars,
+              6,
+            ) as TranscriptMessage[];
+          }
           continue;
         }
 
         const childPlans = agentStep.branches.slice(0, this.maxBranchWidth);
-        if (branch.depth >= this.maxBranchDepth || childPlans.length < 2) {
+        if (branch.depth >= this.maxBranchDepth || childPlans.length === 0) {
           branch.transcript.push({
             role: 'user',
-            content: `Branching was rejected because ${branch.depth >= this.maxBranchDepth ? 'the branch depth budget is exhausted' : 'fewer than two valid child branches were provided'}. Continue this branch without splitting.`,
+            content: `Branching was rejected because ${branch.depth >= this.maxBranchDepth ? 'the branch depth budget is exhausted' : 'no valid child branches were provided'}. Continue this branch without splitting.`,
           });
           continue;
         }

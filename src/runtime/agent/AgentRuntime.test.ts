@@ -37,7 +37,7 @@ class FakeToolRuntime {
 test('child branches get a fresh local step budget', async () => {
   const planner = new FakePlanner(async (transcript) => {
     const lastMessage = transcript[transcript.length - 1]?.content || '';
-    if (lastMessage.includes('Child label: Fast path')) {
+    if (lastMessage.includes('child branch "Fast path"')) {
       return {
         kind: 'final',
         content: 'child-final-answer',
@@ -82,14 +82,15 @@ test('branches execute concurrently up to branchConcurrency', async () => {
   const planner = new FakePlanner(async (transcript) => {
     const serialized = transcript.map((message) => message.content).join('\n');
     if (serialized.includes('TOOL OBSERVATION for wait_tool')) {
-      const childLabelLine = serialized.split('\n').find((line) => line.startsWith('Child label: ')) || '';
+      const childMatch = serialized.match(/child branch "([^"]+)"/);
+      const childLabel = childMatch ? childMatch[1] : '';
       return {
         kind: 'final',
-        content: `${childLabelLine.replace('Child label: ', '').trim()} done`,
+        content: `${childLabel} done`,
       };
     }
 
-    if (serialized.includes('Child label: ')) {
+    if (serialized.includes('child branch "')) {
       return {
         kind: 'tool',
         toolCalls: [{ name: 'wait_tool', arguments: {} }],
