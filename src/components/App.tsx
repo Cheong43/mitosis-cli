@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import { Agent, TraceEvent } from '../agent/index.js';
+import type { AgentMode } from '../agent/index.js';
 import type { ApprovalPrompt } from '../runtime/index.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -190,6 +191,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   const [runRound, setRunRound] = useState(0);
   const [branchLoop, setBranchLoop] = useState<BranchLoopVisualState | null>(null);
   const [traceLogExpanded, setTraceLogExpanded] = useState(false);
+  const [cliAgentMode, setCliAgentMode] = useState<AgentMode>('branching');
   const [uiUrl, setUiUrl] = useState<string | null>(null);
   const [mempediaStatus, setMempediaStatus] = useState<MempediaTransportStatus | null>(null);
   const uiServerRef = useRef<http.Server | null>(null);
@@ -1179,7 +1181,11 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             const answer = await agent.run(prompt, (event: TraceEvent) => {
               roundTraces.push({ type: event.type, content: event.content, metadata: event.metadata });
               roundBranchState = applyBranchTraceEvent(roundBranchState, event, roundBranchSeen);
-            }, { conversationId: `thread:${tId}`, sessionId: `thread-${tId}-${roundId}` });
+            }, {
+              conversationId: `thread:${tId}`,
+              sessionId: `thread-${tId}-${roundId}`,
+              agentMode: (body?.agentMode === 'react' ? 'react' : 'branching') as AgentMode,
+            });
 
             const round: ThreadRound = {
               id: roundId,
@@ -1272,6 +1278,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             }, {
               conversationId: `thread:${tId}`,
               sessionId: `thread-${tId}-${roundId}`,
+              agentMode: (body?.agentMode === 'react' ? 'react' : 'branching') as AgentMode,
               onApproval: async (prompt: ApprovalPrompt) => {
                 const approvalId = `${tId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                 sendSSE({ kind: 'approval_request', approvalId, prompt });
@@ -1443,7 +1450,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
         traceType: event.type,
         traceMeta: event.metadata,
       }]);
-    }, { conversationId: 'terminal-main', sessionId: `terminal-${Date.now()}`, onApproval: cliApprovalCallback });
+    }, { conversationId: 'terminal-main', sessionId: `terminal-${Date.now()}`, agentMode: cliAgentMode, onApproval: cliApprovalCallback });
     setHistory((prev: HistoryItem[]) => [...prev, { type: 'agent', content: response }]);
   };
 
@@ -1468,8 +1475,26 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
     if (trimmed === '/help') {
       setHistory((prev: HistoryItem[]) => [...prev, {
         type: 'info',
-        content: 'Commands: /help | /clear | /tracelog | /skills | /skills library [query] | /skills download <skill_id> | /skills search <query> | /skills clear-remote | /skill <name> | /skill off | /skill <name> <task> | /ui start [port] | /ui stop | /ui status'
+        content: 'Commands: /help | /clear | /tracelog | /mode [branching|react] | /skills | /skills library [query] | /skills download <skill_id> | /skills search <query> | /skills clear-remote | /skill <name> | /skill off | /skill <name> <task> | /ui start [port] | /ui stop | /ui status'
       }]);
+      return;
+    }
+
+    if (trimmed.startsWith('/mode')) {
+      const parts = trimmed.split(/\s+/);
+      const requestedMode = parts[1] || '';
+      if (requestedMode === 'branching' || requestedMode === 'react') {
+        setCliAgentMode(requestedMode);
+        setHistory((prev: HistoryItem[]) => [...prev, {
+          type: 'info',
+          content: `Agent mode set to: ${requestedMode}`
+        }]);
+      } else {
+        setHistory((prev: HistoryItem[]) => [...prev, {
+          type: 'info',
+          content: `Current mode: ${cliAgentMode}. Usage: /mode branching | /mode react`
+        }]);
+      }
       return;
     }
 

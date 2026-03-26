@@ -47,8 +47,7 @@ export { WriteFileTool } from './tools/builtin/local/WriteFileTool.js';
 export { RunShellTool } from './tools/builtin/local/RunShellTool.js';
 export { AgentRuntime } from './agent/AgentRuntime.js';
 export { SimplePlanner } from './agent/SimplePlanner.js';
-export { BeamSearchAgentRuntime } from './agent/BeamSearchAgentRuntime.js';
-export { DefaultPathScorer } from './agent/DefaultPathScorer.js';
+
 
 export type { Policy } from './governance/types.js';
 export type { ApprovalEngine } from './governance/types.js';

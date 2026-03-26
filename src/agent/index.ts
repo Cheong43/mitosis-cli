@@ -1,8 +1,6 @@
 import {
-  NoObjectGeneratedError,
   buildLanguageModel,
   buildAnthropicLanguageModel,
-  generateObject,
   generateText,
   type LanguageModelV1,
 } from './llm.js';
@@ -13,7 +11,7 @@ import * as path from 'path';
 import * as dotenv from 'dotenv';
 import { z } from 'zod';
 import { resolveCodeCliRoot } from '../config/projectPaths.js';
-import { AgentRuntime, createRuntime, BeamSearchAgentRuntime, CallbackApprovalEngine } from '../runtime/index.js';
+import { AgentRuntime, createRuntime, CallbackApprovalEngine } from '../runtime/index.js';
 import type { ApprovalCallback } from '../runtime/index.js';
 import type { AgentBranchState, BranchSynthesisInput } from '../runtime/agent/AgentRuntime.js';
 import { TOOLS, TOOL_NAMES } from '../tools/definitions.js';
@@ -53,25 +51,11 @@ const PlannerToolCallSchema = z.object({
   goal: z.string().trim().min(1).max(240).optional(),
 });
 
-// OpenAI structured outputs require all fields to be present.
-const PlannerToolCallStructuredSchema = z.object({
-  name: PlannerToolNameSchema,
-  arguments: z.record(z.any()),
-  goal: z.string().trim().min(1).max(240).nullable(),
-});
-
 const PlannerBranchSchema = z.object({
   label: z.string().trim().min(1).max(80),
   goal: z.string().trim().min(1).max(240),
   why: z.string().trim().min(1).max(240).optional(),
   priority: z.number().min(0).max(1).optional(),
-});
-
-const PlannerBranchStructuredSchema = z.object({
-  label: z.string().trim().min(1).max(80),
-  goal: z.string().trim().min(1).max(240),
-  why: z.string().trim().min(1).max(240).nullable(),
-  priority: z.number().min(0).max(1).nullable(),
 });
 
 const PlannerDecisionSchema = z.object({
@@ -82,16 +66,6 @@ const PlannerDecisionSchema = z.object({
   skills_to_load: z.array(z.string().trim().min(1)).max(2).optional(),
   final_answer: z.string().optional(),
   completion_summary: z.string().trim().min(1).max(280).optional(),
-});
-
-const PlannerDecisionStructuredSchema = z.object({
-  kind: z.enum(['tool', 'branch', 'final', 'skills']),
-  thought: z.string().trim().min(1),
-  tool_calls: z.array(PlannerToolCallStructuredSchema).nullable(),
-  branches: z.array(PlannerBranchStructuredSchema).nullable(),
-  skills_to_load: z.array(z.string().trim().min(1)).max(2).nullable(),
-  final_answer: z.string().nullable(),
-  completion_summary: z.string().trim().min(1).max(280).nullable(),
 });
 
 type PlannerDecision = z.infer<typeof PlannerDecisionSchema>;
@@ -168,12 +142,16 @@ export interface AgentConfig {
   anthropicModel?: string;
 }
 
+export type AgentMode = 'branching' | 'react';
+
 export interface AgentRunOptions {
   conversationId?: string;
   agentId?: string;
   sessionId?: string;
   /** Interactive approval callback for governance `ask` decisions. */
   onApproval?: ApprovalCallback;
+  /** Agent execution mode. Defaults to 'branching'. */
+  agentMode?: AgentMode;
 }
 
 interface PerfEntry {
@@ -254,10 +232,7 @@ export class Agent {
   private readonly projectRoot: string;
   private readonly codeCliRoot: string;
   private openai: LanguageModelV1;
-  private beamPlannerStructuredOpenai: LanguageModelV1;
-  private beamPlannerCompatOpenai: LanguageModelV1;
   private memoryOpenai: LanguageModelV1;
-  private beamStructuredResponseFormatSupported = true;
   private jsonObjectResponseFormatSupported = true;
   private mempedia: MempediaClient;
   private model: string;
@@ -293,14 +268,12 @@ export class Agent {
   private readonly agentLlmTimeoutMs: number;
   private readonly plannerTemperature: number;
   private readonly responseTemperature: number;
-  /** When true the agent uses the beam-search loop instead of branching. */
-  private readonly useBeamSearch: boolean;
-  private readonly beamWidth: number;
-  private readonly beamMaxDepth: number;
-  private readonly beamExpansionFactor: number;
   private readonly memoryClassifier: MemoryClassifierAgent;
   /** Per-session compressor for exhausted-run carry-over. */
   private readonly sessionCompressor: SessionCompressor;
+  /** In-process caches to avoid re-reading disk on every request. */
+  private cachedWorkspaceSkills: SkillRecord[] | null = null;
+  private cachedSoulsMarkdown: string | null = null;
 
   constructor(config: AgentConfig, projectRoot: string, binaryPath?: string) {
     this.projectRoot = projectRoot;
@@ -317,8 +290,6 @@ export class Agent {
         baseURL: config.anthropicBaseURL,
       });
       this.openai = anthropicModel;
-      this.beamPlannerStructuredOpenai = anthropicModel;
-      this.beamPlannerCompatOpenai = anthropicModel;
     } else {
       this.openai = buildLanguageModel({
         model: this.model,
@@ -328,28 +299,6 @@ export class Agent {
         hmacSecretKey: config.hmacSecretKey,
         gatewayApiKey: config.gatewayApiKey,
       });
-      this.beamPlannerStructuredOpenai = buildLanguageModel(
-        {
-          model: this.model,
-          apiKey: config.apiKey,
-          baseURL: config.baseURL,
-          hmacAccessKey: config.hmacAccessKey,
-          hmacSecretKey: config.hmacSecretKey,
-          gatewayApiKey: config.gatewayApiKey,
-        },
-        { structuredOutputs: true }
-      );
-      this.beamPlannerCompatOpenai = buildLanguageModel(
-        {
-          model: this.model,
-          apiKey: config.apiKey,
-          baseURL: config.baseURL,
-          hmacAccessKey: config.hmacAccessKey,
-          hmacSecretKey: config.hmacSecretKey,
-          gatewayApiKey: config.gatewayApiKey,
-        },
-        { structuredOutputs: false }
-      );
     }
 
     // ── Memory LLM: reuse Anthropic if no separate memory config ───────
@@ -413,14 +362,6 @@ export class Agent {
     this.plannerTemperature = Number.isFinite(rawPlannerTemperature) ? Math.max(0, Math.min(1, rawPlannerTemperature)) : 0.1;
     const rawResponseTemperature = Number(process.env.RESPONSE_TEMPERATURE ?? 0.3);
     this.responseTemperature = Number.isFinite(rawResponseTemperature) ? Math.max(0, Math.min(1, rawResponseTemperature)) : 0.3;
-    const rawUseBeamSearch = String(process.env.REACT_BEAM_SEARCH_ENABLED ?? '0').toLowerCase();
-    this.useBeamSearch = rawUseBeamSearch === '1' || rawUseBeamSearch === 'true' || rawUseBeamSearch === 'on';
-    const rawBeamWidth = Number(process.env.REACT_BEAM_WIDTH ?? 3);
-    this.beamWidth = Number.isFinite(rawBeamWidth) ? Math.max(1, Math.min(10, Math.floor(rawBeamWidth))) : 3;
-    const rawBeamMaxDepth = Number(process.env.REACT_BEAM_MAX_DEPTH ?? 5);
-    this.beamMaxDepth = Number.isFinite(rawBeamMaxDepth) ? Math.max(1, Math.min(10, Math.floor(rawBeamMaxDepth))) : 5;
-    const rawBeamExpansionFactor = Number(process.env.REACT_BEAM_EXPANSION_FACTOR ?? 3);
-    this.beamExpansionFactor = Number.isFinite(rawBeamExpansionFactor) ? Math.max(1, Math.min(10, Math.floor(rawBeamExpansionFactor))) : 3;
     this.memoryLogPath = path.join(projectRoot, '.mitosis', 'logs', 'mitosis_save.log');
     this.conversationLogDir = path.join(projectRoot, '.mitosis', 'conversations');
     this.nodeConversationMapPath = path.join(projectRoot, '.mitosis', 'logs', 'node_conversations.jsonl');
@@ -2058,6 +1999,21 @@ export class Agent {
       };
     }
 
+    // Skip the LLM call when scores are already unambiguous: the top candidate
+    // leads by a wide margin and every candidate scores above the noise floor.
+    const sorted = [...candidates].sort((a, b) => b.searchScore - a.searchScore);
+    const topScore = sorted[0].searchScore;
+    const secondScore = sorted[1]?.searchScore ?? 0;
+    const noiseFloor = 0.5;
+    const dominanceGap = 0.8;
+    if (topScore >= noiseFloor && topScore - secondScore >= dominanceGap) {
+      const heuristic = this.heuristicSelectContextCandidates(input, candidates, selectedTurns);
+      return {
+        selected: heuristic,
+        rationale: `Heuristic selection used (top score=${topScore.toFixed(2)} dominance gap=${(topScore - secondScore).toFixed(2)} ≥ ${dominanceGap}); skipped LLM context-selection call.`,
+      };
+    }
+
     const candidateList = candidates.map((candidate, index) => [
       `${index + 1}. node_id=${candidate.nodeId}`,
       `score=${candidate.searchScore.toFixed(2)}`,
@@ -2140,13 +2096,18 @@ export class Agent {
     }
 
     const recalledNodeIds = searchResults.results.map((item: any) => String(item.node_id));
+    const topHits = searchResults.results.slice(0, 5);
+    const openedResults = await Promise.all(
+      topHits.map((hit: any) =>
+        sendAction({ action: 'open_node', node_id: String(hit.node_id), markdown: true })
+          .then((opened) => ({ hit, opened }))
+          .catch(() => null),
+      ),
+    );
     const candidates: ContextCandidate[] = [];
-    for (const hit of searchResults.results.slice(0, 5)) {
-      const opened = await sendAction({
-        action: 'open_node',
-        node_id: String(hit.node_id),
-        markdown: true,
-      });
+    for (const result of openedResults) {
+      if (!result) continue;
+      const { hit, opened } = result;
       if (opened.kind !== 'markdown' || !opened.markdown) {
         continue;
       }
@@ -2565,6 +2526,7 @@ export class Agent {
     const traceBuffer: TraceEvent[] = [];
     const conversationId = options.conversationId || 'default';
     const runAgentId = options.agentId || 'agent-main';
+    const agentMode: AgentMode = options.agentMode || 'branching';
     const runSessionId = options.sessionId || `agent-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const runRuntimeHandle = createRuntime({
       projectRoot: this.projectRoot,
@@ -2609,8 +2571,15 @@ export class Agent {
     let context = '';
     let recalledNodeIds: string[] = [];
     let selectedNodeIds: string[] = [];
-    const soulsGuidance = this.loadSoulsMarkdown();
-    const availableSkills = loadWorkspaceSkills(this.projectRoot, this.codeCliRoot);
+    // Cache skill/souls reads across requests – re-read on first access only.
+    if (!this.cachedSoulsMarkdown) {
+      this.cachedSoulsMarkdown = this.loadSoulsMarkdown();
+    }
+    if (!this.cachedWorkspaceSkills) {
+      this.cachedWorkspaceSkills = loadWorkspaceSkills(this.projectRoot, this.codeCliRoot);
+    }
+    const soulsGuidance = this.cachedSoulsMarkdown;
+    const availableSkills = this.cachedWorkspaceSkills;
     const alwaysIncludeSkills = availableSkills.filter((s) => s.alwaysInclude);
     const localSkillsIndex = renderSkillCatalog(availableSkills);
     const rawAutoQueueMemorySave = String(process.env.AUTO_QUEUE_MEMORY_SAVE ?? '1').toLowerCase();
@@ -2676,8 +2645,17 @@ export class Agent {
       ? `\n\n--- ALWAYS-ACTIVE SKILL POLICIES (pre-loaded, binding on every turn) ---\n${renderSkillGuidance(alwaysIncludeSkills)}\n--- END ALWAYS-ACTIVE SKILLS ---`
       : '';
 
-    const systemPrompt = `You are a branching ReAct agent.
+    const isBranchingMode = agentMode === 'branching';
+
+    const systemPrompt = isBranchingMode
+      ? `You are a branching ReAct agent.
 Treat ReAct as a functional loop. A branch is an independent child loop with its own thought -> action -> observation state.
+
+BRANCHING PHILOSOPHY:
+Before deciding on any action, first ask: "Can this goal be decomposed into independent sub-goals that are worth exploring in parallel?"
+If yes, prefer kind="branch" over a single sequential kind="tool" step.
+Decompose aggressively — many goals that appear simple on the surface have multiple angles (different sources, different sub-tasks, alternative strategies, independent file locations, etc.) that benefit from concurrent exploration.
+However, only branch when branches are genuinely distinct. If two branches would perform the exact same work or one is strictly a prerequisite of the other, do NOT split them — use kind="tool" sequentially instead.
 
 You only use five top-level tools:
   read   -> read semantic targets such as workspace files, memory nodes, preferences, or skills
@@ -2724,10 +2702,10 @@ VALID EXAMPLES:
 {"kind":"final","thought":"Enough evidence is available.","final_answer":"我查到的主流评价是正面的。"}
 
 Rules:
-1. Prefer kind="tool" when one next action is clearly best.
-2. Use kind="branch" when there are multiple possibilities to explore, independent tasks that can run in parallel, or different strategies worth trying concurrently.
-3. Each branch should have a distinct purpose. Do not create branches that duplicate the same work.
-4. Never create more than ${this.branchMaxWidth} child branches in one step.
+1. DECOMPOSE FIRST: Before executing any single tool call, ask "can this goal be split into independent sub-goals?" If yes, return kind="branch" instead of kind="tool". Only fall back to kind="tool" when the next action is atomic and cannot be meaningfully parallelised.
+2. Use kind="branch" liberally for: (a) independent sub-tasks within a goal, (b) parallel information gathering from different sources, (c) alternative strategies or hypotheses to evaluate concurrently, (d) different files/modules/topics that can be researched simultaneously, (e) multi-part user requests where parts do not depend on each other.
+3. Each branch must have a genuinely distinct purpose and a different goal string. Do NOT branch when: both branches would issue the same tool call, one branch is a strict prerequisite of the other, or the task is a single atomic read/write/search. Redundant or near-duplicate branches waste budget and degrade quality.
+4. Never create more than ${this.branchMaxWidth} child branches in one step. Aim for 2–${this.branchMaxWidth} well-scoped branches rather than one monolithic sequential thread.
 5. Prefer search before edit when the correct answer may already exist in repository files.
 6. For repository discovery, prefer read and search on workspace evidence before using web.
 7. Prefer relative file paths rooted at the current project. Use absolute paths only when necessary for clarity or when the tool requires them.
@@ -2761,6 +2739,89 @@ ${selectedNodeIds.length > 0 ? selectedNodeIds.join(', ') : '(none)'}
 
 ${soulsGuidance ? `Global souls.md guidance:
 ${soulsGuidance}
+` : ''}`
+      : `You are a classic ReAct agent. Follow a strict sequential loop: Think → Act → Observe → Think → … → Final Answer.
+Do NOT branch. Execute one tool call at a time, observe the result, and decide the next step.
+
+You only use five top-level tools:
+  read   -> read semantic targets such as workspace files, memory nodes, preferences, or skills
+  search -> search semantic targets such as workspace, memory, preferences, or skills
+  edit   -> edit semantic targets such as workspace files, memory nodes, preferences, or skills
+  bash   -> run sandboxed shell commands
+  web    -> search the web (returns title+url+snippet) or fetch a page; use for external/current information
+
+Tool target guidance:
+  target=workspace   -> normal repository files
+  target=memory      -> Mempedia nodes and episodic memory search
+  target=preferences -> project preference markdown
+  target=skills      -> local SKILL.md guidance files
+
+Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md and ./.github/skills/*/SKILL.md.
+${localSkillsIndex ? `${localSkillsIndex}\n` : ''}Skills are guidance documents, not tool names. Never emit skill names such as project-discovery in tool_calls.name.
+If skill guidance has been injected for the turn, treat it as internal policy only. Do not inspect the skills directory, verify skill files, or summarize skill text back to the user unless the user explicitly asked about skills.
+When you save knowledge, prefer markdown-first notes that preserve concrete facts, numbers, data points, historical changes, viewpoints, evidence, and explicit uncertainties instead of terse summaries.
+    Separate facts from opinions or viewpoints. Never fabricate facts; if something is uncertain, attribute it or mark it as uncertain.
+
+
+Allowed JSON schema:
+{
+  "kind": "tool" | "final" | "skills",
+  "thought": "string",
+  "skills_to_load": ["skill-name"],
+  "tool_calls": [{ "name": "tool_name", "arguments": {}, "goal": "optional" }],
+  "final_answer": "string",
+  "completion_summary": "optional short summary"
+}
+
+STRICT OUTPUT CONTRACT:
+- Return exactly one JSON object.
+- Start the reply with "{" and end it with "}".
+- Do not wrap the JSON in Markdown fences.
+- Do not add explanation text before or after the JSON object.
+- Do not output raw shell commands, pseudo-code, or checklists as the top-level reply.
+- If you need to show commands to the user, place them inside "final_answer" as a JSON string.
+- NEVER use kind="branch". You are in classic ReAct mode — always pick one tool at a time.
+
+VALID EXAMPLES:
+{"kind":"tool","thought":"Use web search first.","tool_calls":[{"name":"web","arguments":{"mode":"search","query":"Ryan Gosling review","limit":5},"goal":"Gather current external evidence."}]}
+{"kind":"final","thought":"Enough evidence is available.","final_answer":"我查到的主流评价是正面的。"}
+
+Rules:
+1. Always use kind="tool" with exactly one tool call when you need more information.
+2. Do NOT use kind="branch" — you are running in classic sequential ReAct mode.
+3. Prefer search before edit when the correct answer may already exist in repository files.
+4. For repository discovery, prefer read and search on workspace evidence before using web.
+5. Prefer relative file paths rooted at the current project. Use absolute paths only when necessary for clarity or when the tool requires them.
+6. The skill catalog is lightweight; request full skill guidance only when it materially changes the next step.
+7. Do not answer a project-overview question by listing local skills unless the user explicitly asked about the skill system.
+8. Use bash whenever shell is the practical tool, but remember dangerous shell operations are sandboxed and should require confirmation.
+9. Use web for questions about external topics, current events, APIs, libraries, or anything not answerable from workspace files. Prefer workspace evidence only for project-specific questions. When web search returns results, read the snippet field first — only fetch a page if the snippet is insufficient.
+9a. web mode=search returns {title, url, snippet} — use snippets to decide which results are relevant before fetching full pages.
+9b. When you need current/external information, use web proactively — do not guess or rely on training data when a quick search would give a definitive answer.
+10. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
+11. When you finish, return kind="final" with a direct user-facing answer.
+12. NEVER use \`edit target=workspace\` to write directly into raw \`.mempedia\` storage. Use semantic targets instead: \`target=memory\`, \`target=preferences\`, or \`target=skills\`.
+13. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via kind="skills". For other skills in the catalog whose description overlaps with the task, return kind="skills" to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to kind="tool".
+14. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
+15. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
+16. If the user asks what is in Mempedia or what skills are available, prefer \`search/read\` with \`target=memory\` or \`target=skills\` before final_answer.
+17. NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value. Saving a greeting or one-liner response wastes storage and pollutes search results.
+${alwaysIncludeBlock ? `
+${alwaysIncludeBlock}
+
+IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool_calls.arguments.command — they are NOT the planner response format. Your planner response must always follow the JSON schema above (kind/thought/tool_calls/etc.).
+` : ''}
+Available tools:
+${toolCatalog}
+
+Shared context for this request:
+${context || '(no context found)'}
+
+Selected context node ids:
+${selectedNodeIds.length > 0 ? selectedNodeIds.join(', ') : '(none)'}
+
+${soulsGuidance ? `Global souls.md guidance:
+${soulsGuidance}
 ` : ''}`;
 
     // ── Dynamic context budget computation ──────────────────────────────
@@ -2775,7 +2836,7 @@ ${soulsGuidance}
     });
     emitTrace({
       type: 'observation',
-      content: `Context budget: model=${this.model} limit=${ctxBudget.modelLimit} committed=${ctxBudget.committedTokens} residual=${ctxBudget.residualBudget} → maxSteps=${ctxBudget.maxSteps} depth=${ctxBudget.maxBranchDepth} width=${ctxBudget.maxBranchWidth} totalSteps=${ctxBudget.maxTotalSteps} transcriptChars=${ctxBudget.transcriptBudgetChars} beamDepth=${ctxBudget.beamMaxDepth} beamWidth=${ctxBudget.beamWidth} [dynamic-budget: ON, compress@92%]`,
+      content: `Context budget: model=${this.model} limit=${ctxBudget.modelLimit} committed=${ctxBudget.committedTokens} residual=${ctxBudget.residualBudget} → maxSteps=${ctxBudget.maxSteps} depth=${ctxBudget.maxBranchDepth} width=${ctxBudget.maxBranchWidth} totalSteps=${ctxBudget.maxTotalSteps} transcriptChars=${ctxBudget.transcriptBudgetChars} agentMode=${agentMode} [dynamic-budget: ON, compress@92%]`,
     });
 
     // Effective parameters: take the minimum of env-configured and budget-computed values.
@@ -2787,9 +2848,6 @@ ${soulsGuidance}
       ctxBudget.maxTotalSteps,
     );
     const effectiveTranscriptBudgetChars = ctxBudget.transcriptBudgetChars;
-    const effectiveBeamMaxDepth = Math.min(this.beamMaxDepth, ctxBudget.beamMaxDepth);
-    const effectiveBeamWidth = Math.min(this.beamWidth, ctxBudget.beamWidth);
-    const effectiveBeamExpansionFactor = Math.min(this.beamExpansionFactor, ctxBudget.beamExpansionFactor);
 
     const extractText = (content: any): string => {
       if (typeof content === 'string') {
@@ -3163,68 +3221,6 @@ ${soulsGuidance}
       } as PlannerDecision;
     };
 
-    const planWithSkillRoutingObject = async (
-      initialTranscript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-      invoke: (transcript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>) => Promise<unknown>,
-    ): Promise<PlannerDecision> => {
-      let workingTranscript = initialTranscript;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        const rawDecisionUnknown = await invoke(workingTranscript);
-        const rawDecision = (rawDecisionUnknown && typeof rawDecisionUnknown === 'object'
-          ? rawDecisionUnknown
-          : {}) as Record<string, unknown>;
-        const decision = PlannerDecisionSchema.parse({
-          ...rawDecision,
-          tool_calls: Array.isArray((rawDecision as any).tool_calls)
-            ? (rawDecision as any).tool_calls.map((call: any) => ({
-                ...call,
-                goal: call?.goal ?? undefined,
-              }))
-            : undefined,
-          branches: Array.isArray((rawDecision as any).branches)
-            ? (rawDecision as any).branches.map((branch: any) => ({
-                ...branch,
-                why: branch?.why ?? undefined,
-                priority: branch?.priority ?? undefined,
-              }))
-            : undefined,
-          skills_to_load: Array.isArray((rawDecision as any).skills_to_load)
-            ? (rawDecision as any).skills_to_load
-            : undefined,
-          final_answer: (rawDecision as any).final_answer ?? undefined,
-          completion_summary: (rawDecision as any).completion_summary ?? undefined,
-        });
-        if (decision.kind !== 'skills') {
-          return decision;
-        }
-        const requestedNames = Array.isArray(decision.skills_to_load) ? decision.skills_to_load : [];
-        const loadedSkillNames = getLoadedSkillNames(workingTranscript);
-        const skillsToInject = resolveSkillsByName(availableSkills, requestedNames, 2)
-          .filter((skill) => !loadedSkillNames.has(skill.name.toLowerCase()));
-        if (skillsToInject.length === 0) {
-          emitTrace({
-            type: 'observation',
-            content: `Skill router could not resolve requested skills: ${requestedNames.join(', ') || '(none)'}.`,
-          });
-          return {
-            kind: 'final',
-            thought: 'Skill router request could not be resolved to new skills; using fallback final answer.',
-            final_answer: '抱歉，当前请求的技能不可用。请重试或手动指定技能。',
-          } as PlannerDecision;
-        }
-        emitTrace({
-          type: 'observation',
-          content: `Skill router loaded local guidance: ${skillsToInject.map((skill) => skill.name).join(', ')}.`,
-        });
-        workingTranscript = appendSkillGuidance(workingTranscript, skillsToInject);
-      }
-      return {
-        kind: 'final',
-        thought: 'Skill router exceeded load attempts; using fallback final answer.',
-        final_answer: '抱歉，技能路由未能收敛为有效回答。请重试一次。',
-      } as PlannerDecision;
-    };
-
     const buildBranchMemoryJob = (
       branch: BranchState,
       reason: string,
@@ -3370,181 +3366,75 @@ ${soulsGuidance}
     let completedBranchesForRun: Array<BranchSynthesisInput['branches'][number]> = [];
     let finalAnswer: string;
 
-    if (this.useBeamSearch) {
-      // ── Beam Search ReAct mode ──────────────────────────────────────────
-      emitTrace({ type: 'thought', content: `Using beam-search mode (width=${effectiveBeamWidth}, depth=${effectiveBeamMaxDepth}, expansion=${effectiveBeamExpansionFactor}).` });
-      const beamPlanner = {
-        plan: async (transcript: Array<{ role: string; content: string }>) => {
-          const baseTranscript = transcript as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
-
-          const planFromText = async (workingTranscript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>) =>
-            planWithSkillRouting(
-              workingTranscript,
-              async (textTranscript) => this.measure(perfEntries, `beam_llm_plan_fallback_text`, async () =>
+    if (agentMode === 'react') {
+      // ── Classic ReAct mode (sequential: think → act → observe → …) ────
+      emitTrace({ type: 'thought', content: 'Using classic ReAct mode (sequential, no branching).' });
+      const runtime = new AgentRuntime({
+        planner: { plan: async (transcript) => ({ kind: 'final', content: transcript.at(-1)?.content || '' }) },
+        toolRuntime: {
+          execute: async () => ({ success: false, error: 'unreachable tool runtime fallback', durationMs: 0 }),
+          resetSession: () => runRuntimeHandle.toolRuntime.resetSession(),
+        },
+        maxSteps: effectiveMaxSteps,
+        maxBranchDepth: 0,
+        maxBranchWidth: 1,
+        maxCompletedBranches: 1,
+        branchConcurrency: 1,
+        maxTotalSteps: effectiveMaxSteps,
+        transcriptBudgetChars: effectiveTranscriptBudgetChars,
+        modelLimit: ctxBudget.modelLimit,
+        committedTokens: ctxBudget.committedTokens,
+        planBranch: async ({ branch }) => {
+          const decision = await planWithSkillRouting(
+            buildMessages(branch as BranchState) as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+            async (workingTranscript) => {
+              return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
                 this.generateJsonPromptText({
                   model: this.openai,
-                  messages: textTranscript as any,
+                  messages: workingTranscript as any,
                   timeoutMs: this.agentLlmTimeoutMs,
-                  timeoutLabel: 'beam_plan_fallback llm',
+                  timeoutLabel: `planBranch_${branch.id} llm`,
+                  temperature: this.plannerTemperature,
                   onFallback: () => emitTrace({
                     type: 'observation',
                     content: `Model ${this.model} does not support response_format=json_object; switching planner JSON prompts to plain-text mode.`,
                   }),
                 })
-              )
-            );
-
-          const decision = await (async () => {
-            try {
-              return await planWithSkillRoutingObject(
-                baseTranscript,
-                async (workingTranscript) => {
-              const runTextFallback = async () => {
-                return planFromText(workingTranscript);
-              };
-
-              const runCompatObjectMode = async () => {
-                try {
-                  const { object } = await this.measure(perfEntries, `beam_llm_plan_compat`, async () =>
-                    this.withTimeout(
-                      generateObject({
-                        model: this.beamPlannerCompatOpenai,
-                        temperature: this.plannerTemperature,
-                        maxTokens: 1200,
-                        messages: workingTranscript as any,
-                        mode: 'json',
-                        schema: PlannerDecisionStructuredSchema,
-                      }),
-                      this.agentLlmTimeoutMs,
-                      'beam_plan_compat llm'
-                    )
-                  );
-                  return object;
-                } catch (error: any) {
-                  if (this.isJsonResponseFormatUnsupported(error)) {
-                    this.jsonObjectResponseFormatSupported = false;
-                    emitTrace({
-                      type: 'observation',
-                      content: `Model ${this.model} does not support response_format=json_object; switching planner JSON prompts to plain-text mode.`,
-                    });
-                    return runTextFallback();
-                  }
-                  const shouldFallback = NoObjectGeneratedError.isInstance(error)
-                    || /No object generated/i.test(String(error?.message || error));
-                  if (!shouldFallback) {
-                    throw error;
-                  }
-                  emitTrace({
-                    type: 'observation',
-                    content: `Beam planner compat object mode returned no object; falling back to text JSON planning. ${String(error?.message || error)}`,
-                  });
-                  return runTextFallback();
-                }
-              };
-
-              if (this.beamStructuredResponseFormatSupported) {
-                try {
-                  const { object } = await this.measure(perfEntries, `beam_llm_plan`, async () =>
-                    this.withTimeout(
-                      generateObject({
-                        model: this.beamPlannerStructuredOpenai,
-                        temperature: this.plannerTemperature,
-                        maxTokens: 1200,
-                        messages: workingTranscript as any,
-                        mode: 'json',
-                        schema: PlannerDecisionStructuredSchema,
-                      }),
-                      this.agentLlmTimeoutMs,
-                      'beam_plan llm'
-                    )
-                  );
-                  return object;
-                } catch (error: any) {
-                  if (this.isJsonResponseFormatUnsupported(error)) {
-                    this.beamStructuredResponseFormatSupported = false;
-                    emitTrace({
-                      type: 'observation',
-                      content: `Model ${this.model} rejected schema-based structured outputs; retrying beam planner with json_object mode.`,
-                    });
-                    if (!this.jsonObjectResponseFormatSupported) {
-                      return runTextFallback();
-                    }
-                    return runCompatObjectMode();
-                  }
-                  const shouldFallback = NoObjectGeneratedError.isInstance(error)
-                    || /No object generated/i.test(String(error?.message || error));
-                  if (!shouldFallback) {
-                    throw error;
-                  }
-                  emitTrace({
-                    type: 'observation',
-                    content: `Beam planner object mode returned no object; falling back to text JSON planning. ${String(error?.message || error)}`,
-                  });
-                  return runTextFallback();
-                }
-              }
-
-              if (!this.jsonObjectResponseFormatSupported) {
-                return runTextFallback();
-              }
-
-              return runCompatObjectMode();
-                }
               );
-            } catch (error: any) {
-              emitTrace({
-                type: 'observation',
-                content: `Beam planner object pipeline failed unexpectedly; falling back to text JSON planning. ${String(error?.message || error)}`,
-              });
-              return planFromText(baseTranscript);
             }
-          })();
-
+          );
           if (decision.kind === 'tool') {
-            return { kind: 'tool' as const, thought: decision.thought, toolCalls: decision.tool_calls || [] };
+            // In classic react, limit to one tool call at a time
+            const toolCalls = (decision.tool_calls || []).slice(0, 1);
+            return { kind: 'tool' as const, thought: decision.thought, toolCalls };
+          }
+          if (decision.kind === 'branch') {
+            // Classic react does not support branching — ask model to continue sequentially
+            branch.transcript.push({
+              role: 'user' as const,
+              content: 'Branching is not available in classic ReAct mode. Please use kind="tool" to proceed step by step, or kind="final" to finish.',
+            });
+            return { kind: 'tool' as const, thought: decision.thought, toolCalls: [] };
           }
           return { kind: 'final' as const, thought: decision.thought, content: String(decision.final_answer || ''), completionSummary: decision.completion_summary };
         },
-      };
-
-      const beamRuntime = new BeamSearchAgentRuntime({
-        planner: beamPlanner,
-        toolRuntime: {
-          execute: async (toolName: string, args: Record<string, unknown>) => {
-            const startedAt = Date.now();
-            try {
-              const result = await executePlannerTool(toolName, args);
-              const success = !/^Error[:\s]|^ERROR:/.test(String(result));
-              return {
-                success,
-                result,
-                error: success ? undefined : String(result).replace(/^Error:\s*/i, ''),
-                durationMs: Date.now() - startedAt,
-              };
-            } catch (error: any) {
-              return {
-                success: false,
-                error: String(error?.message || error),
-                durationMs: Date.now() - startedAt,
-              };
-            }
-          },
-          resetSession: () => runRuntimeHandle.toolRuntime.resetSession(),
+        executeToolCall: async ({ branch, toolCall }) => {
+          const result = await executeToolCall(branch as BranchState, toolCall as z.infer<typeof PlannerToolCallSchema>);
+          return {
+            toolName: toolCall.name,
+            result,
+            success: !/^Error[:\s]|^ERROR:/.test(result),
+          };
         },
-        beamWidth: effectiveBeamWidth,
-        maxDepth: effectiveBeamMaxDepth,
-        expansionFactor: effectiveBeamExpansionFactor,
+        finalizeBranch: async ({ branch, reason }) => finalizeFromBranch(branch as BranchState, reason),
         onTrace: (event) => {
           if (event.type === 'final') return;
           emitTrace({ type: event.type, content: event.content, metadata: event.metadata });
         },
       });
-
-      finalAnswer = await beamRuntime.run(
-        `Original user request:\n${input}\n\nExplore multiple strategies to solve this.`,
-      );
+      finalAnswer = await runtime.run(`Original user request:\n${input}\n\nThink step by step. Use one tool at a time, observe the result, then decide the next action.`);
     } else {
-      // ── Branching ReAct mode (original) ─────────────────────────────────
+      // ── Branching ReAct mode (default) ──────────────────────────────────
     const runtime = new AgentRuntime({
       planner: { plan: async (transcript) => ({ kind: 'final', content: transcript.at(-1)?.content || '' }) },
       toolRuntime: {
@@ -3711,13 +3601,7 @@ ${soulsGuidance}
       });
     }
     finalAnswer = this.normalizeUserFacingAnswer(finalAnswer);
-    // Save the complete conversation trace (all branches) for diagnosis.
-    this.appendConversationLog(
-      `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      input,
-      traceBuffer,
-      finalAnswer,
-    );
+    // Persist conversation state synchronously (fast, small writes).
     this.appendConversationTurn(conversationId, { user: input, assistant: finalAnswer });
     const persistedTurns = this.getConversationTurns(conversationId);
     const nextPersistedState = this.buildPersistedConversationState(
@@ -3738,6 +3622,15 @@ ${soulsGuidance}
       next_expected_user_action: nextPersistedState.open_loops[0] || nextPersistedState.current_goal,
       referenced_entities: nextPersistedState.referenced_entities.slice(0, 8),
       tool_findings: this.deriveToolFindings(traceBuffer, 4),
+    });
+    // Defer the large conversation-log write off the answer-return critical path.
+    setImmediate(() => {
+      this.appendConversationLog(
+        `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        input,
+        traceBuffer,
+        finalAnswer,
+      );
     });
     if (perfEntries && perfEntries.length > 0) {
       const totalMs = perfEntries.reduce((sum, item) => sum + item.ms, 0);

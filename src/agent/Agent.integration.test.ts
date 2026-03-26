@@ -6,7 +6,6 @@ import fs from 'node:fs';
 import { Agent, type TraceEvent } from './index.js';
 
 process.env.AUTO_QUEUE_MEMORY_SAVE = '0';
-process.env.REACT_BEAM_SEARCH_ENABLED = '0';
 
 function createTempProjectRoot(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
