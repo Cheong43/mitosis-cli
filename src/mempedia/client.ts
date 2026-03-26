@@ -1,14 +1,26 @@
 import { ToolAction, ToolResponse } from './types.js';
+import {
+  getMempediaTransportStatus,
+  getSharedMempediaTransport,
+  type MempediaTransportStatus,
+} from './transport.js';
 
-/** Stub: MitosisCLI operates without the Mempedia Rust binary. */
 export class MempediaClient {
   constructor(private projectRoot: string, private binaryPath?: string) {}
 
-  start() {}
-
-  async send(_action: ToolAction): Promise<ToolResponse> {
-    return { kind: 'error', message: 'mitosis-cli: Mempedia binary operations are not available' } as unknown as ToolResponse;
+  start() {
+    getSharedMempediaTransport(this.projectRoot, this.binaryPath).start();
   }
 
-  stop() {}
+  async send(action: ToolAction): Promise<ToolResponse> {
+    return await getSharedMempediaTransport(this.projectRoot, this.binaryPath).send(action) as ToolResponse;
+  }
+
+  async status(): Promise<MempediaTransportStatus> {
+    return getMempediaTransportStatus(this.projectRoot, this.binaryPath);
+  }
+
+  stop() {
+    getSharedMempediaTransport(this.projectRoot, this.binaryPath).stop();
+  }
 }

@@ -7,11 +7,13 @@ import { fileURLToPath } from 'node:url';
 
 import {
   executeMempediaCliAction,
+  getMempediaCliStatus,
   installWorkspaceSkillFromLibraryViaCli,
   listOrSearchEpisodicViaCli,
   readUserPreferencesViaCli,
   updateUserPreferencesViaCli,
 } from './cli.js';
+import { stopAllSharedMempediaTransports } from './transport.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,6 +21,10 @@ const __dirname = path.dirname(__filename);
 function createTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
+
+test.after(() => {
+  stopAllSharedMempediaTransports();
+});
 
 test('skill library helper reads library records through the mempedia CLI', async () => {
   const projectRoot = createTempDir('mempedia-cli-helper-');
@@ -104,4 +110,13 @@ test('preferences and episodic helpers read and write through the mempedia CLI',
   const searched = await listOrSearchEpisodicViaCli(__dirname, projectRoot, { query: 'episodic regression', limit: 5 });
   assert.equal((searched as any).kind, 'episodic_results');
   assert.ok(((searched as any).memories || []).some((item: any) => item.summary === 'CLI helper episodic regression'));
+});
+
+test('mempedia cli status reports shared transport availability', async () => {
+  const projectRoot = createTempDir('mempedia-cli-status-');
+
+  const status = await getMempediaCliStatus(__dirname, projectRoot);
+  assert.equal(status.binaryAvailable, true);
+  assert.equal(status.memoryWriteEnabled, true);
+  assert.ok(status.transportMode === 'ndjson' || status.transportMode === 'oneshot');
 });

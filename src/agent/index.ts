@@ -13,7 +13,7 @@ import * as path from 'path';
 import * as dotenv from 'dotenv';
 import { z } from 'zod';
 import { resolveCodeCliRoot } from '../config/projectPaths.js';
-import { AgentRuntime, createRuntime, RuntimeHandle, BeamSearchAgentRuntime, CallbackApprovalEngine } from '../runtime/index.js';
+import { AgentRuntime, createRuntime, BeamSearchAgentRuntime, CallbackApprovalEngine } from '../runtime/index.js';
 import type { ApprovalCallback } from '../runtime/index.js';
 import type { AgentBranchState, BranchSynthesisInput } from '../runtime/agent/AgentRuntime.js';
 import { TOOLS, TOOL_NAMES } from '../tools/definitions.js';
@@ -37,6 +37,7 @@ import {
   type ContextBudgetResult,
 } from './contextBudget.js';
 import { SessionCompressor, isRunExhausted } from './sessionCompressor.js';
+import { PlannerToolAdapter } from './PlannerToolAdapter.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -267,8 +268,6 @@ export class Agent {
   private readonly beamWidth: number;
   private readonly beamMaxDepth: number;
   private readonly beamExpansionFactor: number;
-  /** Governed runtime handle — routes mempedia actions through policy + guards. */
-  private readonly runtimeHandle: RuntimeHandle;
   private readonly memoryClassifier: MemoryClassifierAgent;
   /** Per-session compressor for exhausted-run carry-over. */
   private readonly sessionCompressor: SessionCompressor;
@@ -392,7 +391,6 @@ export class Agent {
     this.conversationLogDir = path.join(projectRoot, '.mitosis', 'conversations');
     this.nodeConversationMapPath = path.join(projectRoot, '.mitosis', 'logs', 'node_conversations.jsonl');
 
-    this.runtimeHandle = createRuntime({ projectRoot, agentId: 'agent-main' });
     this.memoryClassifier = new MemoryClassifierAgent({
       chatClient: this.memoryOpenai,
       codeCliRoot: this.codeCliRoot,
@@ -805,6 +803,58 @@ export class Agent {
     return trimmed.slice(0, 200);
   }
 
+  private normalizeUserFacingAnswer(answer: string): string {
+    let current = String(answer || '').trim();
+    if (!current) {
+      return '';
+    }
+
+    for (let depth = 0; depth < 3; depth += 1) {
+      const extracted = this.extractFinalAnswerFromJsonPayload(current);
+      if (!extracted || extracted === current) {
+        break;
+      }
+      current = extracted;
+    }
+
+    return current;
+  }
+
+  private extractFinalAnswerFromJsonPayload(raw: string): string | null {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const candidates = extractJsonishCandidates(trimmed);
+    for (const candidate of candidates) {
+      let parsed: unknown;
+      try {
+        parsed = parseJsonish(candidate);
+      } catch {
+        continue;
+      }
+      const obj = Array.isArray(parsed) ? (parsed[0] || {}) : parsed;
+      if (!obj || typeof obj !== 'object') {
+        continue;
+      }
+
+      const record = obj as Record<string, unknown>;
+      const finalAnswer = [record.final_answer, record.finalAnswer, record.answer, record.content, record.message]
+        .find((value) => typeof value === 'string' && value.trim().length > 0);
+      if (typeof finalAnswer !== 'string') {
+        continue;
+      }
+
+      const kind = typeof record.kind === 'string' ? record.kind.trim().toLowerCase() : '';
+      if (kind === 'final' || candidate.trim() === trimmed) {
+        return finalAnswer.trim();
+      }
+    }
+
+    return null;
+  }
+
   private collectAtomicCandidates(input: string, answer: string): string[] {
     const candidates: string[] = [];
     const seen = new Set<string>();
@@ -864,265 +914,6 @@ export class Agent {
     }
 
     return candidates.slice(0, 8);
-  }
-
-  private isIgnoredWorkspacePath(relativePath: string): boolean {
-    return relativePath.startsWith('.git/')
-      || relativePath === '.git'
-      || relativePath.startsWith('node_modules/')
-      || relativePath === 'node_modules'
-      || relativePath.startsWith('target/')
-      || relativePath === 'target'
-      || relativePath.startsWith('.mitosis/sandbox/')
-      || relativePath === '.mitosis/sandbox';
-  }
-
-  private listWorkspaceFiles(dir = this.projectRoot, prefix = ''): string[] {
-    if (!fs.existsSync(dir)) {
-      return [];
-    }
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    const files: string[] = [];
-    for (const entry of entries) {
-      const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (this.isIgnoredWorkspacePath(relativePath)) {
-        continue;
-      }
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        files.push(...this.listWorkspaceFiles(fullPath, relativePath));
-      } else {
-        files.push(relativePath.replace(/\\/g, '/'));
-      }
-    }
-    return files;
-  }
-
-  private globToRegExp(pattern: string): RegExp {
-    let regex = '^';
-    for (let index = 0; index < pattern.length; index += 1) {
-      const char = pattern[index];
-      const next = pattern[index + 1];
-      if (char === '*') {
-        if (next === '*') {
-          regex += '.*';
-          index += 1;
-        } else {
-          regex += '[^/]*';
-        }
-      } else if (char === '?') {
-        regex += '.';
-      } else if ('\\^$+.|(){}[]'.includes(char)) {
-        regex += `\\${char}`;
-      } else {
-        regex += char;
-      }
-    }
-    regex += '$';
-    return new RegExp(regex, 'i');
-  }
-
-  private async executeReadTool(args: Record<string, unknown>, runtimeHandle: RuntimeHandle): Promise<string> {
-    const target = String(args.target || '').trim();
-    if (target === 'workspace') {
-      const toolRes = await runtimeHandle.executeTool('read_file', { path: String(args.path || '') });
-      if (!toolRes.success) {
-        return `Error: ${toolRes.error ?? 'workspace read failed'}`;
-      }
-      return typeof toolRes.result === 'string' ? toolRes.result : JSON.stringify(toolRes.result);
-    }
-    return 'Error: read only supports target=workspace.';
-  }
-
-  private async executeSearchTool(args: Record<string, unknown>, runtimeHandle: RuntimeHandle): Promise<string> {
-    const target = String(args.target || '').trim();
-    const mode = String(args.mode || '').trim();
-    const limit = Number(args.limit || 20);
-    if (target === 'workspace' && mode === 'glob') {
-      const pattern = String(args.pattern || '**/*').trim() || '**/*';
-      const matcher = this.globToRegExp(pattern);
-      const files = this.listWorkspaceFiles()
-        .filter((filePath) => matcher.test(filePath))
-        .slice(0, Math.max(1, Math.min(200, Number.isFinite(limit) ? Math.floor(limit) : 20)));
-      return JSON.stringify({ kind: 'workspace_glob_results', pattern, results: files });
-    }
-    if (target === 'workspace' && mode === 'grep') {
-      const query = String(args.query || '').trim();
-      if (!query) {
-        return JSON.stringify({ kind: 'error', message: 'search grep requires query' });
-      }
-      const results: Array<{ path: string; line: number; text: string }> = [];
-      const matcher = new RegExp(query, 'i');
-      for (const relativePath of this.listWorkspaceFiles()) {
-        if (results.length >= Math.max(1, Math.min(200, Number.isFinite(limit) ? Math.floor(limit) : 20))) {
-          break;
-        }
-        const absolutePath = path.join(this.projectRoot, relativePath);
-        let content = '';
-        try {
-          content = fs.readFileSync(absolutePath, 'utf-8');
-        } catch {
-          continue;
-        }
-        const lines = content.split(/\r?\n/);
-        for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-          if (!matcher.test(lines[lineIndex])) {
-            continue;
-          }
-          results.push({
-            path: relativePath,
-            line: lineIndex + 1,
-            text: lines[lineIndex].trim().slice(0, 240),
-          });
-          if (results.length >= Math.max(1, Math.min(200, Number.isFinite(limit) ? Math.floor(limit) : 20))) {
-            break;
-          }
-        }
-      }
-      return JSON.stringify({ kind: 'workspace_grep_results', query, results });
-    }
-    return JSON.stringify({ kind: 'error', message: 'search only supports workspace grep/glob.' });
-  }
-
-  private async executeEditTool(args: Record<string, unknown>, runtimeHandle: RuntimeHandle): Promise<string> {
-    const target = String(args.target || '').trim();
-    if (target === 'workspace') {
-      const filePath = String(args.path || '').trim();
-      // Runtime guard: block writes to Mempedia storage paths regardless of prompt-level rules.
-      const mempediaStoragePrefixes = ['core-knowledge/', 'episodic/', '.mempedia/', 'preferences/'];
-      const normalizedPath = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
-      if (mempediaStoragePrefixes.some((prefix) => normalizedPath.startsWith(prefix))) {
-        return JSON.stringify({
-          kind: 'error',
-          message: `edit is blocked for Mempedia storage path "${filePath}". Use bash with the mempedia CLI binary instead (e.g., mempedia agent_upsert_markdown ...).`,
-        });
-      }
-      const toolRes = await runtimeHandle.executeTool('write_file', {
-        path: filePath,
-        content: String(args.content || ''),
-      });
-      if (!toolRes.success) {
-        return `Error: ${toolRes.error ?? 'workspace edit failed'}`;
-      }
-      return typeof toolRes.result === 'string' ? toolRes.result : JSON.stringify(toolRes.result);
-    }
-    return JSON.stringify({ kind: 'error', message: 'edit only supports target=workspace. Use bash with mempedia CLI for Mempedia operations.' });
-  }
-
-  private stripHtml(html: string): string {
-    return html
-      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
-  private async executeWebTool(args: Record<string, unknown>): Promise<string> {
-    const webTimeoutMs = Number(process.env.MITOSIS_WEB_TIMEOUT_MS ?? process.env.MEMPEDIA_WEB_TIMEOUT_MS ?? 15000);
-    const safeWebTimeout = Number.isFinite(webTimeoutMs) && webTimeoutMs > 0 ? webTimeoutMs : 15000;
-    const mode = String(args.mode || '').trim();
-    if (mode === 'fetch') {
-      const url = String(args.url || '').trim();
-      if (!url) {
-        return JSON.stringify({ kind: 'error', message: 'web fetch requires url' });
-      }
-      const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-      const MAX_FETCH_RETRIES = 2;
-      for (let attempt = 0; attempt <= MAX_FETCH_RETRIES; attempt++) {
-        const ac = new AbortController();
-        const timer = setTimeout(() => ac.abort(), safeWebTimeout);
-        try {
-          const response = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' }, signal: ac.signal, redirect: 'follow' });
-          const html = await response.text();
-          if (!response.ok) {
-            // Retry on 429 / 5xx
-            if (attempt < MAX_FETCH_RETRIES && (response.status === 429 || response.status >= 500)) {
-              clearTimeout(timer);
-              await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-              continue;
-            }
-            return JSON.stringify({ kind: 'error', message: `HTTP ${response.status} ${response.statusText}` });
-          }
-          const title = html.match(/<title>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim() || url;
-          return JSON.stringify({
-            kind: 'web_fetch',
-            url,
-            title,
-            content: this.stripHtml(html).slice(0, 3000),
-          });
-        } catch (err: any) {
-          clearTimeout(timer);
-          const isAbort = err?.name === 'AbortError';
-          if (!isAbort && attempt < MAX_FETCH_RETRIES) {
-            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-            continue;
-          }
-          return JSON.stringify({ kind: 'error', message: isAbort ? `web fetch timed out after ${safeWebTimeout}ms` : String(err?.message || err) });
-        } finally {
-          clearTimeout(timer);
-        }
-      }
-      return JSON.stringify({ kind: 'error', message: 'web fetch exhausted retries' });
-    }
-
-    if (mode === 'search') {
-      const query = String(args.query || '').trim();
-      if (!query) {
-        return JSON.stringify({ kind: 'error', message: 'web search requires query' });
-      }
-      const limit = Math.max(1, Math.min(10, Number.isFinite(Number(args.limit)) ? Math.floor(Number(args.limit)) : 5));
-      const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-      const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), safeWebTimeout);
-      try {
-        const response = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' }, signal: ac.signal });
-        const html = await response.text();
-        if (!response.ok) {
-          return JSON.stringify({ kind: 'error', message: `HTTP ${response.status} ${response.statusText}` });
-        }
-        const results: Array<{ title: string; url: string; snippet: string }> = [];
-        // Extract link titles + raw hrefs (DuckDuckGo redirect URLs).
-        const linkRegex = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-        const rawLinks: Array<{ rawUrl: string; title: string }> = [];
-        let match: RegExpExecArray | null = null;
-        while ((match = linkRegex.exec(html)) && rawLinks.length < limit) {
-          rawLinks.push({ rawUrl: match[1], title: this.stripHtml(match[2]) });
-        }
-        // Extract snippets.
-        const snippetRegex = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
-        const snippets: string[] = [];
-        let sm: RegExpExecArray | null = null;
-        while ((sm = snippetRegex.exec(html)) && snippets.length < limit) {
-          snippets.push(this.stripHtml(sm[1]).slice(0, 300));
-        }
-        // Resolve real URLs from DuckDuckGo redirect `uddg` param.
-        for (let i = 0; i < rawLinks.length; i++) {
-          const { rawUrl, title } = rawLinks[i];
-          let realUrl = rawUrl;
-          const uddgMatch = rawUrl.match(/[?&]uddg=([^&]+)/);
-          if (uddgMatch) {
-            try { realUrl = decodeURIComponent(uddgMatch[1]); } catch { /* keep rawUrl */ }
-          } else if (realUrl.startsWith('//')) {
-            realUrl = 'https:' + realUrl;
-          }
-          results.push({ title, url: realUrl, snippet: snippets[i] || '' });
-        }
-        return JSON.stringify({ kind: 'web_search', query, results });
-      } catch (err: any) {
-        const isAbort = err?.name === 'AbortError';
-        return JSON.stringify({ kind: 'error', message: isAbort ? `web search timed out after ${safeWebTimeout}ms` : String(err?.message || err) });
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-
-    return JSON.stringify({ kind: 'error', message: 'unsupported web mode' });
   }
 
   private fallbackExtractAtomic(input: string, answer: string): Array<{ keyword: string; summary: string; description: string; evolution: string; relations: string[] }> {
@@ -1613,7 +1404,7 @@ export class Agent {
         const args = trace.metadata?.args as Record<string, unknown> | undefined;
         const target = typeof args?.target === 'string' ? args.target.toLowerCase() : '';
         const filePath = typeof args?.path === 'string' ? args.path.toLowerCase() : '';
-        if (target === 'memory' || target === 'project' || target === 'preferences' || target === 'skill') {
+        if (target === 'memory' || target === 'preferences' || target === 'skills') {
           return true;
         }
         // Any non-empty local file path (not a URL) counts as workspace-grounded.
@@ -1622,7 +1413,7 @@ export class Agent {
       if (toolName === 'search') {
         const args = trace.metadata?.args as Record<string, unknown> | undefined;
         const target = typeof args?.target === 'string' ? args.target.toLowerCase() : '';
-        return target === 'memory' || target === 'workspace' || target === 'projects';
+        return target === 'memory' || target === 'workspace' || target === 'skills' || target === 'preferences';
       }
       return false;
     });
@@ -2267,6 +2058,11 @@ export class Agent {
       sessionId: runSessionId,
       ...(options.onApproval ? { approvalEngine: new CallbackApprovalEngine(options.onApproval) } : {}),
     });
+    const plannerToolAdapter = new PlannerToolAdapter({
+      projectRoot: this.projectRoot,
+      codeCliRoot: this.codeCliRoot,
+      runtimeHandle: runRuntimeHandle,
+    });
     const emitTrace = (event: TraceEvent) => {
       traceBuffer.push(event);
       onTrace(event);
@@ -2338,11 +2134,17 @@ export class Agent {
 Treat ReAct as a functional loop. A branch is an independent child loop with its own thought -> action -> observation state.
 
 You only use five top-level tools:
-  read   -> read workspace files
-  search -> grep/glob workspace files
-  edit   -> edit workspace files
+  read   -> read semantic targets such as workspace files, memory nodes, preferences, or skills
+  search -> search semantic targets such as workspace, memory, preferences, or skills
+  edit   -> edit semantic targets such as workspace files, memory nodes, preferences, or skills
   bash   -> run sandboxed shell commands
   web    -> search the web (returns title+url+snippet) or fetch a page; use for external/current information
+
+Tool target guidance:
+  target=workspace   -> normal repository files
+  target=memory      -> Mempedia nodes and episodic memory search
+  target=preferences -> project preference markdown
+  target=skills      -> local SKILL.md guidance files
 
 Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md and ./.github/skills/*/SKILL.md.
 ${localSkillsIndex ? `${localSkillsIndex}\n` : ''}Skills are guidance documents, not tool names. Never emit skill names such as project-discovery in tool_calls.name.
@@ -2380,11 +2182,11 @@ Rules:
 11b. When you need current/external information, use web proactively — do not guess or rely on training data when a quick search would give a definitive answer.
 12. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
 13. When you finish, return kind="final" with a direct user-facing answer.
-18. NEVER use \`edit\` to write to Mempedia storage paths (core-knowledge/, episodic/, .mempedia/, preferences/, skills/). ALL Mempedia Layer 1/2/3/4 read and write operations MUST go through \`bash\` using the mempedia CLI binary. Using \`edit\` on these paths bypasses indexing, versioning, and embedding; the data will be invisible to the system.
+18. NEVER use \`edit target=workspace\` to write directly into raw \`.mempedia\` storage. Use semantic targets instead: \`target=memory\`, \`target=preferences\`, or \`target=skills\`.
 14. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via kind="skills". For other skills in the catalog whose description overlaps with the task, return kind="skills" to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to kind="tool" or kind="branch".
 15. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
-16. For questions about local Mempedia contents, workspace memory, or local skills, inspect local evidence first. Do not answer from generic model background knowledge.
-17. If the user asks what is in Mempedia or what skills are available, prefer search or read against local workspace evidence before final_answer.
+16. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
+17. If the user asks what is in Mempedia or what skills are available, prefer \`search/read\` with \`target=memory\` or \`target=skills\` before final_answer.
 19. NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value. Saving a greeting or one-liner response wastes storage and pollutes search results.
 ${alwaysIncludeBlock ? `
 ${alwaysIncludeBlock}
@@ -2593,7 +2395,7 @@ ${soulsGuidance}
           if (typeof finalAnswer !== 'string') {
             continue;
           }
-          probe.final_answer = finalAnswer;
+          probe.final_answer = this.normalizeUserFacingAnswer(finalAnswer);
         }
         if (inferredKind === 'tool' && (!Array.isArray(probe.tool_calls) || probe.tool_calls.length === 0)) {
           continue;
@@ -2645,7 +2447,7 @@ ${soulsGuidance}
           kind: 'final',
           thought: 'Planner returned no valid structured decision; using fallback final answer.',
           final_answer: rawTrimmed && !looksLikePromptEcho
-            ? rawTrimmed
+            ? this.normalizeUserFacingAnswer(rawTrimmed)
             : '抱歉，当前没有生成有效回答。请重试一次。',
         });
       }
@@ -2859,26 +2661,10 @@ ${soulsGuidance}
     };
 
     const executePlannerTool = async (fnName: string, args: Record<string, unknown>): Promise<string> => {
-      if (fnName === 'read') {
-        return this.executeReadTool(args, runRuntimeHandle);
+      if (!TOOL_NAMES.includes(fnName as any)) {
+        return `Unknown tool: ${fnName}`;
       }
-      if (fnName === 'search') {
-        return this.executeSearchTool(args, runRuntimeHandle);
-      }
-      if (fnName === 'edit') {
-        return this.executeEditTool(args, runRuntimeHandle);
-      }
-      if (fnName === 'bash') {
-        const toolRes = await runRuntimeHandle.executeTool('run_shell', { command: String(args.command || '') });
-        if (!toolRes.success) {
-          return `Error: ${toolRes.error ?? 'unknown tool error'}`;
-        }
-        return typeof toolRes.result === 'string' ? toolRes.result : JSON.stringify(toolRes.result);
-      }
-      if (fnName === 'web') {
-        return this.executeWebTool(args);
-      }
-      return `Unknown tool: ${fnName}`;
+      return plannerToolAdapter.execute(fnName as (typeof TOOL_NAMES)[number], args);
     };
 
     const executeToolCall = async (branch: BranchState, toolCall: z.infer<typeof PlannerToolCallSchema>): Promise<string> => {
@@ -3292,6 +3078,7 @@ ${soulsGuidance}
         content: `Auto-queued independent four-layer memory classification from branch ${(bestBranch?.id) || 'B0'}.`,
       });
     }
+    finalAnswer = this.normalizeUserFacingAnswer(finalAnswer);
     this.appendConversationTurn(conversationId, { user: input, assistant: finalAnswer });
     if (perfEntries && perfEntries.length > 0) {
       const totalMs = perfEntries.reduce((sum, item) => sum + item.ms, 0);

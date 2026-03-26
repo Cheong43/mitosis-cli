@@ -95,3 +95,14 @@ test('beam planner forces structured outputs for custom model ids', () => {
 
   agent.stop();
 });
+
+test('unwraps raw planner JSON from final answer before returning to user', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-final-unpack-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  installAgentTestDoubles(agent, () => '{"kind":"final","final_answer":"这是正常回答"}');
+
+  const answer = await agent.run('测试请求', () => {}, { conversationId: 'thread-json-wrap' });
+  assert.equal(answer, '这是正常回答');
+
+  agent.stop();
+});

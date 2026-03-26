@@ -3,8 +3,7 @@ import * as path from 'node:path';
 
 import { resolveCodeCliRoot } from '../config/projectPaths.js';
 import type { ToolAction, ToolResponse } from './types.js';
-
-const NOT_AVAILABLE = { kind: 'error', message: 'mitosis-cli: Mempedia binary operations are not available' };
+import { getMempediaTransportStatus, getSharedMempediaTransport, type MempediaTransportStatus } from './transport.js';
 
 type SkillInstallResult = { kind: string; skill_id: string; path?: string; message: string };
 
@@ -42,12 +41,40 @@ function ensureSkillMarkdown(skillId: string, title: string, content: string, ta
   return `---\nname: ${yamlEscape(skillId)}\ndescription: "${description}"\n${tagLine}---\n\n${trimmed}\n`;
 }
 
+function resolveBinaryPathFromModuleDir(moduleDir: string): string | undefined {
+  const candidates = [
+    path.join(moduleDir, '..', '..', '..', 'target', 'debug', 'mempedia'),
+    path.join(moduleDir, '..', '..', '..', 'target', 'release', 'mempedia'),
+    path.join(moduleDir, '..', '..', 'target', 'debug', 'mempedia'),
+    path.join(moduleDir, '..', '..', 'target', 'release', 'mempedia'),
+    path.join(process.cwd(), 'target', 'debug', 'mempedia'),
+    path.join(process.cwd(), 'target', 'release', 'mempedia'),
+    path.join(process.cwd(), '..', 'target', 'debug', 'mempedia'),
+    path.join(process.cwd(), '..', 'target', 'release', 'mempedia'),
+  ].map((candidate) => path.resolve(candidate));
+
+  return candidates.find((candidate) => {
+    try {
+      return fs.existsSync(candidate);
+    } catch {
+      return false;
+    }
+  });
+}
+
 export async function executeMempediaCliAction(
-  _moduleDir: string,
-  _projectRoot: string,
-  _payload: ToolAction | Record<string, unknown>,
+  moduleDir: string,
+  projectRoot: string,
+  payload: ToolAction | Record<string, unknown>,
 ): Promise<ToolResponse | Record<string, unknown>> {
-  return NOT_AVAILABLE;
+  return getSharedMempediaTransport(projectRoot, resolveBinaryPathFromModuleDir(moduleDir)).send(payload);
+}
+
+export async function getMempediaCliStatus(
+  moduleDir: string,
+  projectRoot: string,
+): Promise<MempediaTransportStatus> {
+  return getMempediaTransportStatus(projectRoot, resolveBinaryPathFromModuleDir(moduleDir));
 }
 
 export async function readUserPreferencesViaCli(

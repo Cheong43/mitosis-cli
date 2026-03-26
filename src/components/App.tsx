@@ -6,16 +6,17 @@ import type { ApprovalPrompt } from '../runtime/index.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
-import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { resolveCodeCliRoot } from '../config/projectPaths.js';
 import {
   executeMempediaCliAction,
+  getMempediaCliStatus,
   installWorkspaceSkillFromLibraryViaCli,
   listOrSearchEpisodicViaCli,
   readUserPreferencesViaCli,
   updateUserPreferencesViaCli,
 } from '../mempedia/cli.js';
+import type { MempediaTransportStatus } from '../mempedia/transport.js';
 import {
   findSkillByName,
   loadWorkspaceSkills as loadSkillsFromRouter,
@@ -190,6 +191,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   const [branchLoop, setBranchLoop] = useState<BranchLoopVisualState | null>(null);
   const [traceLogExpanded, setTraceLogExpanded] = useState(false);
   const [uiUrl, setUiUrl] = useState<string | null>(null);
+  const [mempediaStatus, setMempediaStatus] = useState<MempediaTransportStatus | null>(null);
   const uiServerRef = useRef<http.Server | null>(null);
   const uiBusyRef = useRef(false);
   const activeThreadRunsRef = useRef<Set<string>>(new Set());
@@ -222,10 +224,35 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   const branchMaxCompleted = Number.isFinite(envBranchMaxCompleted) ? Math.max(1, Math.min(8, Math.floor(envBranchMaxCompleted))) : 4;
   const branchTotalBudget = Math.max(branchMaxSteps, branchMaxSteps * branchMaxWidth * (branchMaxDepth + 1));
 
+  const refreshMempediaStatus = useCallback(async (writeHistory = false) => {
+    try {
+      const nextStatus = await getMempediaCliStatus(__dirname, projectRoot);
+      setMempediaStatus(nextStatus);
+      if (writeHistory) {
+        const line = `Mempedia self-check: binary available=${nextStatus.binaryAvailable ? 'yes' : 'no'} | transport connected=${nextStatus.transportConnected ? 'yes' : 'no'} | memory write enabled=${nextStatus.memoryWriteEnabled ? 'yes' : 'no'}${nextStatus.transportMode ? ` | mode=${nextStatus.transportMode}` : ''}${nextStatus.lastError ? ` | ${nextStatus.lastError}` : ''}`;
+        setHistory((prev: HistoryItem[]) => [...prev, { type: 'info', content: line }]);
+      }
+    } catch (error: any) {
+      const message = error?.message || String(error);
+      setMempediaStatus({
+        binaryAvailable: false,
+        binaryPath: null,
+        transportConnected: false,
+        memoryWriteEnabled: false,
+        transportMode: 'unavailable',
+        lastError: message,
+      });
+      if (writeHistory) {
+        setHistory((prev: HistoryItem[]) => [...prev, { type: 'info', content: `Mempedia self-check failed: ${message}` }]);
+      }
+    }
+  }, [projectRoot]);
+
   useEffect(() => {
     agent.start().catch((err: any) => {
       setHistory((prev: HistoryItem[]) => [...prev, { type: 'info', content: `Error starting agent: ${err.message}` }]);
     });
+    void refreshMempediaStatus(true);
     
     // Subscribe to background task updates
     const unsubscribe = agent.onBackgroundTask((task, status) => {
@@ -244,38 +271,10 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
       unsubscribe();
       agent.stop();
     };
-  }, [agent]);
+  }, [agent, refreshMempediaStatus]);
 
   const runMempediaCliAction = async (payload: Record<string, unknown>) => {
     return executeMempediaCliAction(__dirname, projectRoot, payload);
-  };
-
-  // ── Real mempedia binary helper ───────────────────────────────────────────
-  const resolveMempediaBinary = (): string | null => {
-    if (process.env.MEMPEDIA_BINARY) return process.env.MEMPEDIA_BINARY;
-    const candidates = [
-      path.join(projectRoot, '..', '..', 'target', 'release', 'mempedia'),
-      path.join(projectRoot, '..', 'target', 'release', 'mempedia'),
-      path.join(projectRoot, 'target', 'release', 'mempedia'),
-    ];
-    for (const c of candidates) {
-      try { if (fs.existsSync(c)) return c; } catch {}
-    }
-    return null;
-  };
-
-  const callMempediaBinary = (action: Record<string, unknown>): Record<string, unknown> => {
-    const bin = resolveMempediaBinary();
-    if (!bin) return { kind: 'error', message: 'mempedia binary not found. Set MEMPEDIA_BINARY env var.' };
-    const result = spawnSync(bin, ['--project', projectRoot, '--action', JSON.stringify(action)], {
-      encoding: 'utf-8',
-      timeout: 30000,
-    });
-    if (result.error) return { kind: 'error', message: result.error.message };
-    if (result.status !== 0) return { kind: 'error', message: (result.stderr || '').trim() || `binary exited ${result.status}` };
-    const out = (result.stdout || '').trim();
-    if (!out) return { kind: 'error', message: 'binary produced no output' };
-    try { return JSON.parse(out); } catch { return { kind: 'error', message: 'could not parse binary output: ' + out.slice(0, 200) }; }
   };
 
   const memoryRoot = () => path.join(projectRoot, '.mempedia', 'memory');
@@ -896,7 +895,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             return;
           }
           // Use Rust binary for writes (versioning, indexing, audit)
-          const result = callMempediaBinary({
+          const result = await runMempediaCliAction({
             action: 'sync_markdown',
             node_id: nodeId,
             markdown,
@@ -909,7 +908,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             writeJson(res, 400, { ok: false, error: (result as any).message || 'Failed to save markdown' });
             return;
           }
-          const linkResult = graphLinks.length > 0 ? callMempediaBinary({
+          const linkResult = graphLinks.length > 0 ? await runMempediaCliAction({
             action: 'set_node_links',
             node_id: nodeId,
             links: graphLinks
@@ -1022,7 +1021,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             return;
           }
           // Use Rust binary for all generic actions (rollback, fork, merge, etc.)
-          const result = callMempediaBinary(body as Record<string, unknown>);
+          const result = await runMempediaCliAction(body as Record<string, unknown>);
           if ((result as any)?.kind === 'error') {
             writeJson(res, 400, { ok: false, error: (result as any).message || 'Action failed' });
             return;
@@ -1925,6 +1924,16 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
       {backgroundTasks.length > 0 && (
         <Box marginTop={1}>
             <Text color="dim">⏳ Background tasks: {backgroundTasks.join(', ')}</Text>
+        </Box>
+      )}
+      {mempediaStatus && (
+        <Box marginTop={1} flexDirection="column">
+          <Text color="dim">
+            Mempedia: binary available={mempediaStatus.binaryAvailable ? 'yes' : 'no'} | transport connected={mempediaStatus.transportConnected ? 'yes' : 'no'} | memory write enabled={mempediaStatus.memoryWriteEnabled ? 'yes' : 'no'} | mode={mempediaStatus.transportMode}
+          </Text>
+          {mempediaStatus.lastError ? (
+            <Text color="dim">Mempedia detail: {mempediaStatus.lastError}</Text>
+          ) : null}
         </Box>
       )}
     </Box>

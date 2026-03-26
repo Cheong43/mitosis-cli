@@ -88,9 +88,164 @@ export class MemoryClassifierAgent {
     this.autoLinkLimit = options.autoLinkLimit;
   }
 
-  async persist(_job: MemoryClassifierJob, _context: MemoryClassifierContext): Promise<void> {
-    // MitosisCLI: memory classification and Mempedia persistence are disabled.
-    // Conversations are logged locally by the Agent; no LLM extraction runs here.
+  async persist(job: MemoryClassifierJob, context: MemoryClassifierContext): Promise<void> {
+    if (!job.savePreferences && !job.saveSkills && !job.saveAtomic && !job.saveEpisodic) {
+      context.appendMemoryLog('memory_skip_all_layers_disabled');
+      return;
+    }
+
+    const updatedAt = new Date().toISOString();
+    const extracted = await this.extractMemoryPayload(job.input, job.traces, job.answer);
+    context.appendMemoryLog('memory_extract_done', {
+      preferences: extracted.user_preferences.length,
+      skills: extracted.agent_skills.length,
+      atomic: extracted.atomic_knowledge.length,
+      save_preferences: job.savePreferences,
+      save_skills: job.saveSkills,
+      save_atomic: job.saveAtomic,
+      save_episodic: job.saveEpisodic,
+    });
+
+    const savedAtomicNodeIds: string[] = [];
+
+    if (job.savePreferences && extracted.user_preferences.length > 0) {
+      const existingPreferences = await this.withTimeout(
+        context.sendAction({ action: 'read_user_preferences' }),
+        this.memoryActionTimeoutMs,
+        'memory read preferences',
+      );
+      const existingMarkdown = (existingPreferences as any)?.kind === 'user_preferences'
+        ? String((existingPreferences as any).content || '')
+        : '';
+      const mergedMarkdown = context.mergeUserPreferencesMarkdown(
+        existingMarkdown,
+        extracted.user_preferences,
+        updatedAt,
+      );
+      const updatedPreferences = await this.withTimeout(
+        context.sendAction({ action: 'update_user_preferences', content: mergedMarkdown }),
+        this.memoryActionTimeoutMs,
+        'memory update preferences',
+      );
+      if ((updatedPreferences as any)?.kind === 'error') {
+        throw new Error(String((updatedPreferences as any).message || 'failed to update user preferences'));
+      }
+      context.appendMemoryLog('memory_preferences_saved', {
+        count: extracted.user_preferences.length,
+      });
+    }
+
+    if (job.saveSkills && extracted.agent_skills.length > 0) {
+      let savedSkills = 0;
+      for (const skill of extracted.agent_skills) {
+        const response = await this.withTimeout(
+          context.sendAction({
+            action: 'upsert_skill',
+            skill_id: skill.skill_id,
+            title: skill.title,
+            content: skill.content,
+            tags: skill.tags,
+          }),
+          this.memoryActionTimeoutMs,
+          `memory upsert skill ${skill.skill_id}`,
+        );
+        if ((response as any)?.kind === 'error') {
+          throw new Error(String((response as any).message || `failed to save skill ${skill.skill_id}`));
+        }
+        savedSkills += 1;
+      }
+      context.appendMemoryLog('memory_skills_saved', {
+        count: savedSkills,
+      });
+    }
+
+    if (job.saveAtomic && extracted.atomic_knowledge.length > 0) {
+      const atomicItems = extracted.atomic_knowledge.slice(0, 20);
+      let autoLinked = 0;
+      for (const item of atomicItems) {
+        const nodeId = this.stableNodeId('atomic', item.keyword);
+        const resolvedRelations = await context.resolveRelationTargets(item.relations || []);
+        const markdown = this.renderAtomicKnowledgeMarkdown(
+          nodeId,
+          item,
+          resolvedRelations,
+          updatedAt,
+          context.conversationId,
+          context.runId,
+        );
+        const saved = await this.withTimeout(
+          context.sendAction({
+            action: 'agent_upsert_markdown',
+            node_id: nodeId,
+            markdown,
+            importance: 1.2,
+            agent_id: 'memory-classifier',
+            reason: this.normalizeSummary(job.reason || item.summary, item.keyword),
+            source: 'mempedia-memory-classifier',
+            node_type: 'reference',
+          }),
+          this.memoryActionTimeoutMs,
+          `memory save atomic ${nodeId}`,
+        );
+        if ((saved as any)?.kind === 'error') {
+          throw new Error(String((saved as any).message || `failed to save atomic node ${nodeId}`));
+        }
+        savedAtomicNodeIds.push(nodeId);
+        context.appendNodeConversationMap(nodeId, context.conversationId, job.reason || 'memory classifier');
+
+        if (this.autoLinkEnabled && autoLinked < this.autoLinkMaxNodes) {
+          const linkResult = await this.withTimeout(
+            context.sendAction({
+              action: 'auto_link_related',
+              node_id: nodeId,
+              limit: this.autoLinkLimit,
+            }),
+            this.memoryActionTimeoutMs,
+            `memory auto link ${nodeId}`,
+          );
+          if ((linkResult as any)?.kind !== 'error') {
+            autoLinked += 1;
+          }
+        }
+      }
+      context.appendMemoryLog('memory_atomic_saved', {
+        count: savedAtomicNodeIds.length,
+        auto_linked: autoLinked,
+      });
+    }
+
+    if (job.saveEpisodic) {
+      const episodicSummary = this.normalizeSummary(
+        job.focus || this.firstSentence(job.answer) || this.firstSentence(this.stripSkillGuidance(job.input)),
+        job.reason || 'conversation memory',
+      );
+      const episodicTags = [
+        job.branchId ? `branch:${job.branchId}` : '',
+        job.focus ? `focus:${this.toSlug(job.focus).slice(0, 40)}` : '',
+        'memory-classifier',
+      ].filter(Boolean);
+      const episodic = await this.withTimeout(
+        context.sendAction({
+          action: 'record_episodic',
+          scene_type: 'conversation',
+          summary: episodicSummary,
+          raw_conversation_id: context.conversationId,
+          importance: savedAtomicNodeIds.length > 0 ? 0.9 : 0.6,
+          core_knowledge_nodes: savedAtomicNodeIds,
+          tags: episodicTags,
+          agent_id: 'memory-classifier',
+        }),
+        this.memoryActionTimeoutMs,
+        'memory save episodic',
+      );
+      if ((episodic as any)?.kind === 'error') {
+        throw new Error(String((episodic as any).message || 'failed to save episodic memory'));
+      }
+      context.appendMemoryLog('memory_episodic_saved', {
+        summary: episodicSummary,
+        linked_nodes: savedAtomicNodeIds.length,
+      });
+    }
   }
 
   /**
