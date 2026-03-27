@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentRuntime } from './AgentRuntime.js';
-import type { AgentStep, TranscriptMessage } from './types.js';
+import type { AgentStep, SynthesisResult, TranscriptMessage } from './types.js';
 
 class FakePlanner {
   constructor(private readonly planFn: (transcript: TranscriptMessage[]) => Promise<AgentStep>) {}
@@ -340,4 +340,187 @@ test('unsafe tool batches stay serial within one branch', async () => {
   const answer = await runtime.run('run mixed tools');
   assert.equal(answer, 'serial complete');
   assert.equal(maxObservedConcurrency, 1);
+});
+
+// ── Post-synthesis re-branch tests ────────────────────────────────────────
+
+test('synthesizeFinal returning done=false triggers remediation re-branch', async () => {
+  let branchCallCount = 0;
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((m) => m.content).join('\n');
+
+    // Remediation child branch: succeed immediately.
+    if (serialized.includes('child branch "fix:')) {
+      return {
+        kind: 'final' as const,
+        content: 'fixed-answer',
+        outcome: 'success',
+      };
+    }
+
+    // Original children: one succeeds, one fails.
+    if (serialized.includes('child branch "CodeA"')) {
+      return {
+        kind: 'final' as const,
+        content: 'codeA-ok',
+        outcome: 'success',
+      };
+    }
+    if (serialized.includes('child branch "CodeB"')) {
+      return {
+        kind: 'final' as const,
+        content: 'codeB-fail',
+        outcome: 'failed',
+        outcomeReason: 'test assertion error line 42',
+      };
+    }
+
+    // Root: branch into two.
+    branchCallCount++;
+    return {
+      kind: 'branch' as const,
+      thought: 'Split into A and B.',
+      branches: [
+        { label: 'CodeA', goal: 'Write snippet A', priority: 1 },
+        { label: 'CodeB', goal: 'Write snippet B', priority: 1 },
+      ],
+    };
+  });
+
+  let synthesisCallCount = 0;
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 3,
+    maxBranchDepth: 2,
+    maxBranchWidth: 3,
+    maxCompletedBranches: 8,
+    maxSynthesisRetries: 2,
+    synthesizeFinal: async ({ branches, synthesisRetry, maxSynthesisRetries }) => {
+      synthesisCallCount++;
+
+      // After remediation, look for fix branches that supersede older failed ones.
+      const fixBranches = branches.filter((b) => b.label.startsWith('fix:') && b.outcome === 'success');
+      const unresolvedFailed = branches.filter(
+        (b) => (b.outcome === 'failed' || b.outcome === 'partial')
+          && !fixBranches.some((f) => f.label === `fix: ${b.label}`),
+      );
+
+      if (unresolvedFailed.length > 0 && synthesisRetry < maxSynthesisRetries) {
+        return {
+          done: false,
+          branches: unresolvedFailed.map((b) => ({
+            label: `fix: ${b.label}`,
+            goal: `Retry: ${b.outcomeReason}`,
+            priority: 0.9,
+          })),
+          context: branches.filter((b) => b.outcome === 'success').map((b) => `${b.label}: ${b.finalAnswer}`).join('\n'),
+        } satisfies SynthesisResult;
+      }
+
+      // All resolved (or retries exhausted) → done.
+      const successAnswers = branches
+        .filter((b) => b.outcome === 'success')
+        .map((b) => b.finalAnswer);
+      return {
+        done: true,
+        answer: successAnswers.join(' + '),
+      } satisfies SynthesisResult;
+    },
+  });
+
+  const answer = await runtime.run('test re-branch');
+  assert.equal(branchCallCount, 1, 'root should branch exactly once');
+  // Synthesis: call 1 sees CodeB failed → re-branch; call 2 sees fix succeeded → done.
+  assert.equal(synthesisCallCount, 2, 'synthesis should be called twice (initial + after remediation)');
+  assert.ok(answer.includes('fixed-answer'), 'final answer should include the remediation result');
+  assert.ok(answer.includes('codeA-ok'), 'final answer should include the successful branch result');
+});
+
+test('re-branch respects maxSynthesisRetries and forces done on limit', async () => {
+  let synthesisCallCount = 0;
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((m) => m.content).join('\n');
+
+    if (serialized.includes('child branch "')) {
+      return {
+        kind: 'final' as const,
+        content: 'always-fails',
+        outcome: 'failed',
+        outcomeReason: 'persistent error',
+      };
+    }
+
+    return {
+      kind: 'branch' as const,
+      thought: 'branch',
+      branches: [
+        { label: 'Task', goal: 'Do something', priority: 1 },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 3,
+    maxBranchDepth: 2,
+    maxBranchWidth: 3,
+    maxCompletedBranches: 8,
+    maxSynthesisRetries: 2,
+    synthesizeFinal: async ({ branches, synthesisRetry, maxSynthesisRetries }) => {
+      synthesisCallCount++;
+      const failed = branches.filter((b) => b.outcome === 'failed');
+      if (failed.length > 0 && synthesisRetry < maxSynthesisRetries) {
+        return {
+          done: false,
+          branches: [{ label: `fix: retry-${synthesisRetry}`, goal: 'Retry', priority: 0.9 }],
+          context: 'previous attempts failed',
+        };
+      }
+      // Exhausted retries → force done.
+      return { done: true, answer: 'gave-up' };
+    },
+  });
+
+  const answer = await runtime.run('test retry limit');
+  // 1 initial + 2 retries = 3 synthesis calls
+  assert.equal(synthesisCallCount, 3, 'synthesis called 3 times (initial + 2 retries)');
+  assert.equal(answer, 'gave-up');
+});
+
+test('synthesizeFinal returning plain string still works (backward compat)', async () => {
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((m) => m.content).join('\n');
+
+    if (serialized.includes('child branch "')) {
+      return {
+        kind: 'final' as const,
+        content: 'child-answer',
+      };
+    }
+
+    return {
+      kind: 'branch' as const,
+      thought: 'one child',
+      branches: [
+        { label: 'Only', goal: 'Do it', priority: 1 },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 2,
+    maxBranchDepth: 1,
+    // Return plain string (old API).
+    synthesizeFinal: async ({ branches }) => branches[0].finalAnswer,
+  });
+
+  const answer = await runtime.run('test compat');
+  assert.equal(answer, 'child-answer');
 });

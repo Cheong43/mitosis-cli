@@ -22,6 +22,29 @@ Each loop iteration must do exactly one of the following:
 
 Completed branches are synthesized into one user-facing answer.
 
+## Branch Outcome Reporting
+
+When a branch finishes (via `THOUGHT → FINAL`), it must report a structured outcome:
+
+- **success** — the branch's goal was fully achieved (e.g. code written and tests pass).
+- **partial** — some progress was made but the goal was not fully met (e.g. code written but tests not run, or context budget exhausted).
+- **failed** — the goal was not met (e.g. tests fail, required resource not found).
+
+Include a brief `outcome_reason` when the outcome is `partial` or `failed` (e.g. the first few lines of a test error). This structured information enables the **post-synthesis re-branching** mechanism described below.
+
+## Post-Synthesis Re-Branching
+
+After all branches complete, the synthesis stage inspects their outcomes:
+
+1. If **all branches succeeded** (or outcomes are `unknown`), synthesize normally into a final answer.
+2. If **some branches failed or are partial** and retry budget remains (`maxSynthesisRetries`, default 2):
+   - Successful branch results become confirmed context for new branches.
+   - Each failed/partial branch spawns a **remediation child branch** whose goal includes the failure reason.
+   - The remediation branches run their own ReAct loops, then synthesis is attempted again.
+3. If retries are exhausted, synthesize the best available results and finish.
+
+This ensures that in coding tasks, a failed test in one branch does not silently drop — the system automatically retries with the error information carried forward.
+
 ## When to Branch
 
 Branch only if the alternatives are genuinely different, for example:

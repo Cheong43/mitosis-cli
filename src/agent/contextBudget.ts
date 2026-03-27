@@ -452,7 +452,20 @@ export function compressBranchTranscript(
       if (m.role === 'user' && contentText.startsWith('TOOL OBSERVATION')) {
         const firstLine = contentText.split('\n')[0];
         const hasError = contentText.includes('ERROR:');
-        summaryLines.push(`  ${firstLine}${hasError ? ' [ERROR]' : ' [OK]'} (${contentText.length}ch)`);
+        if (hasError) {
+          // Preserve key test/build failure lines for downstream re-branch diagnosis.
+          const errorLines = contentText
+            .split('\n')
+            .filter((l: string) => /error|fail|assert|panic|FAILED|expect/i.test(l))
+            .slice(0, 5)
+            .map((l: string) => l.slice(0, 200));
+          summaryLines.push(`  ${firstLine} [ERROR] (${contentText.length}ch)`);
+          if (errorLines.length > 0) {
+            summaryLines.push(`    ${errorLines.join('\n    ')}`);
+          }
+        } else {
+          summaryLines.push(`  ${firstLine} [OK] (${contentText.length}ch)`);
+        }
       }
     }
   }

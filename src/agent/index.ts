@@ -20,6 +20,7 @@ import { resolveCodeCliRoot } from '../config/projectPaths.js';
 import { AgentRuntime, createRuntime, CallbackApprovalEngine } from '../runtime/index.js';
 import type { ApprovalCallback } from '../runtime/index.js';
 import type { AgentBranchState, BranchSynthesisInput } from '../runtime/agent/AgentRuntime.js';
+import type { BranchOutcome, SynthesisResult } from '../runtime/agent/types.js';
 import { TOOLS, TOOL_NAMES } from '../tools/definitions.js';
 import { installWorkspaceSkillFromLibraryViaCli } from '../mempedia/cli.js';
 import { MemoryClassifierAgent } from './MemoryClassifierAgent.js';
@@ -85,6 +86,8 @@ const PlannerFinalDecisionSchema = z.object({
   thought: PlannerThoughtSchema,
   final_answer: z.string().trim().min(1),
   completion_summary: z.string().trim().min(1).max(280).optional(),
+  outcome: z.enum(['success', 'partial', 'failed']).optional(),
+  outcome_reason: z.string().trim().max(300).optional(),
 });
 
 const PlannerSkillsDecisionSchema = z.object({
@@ -183,6 +186,8 @@ interface BranchState {
   pendingAnthropicToolUseIds?: string[];
   completionSummary?: string;
   finalAnswer?: string;
+  outcome?: BranchOutcome;
+  outcomeReason?: string;
 }
 
 export interface TraceEvent {
@@ -577,6 +582,16 @@ export class Agent {
               type: 'string',
               minLength: 1,
               maxLength: 280,
+            },
+            outcome: {
+              type: 'string',
+              enum: ['success', 'partial', 'failed'],
+              description: 'Structured result of this branch: success if the goal was fully achieved, partial if some progress was made, failed if the goal was not met.',
+            },
+            outcome_reason: {
+              type: 'string',
+              maxLength: 300,
+              description: 'Brief explanation when outcome is partial or failed (e.g. test error message).',
             },
           },
           required: ['thought', 'final_answer'],
@@ -2938,6 +2953,8 @@ Rules:
 12d. Avoid near-duplicate web searches. After 2-3 consecutive web/search rounds without clear new information, you MUST either call planner_final using the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy. Do not continue the same-category search loop.
 13. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
 14. When you finish, call planner_final with a direct user-facing answer.
+14a. OUTCOME REPORTING: When calling planner_final, always set \`outcome\` to 'success', 'partial', or 'failed'. If the branch ran a test or validation that failed, set outcome='failed' and include the key error message in \`outcome_reason\`. If the goal was only partially achieved (e.g. code written but tests not run), set outcome='partial'. This enables the system to automatically retry failed branches.
+14b. CODING TASKS: When a branch writes code and runs tests, include the first few lines of any test failure output in \`outcome_reason\` so sibling or retry branches can use the error to fix the issue.
 15. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via planner_skills. For other skills in the catalog whose description overlaps with the task, call planner_skills to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to read/search/edit/bash/web or planner_branch.
 16. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
 17. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
@@ -3007,6 +3024,7 @@ Rules:
 9d. Avoid near-duplicate web searches. After 2-3 consecutive web/search rounds without clear new information, you MUST either call planner_final using the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy. Do not continue the same-category search loop.
 10. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
 11. When you finish, call planner_final with a direct user-facing answer.
+11a. OUTCOME REPORTING: When calling planner_final, always set \`outcome\` to 'success', 'partial', or 'failed'. If a test or validation failed, set outcome='failed' and include the key error in \`outcome_reason\`.
 12. NEVER use \`edit target=workspace\` to write directly into raw \`.mempedia\` storage. Use semantic targets instead: \`target=memory\`, \`target=preferences\`, or \`target=skills\`.
 13. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via planner_skills. For other skills in the catalog whose description overlaps with the task, call planner_skills to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to read/search/edit/bash/web.
 14. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
@@ -3467,7 +3485,46 @@ ${soulsGuidance}
       return `以下是各已完成分支的整理结果：\n\n${sections.join('\n\n')}`;
     };
 
-    const synthesizeCompletedBranches = async (branches: BranchState[]): Promise<string> => {
+    const synthesizeCompletedBranches = async (
+      branches: BranchState[],
+      synthesisRetry = 0,
+      maxSynthesisRetries = 2,
+    ): Promise<string | SynthesisResult> => {
+      // ── Re-branch check: if some branches failed/partial and retries remain ──
+      const failedBranches = branches.filter(
+        (b) => b.outcome === 'failed' || b.outcome === 'partial',
+      );
+      const successBranches = branches.filter(
+        (b) => b.outcome === 'success' || (!b.outcome && b.finalAnswer && b.finalAnswer.length > 0),
+      );
+
+      if (failedBranches.length > 0 && synthesisRetry < maxSynthesisRetries) {
+        emitTrace({
+          type: 'thought',
+          content: `${failedBranches.length} branch(es) failed/partial, ${successBranches.length} succeeded. Requesting remediation re-branch (retry ${synthesisRetry + 1}/${maxSynthesisRetries}).`,
+        });
+
+        // Build context summary from successful branches.
+        const successContext = successBranches
+          .map((b) => `[${b.id}/${b.label}] (success): ${this.clipText(b.finalAnswer || b.completionSummary || '', 800)}`)
+          .join('\n\n');
+
+        // Build remediation branches for each failed branch.
+        const remediationBranches = failedBranches.map((b) => ({
+          label: `fix: ${b.label}`,
+          goal: `Retry the failed task "${b.goal}". Previous attempt failed: ${b.outcomeReason || b.completionSummary || 'unknown reason'}. Use the error information to fix the issue. The following sibling branches succeeded and their results are available as context.`,
+          why: `Previous branch ${b.id} outcome=${b.outcome}: ${b.outcomeReason || 'no reason given'}`,
+          priority: 0.9,
+        }));
+
+        return {
+          done: false,
+          branches: remediationBranches,
+          context: `Successful branches:\n${successContext || '(none)'}\n\nFailed branches:\n${failedBranches.map((b) => `[${b.id}/${b.label}] outcome=${b.outcome}: ${b.outcomeReason || '(no reason)'}\nanswer: ${this.clipText(b.finalAnswer || '', 400)}`).join('\n\n')}`,
+        };
+      }
+
+      // ── Normal synthesis (all success, or retries exhausted) ──
       if (branches.length === 1 && branches[0].finalAnswer) {
         const fallback = buildSafeBranchDisplayFallback(branches[0]);
         return this.sanitizeUserFacingAnswer(
@@ -3578,6 +3635,8 @@ ${soulsGuidance}
             thought: decision.thought,
             content: decision.final_answer,
             completionSummary: decision.completion_summary,
+            outcome: (decision as any).outcome,
+            outcomeReason: (decision as any).outcome_reason,
           };
         },
         buildToolTranscript: ({ branch, observations }) => buildAnthropicToolTranscript(branch as BranchState, observations),
@@ -3638,6 +3697,8 @@ ${soulsGuidance}
           thought: decision.thought,
           content: decision.final_answer,
           completionSummary: decision.completion_summary,
+          outcome: (decision as any).outcome,
+          outcomeReason: (decision as any).outcome_reason,
         };
       },
       buildToolTranscript: ({ branch, observations }) => buildAnthropicToolTranscript(branch as BranchState, observations),
@@ -3665,8 +3726,14 @@ ${soulsGuidance}
           savedNodeIds: branch.savedNodeIds,
           completionSummary: branch.completionSummary,
           finalAnswer: branch.finalAnswer,
+          outcome: branch.outcome,
+          outcomeReason: branch.outcomeReason,
         })) as BranchState[];
-        return synthesizeCompletedBranches(branches);
+        return synthesizeCompletedBranches(
+          branches,
+          inputData.synthesisRetry,
+          inputData.maxSynthesisRetries,
+        );
       },
       onTrace: (event) => {
         if (event.type === 'final') {

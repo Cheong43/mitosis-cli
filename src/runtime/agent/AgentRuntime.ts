@@ -1,4 +1,4 @@
-import { AgentTraceEvent, PlannedBranch, PlannedToolCall, ToolObservation, TranscriptMessage } from './types.js';
+import { AgentTraceEvent, BranchOutcome, PlannedBranch, PlannedToolCall, SynthesisResult, ToolObservation, TranscriptMessage } from './types.js';
 import { Planner } from './SimplePlanner.js';
 import { ToolExecutionResult } from '../tools/types.js';
 import {
@@ -26,6 +26,10 @@ export interface AgentBranchState {
   savedNodeIds: string[];
   completionSummary?: string;
   finalAnswer?: string;
+  /** Structured outcome of this branch: success, partial, failed, or unknown. */
+  outcome?: BranchOutcome;
+  /** Human-readable explanation when outcome is 'partial' or 'failed'. */
+  outcomeReason?: string;
 }
 
 export interface BranchPlanInput {
@@ -52,7 +56,13 @@ export interface BranchSynthesisInput {
     savedNodeIds: string[];
     completionSummary?: string;
     finalAnswer: string;
+    outcome?: BranchOutcome;
+    outcomeReason?: string;
   }>;
+  /** How many synthesis-retry rounds have already occurred (0 on first call). */
+  synthesisRetry: number;
+  /** Maximum retries allowed — the hook can use this to decide whether to re-branch. */
+  maxSynthesisRetries: number;
 }
 
 export interface BranchToolTranscriptInput {
@@ -90,8 +100,15 @@ export interface AgentRuntimeOptions {
   buildToolTranscript?: (input: BranchToolTranscriptInput) => TranscriptMessage[] | null | undefined;
   /** Optional branch finalization override when a branch hits budget. */
   finalizeBranch?: (input: BranchFinalizeInput) => Promise<string>;
-  /** Optional final synthesis hook when multiple branches finish. */
-  synthesizeFinal?: (input: BranchSynthesisInput) => Promise<string>;
+  /**
+   * Optional final synthesis hook when multiple branches finish.
+   *
+   * Return a plain `string` to finish the run, or a `SynthesisResult` to
+   * either finish (`done: true`) or request re-branching (`done: false`).
+   */
+  synthesizeFinal?: (input: BranchSynthesisInput) => Promise<string | SynthesisResult>;
+  /** Maximum post-synthesis re-branch rounds (default 2). */
+  maxSynthesisRetries?: number;
   /** Trace callback invoked after each loop step. */
   onTrace?: (event: AgentTraceEvent) => void;
 }
@@ -143,7 +160,8 @@ export class AgentRuntime {
   private readonly executeToolCall?: (input: BranchToolExecutionInput) => Promise<ToolObservation>;
   private readonly buildToolTranscript?: (input: BranchToolTranscriptInput) => TranscriptMessage[] | null | undefined;
   private readonly finalizeBranch?: (input: BranchFinalizeInput) => Promise<string>;
-  private readonly synthesizeFinal?: (input: BranchSynthesisInput) => Promise<string>;
+  private readonly synthesizeFinal?: (input: BranchSynthesisInput) => Promise<string | SynthesisResult>;
+  private readonly maxSynthesisRetries: number;
   private readonly onTrace: (event: AgentTraceEvent) => void;
 
   constructor(options: AgentRuntimeOptions) {
@@ -165,6 +183,7 @@ export class AgentRuntime {
     this.buildToolTranscript = options.buildToolTranscript;
     this.finalizeBranch = options.finalizeBranch;
     this.synthesizeFinal = options.synthesizeFinal;
+    this.maxSynthesisRetries = options.maxSynthesisRetries ?? 2;
     this.onTrace = options.onTrace ?? (() => undefined);
   }
 
@@ -384,6 +403,8 @@ export class AgentRuntime {
               branch.finalAnswer = await this.finalizeBranch({ branch, reason });
             }
             branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped: context window full.`;
+            branch.outcome = branch.outcome ?? 'partial';
+            branch.outcomeReason = branch.outcomeReason ?? reason;
             completed.push(branch);
             emitBranchTrace('observation', branch,
               `Branch completed: context exhausted (${(check.usageRatio * 100).toFixed(1)}%).`);
@@ -397,6 +418,8 @@ export class AgentRuntime {
               branch.finalAnswer = await this.finalizeBranch({ branch, reason });
             }
             branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped because ${reason}.`;
+            branch.outcome = branch.outcome ?? 'partial';
+            branch.outcomeReason = branch.outcomeReason ?? reason;
             completed.push(branch);
             emitBranchTrace('observation', branch, `Branch completed after hitting ${reason}.`);
             return [];
@@ -425,8 +448,12 @@ export class AgentRuntime {
               });
             }
             branch.finalAnswer = branch.finalAnswer || agentStep.content;
+            branch.outcome = branch.outcome ?? 'partial';
+            branch.outcomeReason = branch.outcomeReason ?? 'planner format fallback';
           } else {
             branch.finalAnswer = agentStep.content;
+            branch.outcome = agentStep.outcome ?? branch.outcome ?? 'unknown';
+            branch.outcomeReason = agentStep.outcomeReason ?? branch.outcomeReason;
           }
           branch.completionSummary = agentStep.completionSummary ?? branch.completionSummary;
           completed.push(branch);
@@ -466,6 +493,8 @@ export class AgentRuntime {
             branch.finalAnswer = await this.finalizeBranch({ branch, reason });
           }
           branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped because ${reason}.`;
+          branch.outcome = branch.outcome ?? 'partial';
+          branch.outcomeReason = branch.outcomeReason ?? reason;
           completed.push(branch);
           emitBranchTrace('observation', branch, `Branch completed after hitting ${reason}.`);
           return [];
@@ -538,27 +567,86 @@ export class AgentRuntime {
         emitBranchTrace('observation', lastTouchedBranch, 'Branch finalized because no branch reached a natural final answer.');
       }
       lastTouchedBranch.finalAnswer = lastTouchedBranch.finalAnswer || 'No branch produced a final answer.';
+      lastTouchedBranch.outcome = lastTouchedBranch.outcome ?? 'partial';
+      lastTouchedBranch.outcomeReason = lastTouchedBranch.outcomeReason ?? 'no branch reached a natural final answer';
       completed.push(lastTouchedBranch);
     }
 
-    const finalBranches = completed
-      .filter((branch) => typeof branch.finalAnswer === 'string' && branch.finalAnswer.length > 0);
-    const synthesized = await this.synthesize(userMessage, priorTranscript, finalBranches);
-    this.emit({ type: 'final', content: synthesized });
-    return synthesized;
+    // ── Post-synthesis re-branch loop ──────────────────────────────────
+    // After all branches complete, synthesize.  If the synthesis hook
+    // reports that some branches failed and remediation branches are
+    // needed, spawn them and re-enter the scheduling loop.
+    let synthesisRetry = 0;
+    while (true) {
+      const finalBranches = completed
+        .filter((branch) => typeof branch.finalAnswer === 'string' && branch.finalAnswer.length > 0);
+      const synthesisResult = await this.synthesize(
+        userMessage, priorTranscript, finalBranches, synthesisRetry,
+      );
+
+      if (synthesisResult.done) {
+        this.emit({ type: 'final', content: synthesisResult.answer });
+        return synthesisResult.answer;
+      }
+
+      // Re-branch: synthesis requested remediation branches.
+      synthesisRetry++;
+      this.emit({
+        type: 'thought',
+        content: `Synthesis requested ${synthesisResult.branches.length} remediation branch(es) (retry ${synthesisRetry}/${this.maxSynthesisRetries}).`,
+      });
+
+      // Build a synthetic parent branch that carries the completed context.
+      const contextSummary = synthesisResult.context;
+      const remedyParent: AgentBranchState = {
+        id: `R${synthesisRetry}`,
+        parentId: null,
+        depth: 0,
+        label: `synthesis-retry-${synthesisRetry}`,
+        goal: 'Remediate failed branches from previous round.',
+        priority: 1,
+        steps: 0,
+        inheritedMessageCount: 0,
+        savedNodeIds: completed.flatMap((b) => b.savedNodeIds),
+        transcript: [
+          ...priorTranscript,
+          { role: 'user', content: userMessage },
+          {
+            role: 'assistant',
+            content: `Previous round summary:\n${contextSummary}`,
+          },
+        ],
+      };
+
+      const remedyChildren = buildChildBranches(remedyParent, synthesisResult.branches);
+
+      // Reset scheduling state for the new round.
+      queue.length = 0;
+      // Keep completed branches from previous rounds (their results feed the next synthesis).
+      for (const child of remedyChildren) {
+        queue.push(child);
+      }
+
+      launchQueuedBranches();
+      while (active.size > 0) {
+        await Promise.race(active);
+      }
+      // Loop back to synthesize with the updated completed set.
+    }
   }
 
   private async synthesize(
     userMessage: string,
     priorTranscript: TranscriptMessage[],
     branches: AgentBranchState[],
-  ): Promise<string> {
+    synthesisRetry: number,
+  ): Promise<SynthesisResult> {
     if (branches.length === 0) {
-      return 'Maximum steps reached without a final answer.';
+      return { done: true, answer: 'Maximum steps reached without a final answer.' };
     }
 
     if (this.synthesizeFinal) {
-      return this.synthesizeFinal({
+      const hookResult = await this.synthesizeFinal({
         userMessage,
         priorTranscript,
         branches: branches.map((branch) => ({
@@ -568,18 +656,30 @@ export class AgentRuntime {
           savedNodeIds: branch.savedNodeIds,
           completionSummary: branch.completionSummary,
           finalAnswer: branch.finalAnswer ?? '',
+          outcome: branch.outcome,
+          outcomeReason: branch.outcomeReason,
         })),
+        synthesisRetry,
+        maxSynthesisRetries: this.maxSynthesisRetries,
       });
+
+      // Backward compatible: if the hook returns a plain string, wrap it.
+      if (typeof hookResult === 'string') {
+        return { done: true, answer: hookResult };
+      }
+      return hookResult;
     }
 
+    // Default synthesis (no hook): always done.
     if (branches.length === 1) {
-      return branches[0].finalAnswer ?? 'Maximum steps reached without a final answer.';
+      return { done: true, answer: branches[0].finalAnswer ?? 'Maximum steps reached without a final answer.' };
     }
 
-    return [...branches]
+    const answer = [...branches]
       .map((branch) => branch.finalAnswer || '')
-      .find((answer) => answer.length > 0)
+      .find((a) => a.length > 0)
       ?? 'Maximum steps reached without a final answer.';
+    return { done: true, answer };
   }
 
   private emit(event: AgentTraceEvent): void {

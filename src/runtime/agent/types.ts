@@ -5,6 +5,9 @@
 /** A single step in the agent's ReAct loop. */
 export type AgentStepKind = 'tool' | 'branch' | 'final';
 
+/** Structured outcome of a completed branch. */
+export type BranchOutcome = 'success' | 'partial' | 'failed' | 'unknown';
+
 interface AgentStepBase {
   /** Optional planner thought for tracing/debugging. */
   thought?: string;
@@ -32,6 +35,13 @@ export interface FinalAnswer extends AgentStepBase {
   content: string;
   completionSummary?: string;
   /**
+   * Structured outcome reported by the planner.  When the planner omits this
+   * the runtime infers the value from context (e.g. forced finalization → 'partial').
+   */
+  outcome?: BranchOutcome;
+  /** Human-readable explanation when outcome is 'partial' or 'failed'. */
+  outcomeReason?: string;
+  /**
    * `planner_fallback` means the planner never produced a usable branch-final
    * step, so the runtime should explicitly finalize the branch instead of
    * counting this as a natural completion.
@@ -52,6 +62,17 @@ export interface BranchStep extends AgentStepBase {
 }
 
 export type AgentStep = ToolStep | BranchStep | FinalAnswer;
+
+/**
+ * Result of the post-branch synthesis stage.
+ *
+ * - `done: true`  → final answer ready; the run ends.
+ * - `done: false` → one or more branches need remediation; the runtime
+ *   spawns new child branches and re-enters the scheduling loop.
+ */
+export type SynthesisResult =
+  | { done: true; answer: string }
+  | { done: false; branches: PlannedBranch[]; context: string };
 
 /** Observation returned after executing a tool call. */
 export interface ToolObservation {
