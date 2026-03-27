@@ -56,22 +56,9 @@ test('budget: compute produces valid parameters for real model', () => {
   console.log(`    modelLimit: ${budget.modelLimit}`);
   console.log(`    committed: ${budget.committedTokens}`);
   console.log(`    residual: ${budget.residualBudget}`);
-  console.log(`    maxSteps: ${budget.maxSteps}`);
-  console.log(`    maxBranchDepth: ${budget.maxBranchDepth}`);
-  console.log(`    maxBranchWidth: ${budget.maxBranchWidth}`);
-  console.log(`    maxTotalSteps: ${budget.maxTotalSteps}`);
   console.log(`    transcriptBudgetChars: ${budget.transcriptBudgetChars}`);
-  console.log(`    beamMaxDepth: ${budget.beamMaxDepth}`);
-  console.log(`    beamWidth: ${budget.beamWidth}`);
-  console.log(`    beamExpansionFactor: ${budget.beamExpansionFactor}`);
 
-  assert.ok(budget.maxSteps >= 2, `maxSteps should be >= 2, got ${budget.maxSteps}`);
-  assert.ok(budget.maxSteps <= 20, `maxSteps should be <= 20, got ${budget.maxSteps}`);
-  assert.ok(budget.maxBranchDepth >= 0 && budget.maxBranchDepth <= 4, `depth 0-4, got ${budget.maxBranchDepth}`);
-  assert.ok(budget.maxBranchWidth >= 2 && budget.maxBranchWidth <= 5, `width 2-5, got ${budget.maxBranchWidth}`);
   assert.ok(budget.transcriptBudgetChars >= 4000, `chars >= 4000, got ${budget.transcriptBudgetChars}`);
-  assert.ok(budget.beamMaxDepth >= 2, `beamDepth >= 2, got ${budget.beamMaxDepth}`);
-  assert.ok(budget.beamWidth >= 2, `beamWidth >= 2, got ${budget.beamWidth}`);
   assert.ok(budget.residualBudget > 0, `residual > 0, got ${budget.residualBudget}`);
 });
 
@@ -91,11 +78,10 @@ test('budget: heavy context usage produces constrained parameters', () => {
 
   console.log(`  Heavy-usage budget (90% committed):`);
   console.log(`    residual: ${budget.residualBudget}`);
-  console.log(`    maxSteps: ${budget.maxSteps}, depth: ${budget.maxBranchDepth}, width: ${budget.maxBranchWidth}`);
+  console.log(`    transcriptBudgetChars: ${budget.transcriptBudgetChars}`);
 
-  // With only 10% residual, parameters should be more constrained.
-  assert.ok(budget.maxSteps <= budget.maxSteps, 'steps should be reasonable');
-  assert.ok(budget.maxBranchDepth <= 3, `depth should be constrained, got ${budget.maxBranchDepth}`);
+  // With only 10% residual, transcript budget should be small.
+  assert.ok(budget.residualBudget > 0, 'residual should be positive');
 });
 
 test('budget: compression levels evolve as transcript grows', () => {
@@ -195,8 +181,8 @@ test('live: Agent.run() emits context budget trace and completes', { timeout: 12
 
     // Verify the trace contains expected fields.
     assert.ok(budgetTrace!.content.includes('residual='), 'Budget trace should contain residual');
-    assert.ok(budgetTrace!.content.includes('maxSteps='), 'Budget trace should contain maxSteps');
-    assert.ok(budgetTrace!.content.includes('depth='), 'Budget trace should contain depth');
+    assert.ok(budgetTrace!.content.includes('transcriptChars='), 'Budget trace should contain transcriptChars');
+    assert.ok(budgetTrace!.content.includes('agentMode='), 'Budget trace should contain agentMode');
 
     // Verify we got a non-empty answer.
     assert.ok(answer.length > 0, 'Answer should not be empty');

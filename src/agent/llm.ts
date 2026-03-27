@@ -15,6 +15,41 @@ export interface OpenAIChatSettings {
 
 export type LLMProvider = 'openai' | 'anthropic';
 
+export interface AnthropicTextContentBlock {
+  type: 'text';
+  text: string;
+}
+
+export interface AnthropicToolUseContentBlock {
+  type: 'tool_use';
+  id: string;
+  name: string;
+  input: unknown;
+}
+
+export interface AnthropicToolResultContentBlock {
+  type: 'tool_result';
+  tool_use_id: string;
+  content: string;
+  is_error?: boolean;
+}
+
+export interface AnthropicThinkingContentBlock {
+  type: 'thinking';
+  thinking?: string;
+  text?: string;
+  signature?: string;
+}
+
+export type AnthropicMessageContentBlock =
+  | AnthropicTextContentBlock
+  | AnthropicToolUseContentBlock
+  | AnthropicToolResultContentBlock
+  | AnthropicThinkingContentBlock
+  | Record<string, unknown>;
+
+export type ChatMessageContent = string | AnthropicMessageContentBlock[];
+
 export interface LanguageModelV1 {
   provider: LLMProvider;
   client: OpenAI | Anthropic;
@@ -22,9 +57,9 @@ export interface LanguageModelV1 {
   supportsStructuredOutputs: boolean;
 }
 
-interface ChatMessage {
+export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: ChatMessageContent;
 }
 
 interface GenerateTextOptions {
@@ -50,6 +85,36 @@ interface GenerateObjectOptions<TSchema extends z.ZodTypeAny> {
   schema: TSchema;
 }
 
+export interface ParseableFunctionTool<TParsed> {
+  name: string;
+  description?: string;
+  parameters: Record<string, unknown>;
+  parse: (input: unknown) => TParsed;
+}
+
+export interface ParsedToolCall<TParsed> {
+  name: string;
+  input: TParsed;
+  providerToolUseId?: string;
+}
+
+export interface ToolCallProviderMessage {
+  anthropicAssistantContent?: AnthropicMessageContentBlock[];
+}
+
+interface GenerateToolCallsOptions<TParsed> {
+  model: LanguageModelV1;
+  messages: ChatMessage[];
+  tools: Array<ParseableFunctionTool<TParsed>>;
+  temperature?: number;
+  maxTokens?: number;
+}
+
+interface JsonFallbackParseResult<TParsed> {
+  calls: ParsedToolCall<TParsed>[];
+  text: string;
+}
+
 export class NoObjectGeneratedError extends Error {
   static isInstance(error: unknown): error is NoObjectGeneratedError {
     return error instanceof NoObjectGeneratedError;
@@ -58,6 +123,17 @@ export class NoObjectGeneratedError extends Error {
   constructor(message = 'No object generated') {
     super(message);
     this.name = 'NoObjectGeneratedError';
+  }
+}
+
+export class NoToolCallGeneratedError extends Error {
+  static isInstance(error: unknown): error is NoToolCallGeneratedError {
+    return error instanceof NoToolCallGeneratedError;
+  }
+
+  constructor(message = 'No tool call generated') {
+    super(message);
+    this.name = 'NoToolCallGeneratedError';
   }
 }
 
@@ -107,8 +183,16 @@ function extractTextParts(content: unknown): string {
         if (typeof part === 'string') {
           return part;
         }
-        if (part && typeof part === 'object' && 'text' in part && typeof (part as { text?: unknown }).text === 'string') {
-          return (part as { text: string }).text;
+        if (part && typeof part === 'object') {
+          if ('text' in part && typeof (part as { text?: unknown }).text === 'string') {
+            return (part as { text: string }).text;
+          }
+          if ('thinking' in part && typeof (part as { thinking?: unknown }).thinking === 'string') {
+            return (part as { thinking: string }).thinking;
+          }
+          if ('content' in part && typeof (part as { content?: unknown }).content === 'string') {
+            return (part as { content: string }).content;
+          }
         }
         return '';
       })
@@ -144,7 +228,7 @@ function extractMessageText(message: unknown): string {
 function normalizeMessages(messages: ChatMessage[]): Array<{ role: string; content: string }> {
   return messages.map((message) => ({
     role: message.role,
-    content: typeof message.content === 'string' ? message.content : String(message.content ?? ''),
+    content: extractTextParts(message.content),
   }));
 }
 
@@ -163,6 +247,167 @@ function parseJsonObjectText(text: string): unknown {
     }
     throw new NoObjectGeneratedError(`No object generated: ${trimmed.slice(0, 240)}`);
   }
+}
+
+function clipPreview(text: string, maxChars = 240): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, maxChars);
+}
+
+function buildJsonFallbackPrompt<TParsed>(
+  tools: Array<ParseableFunctionTool<TParsed>>,
+  priorReplyPreview: string,
+): string {
+  const toolSchemas = tools
+    .map((tool) => `- ${tool.name}: ${JSON.stringify(tool.parameters)}`)
+    .join('\n');
+
+  return [
+    'Your previous reply was invalid because it did not produce usable native tool calls.',
+    'Reply again with exactly one JSON object and nothing else. No markdown fences. No prose before or after the JSON. Do not output raw shell commands or code unless they are escaped inside a JSON string value.',
+    priorReplyPreview ? `Previous reply preview: ${priorReplyPreview}` : '',
+    'Use this JSON object schema:',
+    '{"tool_calls":[{"name":"<allowed tool name>","input":{}}]}',
+    'Rules:',
+    '- Use only the allowed tool names below.',
+    '- Put every tool input inside the "input" object.',
+    '- Return at least one tool call.',
+    '- If you need a final answer, return planner_final inside the tool_calls array with its required input fields.',
+    '- If you need branching or skills loading, return planner_branch or planner_skills inside the tool_calls array with their required input fields.',
+    '- Do not include markdown fences, XML, tags, or prose outside the JSON object.',
+    'Allowed tools:',
+    toolSchemas,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function buildJsonFallbackModeInstruction(): string {
+  return [
+    'JSON REPAIR MODE:',
+    'Your previous reply was invalid because it did not produce usable native tool calls.',
+    'For this reply only, ignore any earlier instruction that says to emit native tool calls directly.',
+    'Instead, return exactly one JSON object and nothing else. No markdown fences. No prose before or after the JSON. Do not output raw shell commands or code unless they are escaped inside a JSON string value.',
+  ].join('\n');
+}
+
+function buildJsonFallbackMessages<TParsed>(
+  messages: ChatMessage[],
+  tools: Array<ParseableFunctionTool<TParsed>>,
+  priorReplyPreview: string,
+): ChatMessage[] {
+  const fallbackPrompt = buildJsonFallbackPrompt(tools, priorReplyPreview);
+  const fallbackSystem = buildJsonFallbackModeInstruction();
+  let injectedSystem = false;
+  const nextMessages = messages.map((message) => {
+    if (!injectedSystem && message.role === 'system') {
+      injectedSystem = true;
+      return {
+        ...message,
+        content: `${message.content}\n\n${fallbackSystem}`,
+      };
+    }
+    return message;
+  });
+  if (!injectedSystem) {
+    nextMessages.unshift({ role: 'system', content: fallbackSystem });
+  }
+  nextMessages.push({ role: 'user', content: fallbackPrompt });
+  return nextMessages;
+}
+
+function parseToolCallsFromFallbackPayload<TParsed>(
+  payload: unknown,
+  toolMap: Map<string, ParseableFunctionTool<TParsed>>,
+  rawText: string,
+): JsonFallbackParseResult<TParsed> {
+  const parsed = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : {};
+  const thoughtText = typeof parsed.thought === 'string' ? parsed.thought.trim() : '';
+
+  let rawCalls: unknown[] = [];
+  if (Array.isArray(parsed.tool_calls)) {
+    rawCalls = parsed.tool_calls;
+  } else if (Array.isArray(parsed.calls)) {
+    rawCalls = parsed.calls;
+  } else if (typeof parsed.name === 'string') {
+    rawCalls = [parsed];
+  } else if (parsed.kind === 'tool' && Array.isArray(parsed.tool_calls)) {
+    rawCalls = parsed.tool_calls;
+  } else if (parsed.kind === 'final' && toolMap.has('planner_final')) {
+    rawCalls = [{
+      name: 'planner_final',
+      input: {
+        thought: parsed.thought,
+        final_answer: parsed.final_answer,
+        completion_summary: parsed.completion_summary,
+      },
+    }];
+  } else if (parsed.kind === 'branch' && toolMap.has('planner_branch')) {
+    rawCalls = [{
+      name: 'planner_branch',
+      input: {
+        thought: parsed.thought,
+        branches: parsed.branches,
+      },
+    }];
+  } else if (parsed.kind === 'skills' && toolMap.has('planner_skills')) {
+    rawCalls = [{
+      name: 'planner_skills',
+      input: {
+        thought: parsed.thought,
+        skills_to_load: parsed.skills_to_load,
+      },
+    }];
+  }
+
+  if (rawCalls.length === 0) {
+    const preview = clipPreview(rawText);
+    throw new NoToolCallGeneratedError(preview ? `No tool call generated: ${preview}` : 'No tool call generated.');
+  }
+
+  return {
+    calls: rawCalls.map((rawCall) => {
+      if (!rawCall || typeof rawCall !== 'object') {
+        throw new NoToolCallGeneratedError('Fallback JSON contained a non-object tool call.');
+      }
+      const record = rawCall as Record<string, unknown>;
+      const toolName = typeof record.name === 'string' ? record.name : '';
+      if (!toolName) {
+        throw new NoToolCallGeneratedError('Fallback JSON tool call was missing a name.');
+      }
+      const tool = toolMap.get(toolName);
+      if (!tool) {
+        throw new NoToolCallGeneratedError(`Unknown tool call generated: ${toolName}`);
+      }
+      const input = record.input ?? record.arguments ?? record.args ?? {};
+      return {
+        name: tool.name,
+        input: tool.parse(input),
+      };
+    }),
+    text: thoughtText || '',
+  };
+}
+
+async function generateToolCallsJsonFallback<TParsed>(
+  options: GenerateToolCallsOptions<TParsed>,
+  toolMap: Map<string, ParseableFunctionTool<TParsed>>,
+  priorReplyPreview: string,
+): Promise<JsonFallbackParseResult<TParsed>> {
+  const { text } = await generateText({
+    model: options.model,
+    messages: buildJsonFallbackMessages(options.messages, options.tools, priorReplyPreview),
+    temperature: options.temperature,
+    maxTokens: options.maxTokens,
+    providerOptions: {
+      openai: {
+        responseFormat: { type: 'json_object' },
+      },
+    },
+  });
+
+  return parseToolCallsFromFallbackPayload(parseJsonObjectText(text), toolMap, text);
 }
 
 function buildClient(cfg: LLMEndpointConfig): OpenAI {
@@ -218,14 +463,15 @@ export function buildAnthropicLanguageModel(cfg: AnthropicEndpointConfig): Langu
 
 function splitSystemAndMessages(
   messages: ChatMessage[],
-): { system: string | undefined; messages: Array<{ role: 'user' | 'assistant'; content: string }> } {
+): { system: string | undefined; messages: Array<{ role: 'user' | 'assistant'; content: ChatMessageContent }> } {
   let system: string | undefined;
-  const out: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  const out: Array<{ role: 'user' | 'assistant'; content: ChatMessageContent }> = [];
   for (const m of messages) {
     if (m.role === 'system') {
-      system = system ? `${system}\n\n${m.content}` : m.content;
+      const systemChunk = extractTextParts(m.content);
+      system = system ? `${system}\n\n${systemChunk}` : systemChunk;
     } else {
-      out.push({ role: m.role, content: typeof m.content === 'string' ? m.content : String(m.content ?? '') });
+      out.push({ role: m.role, content: typeof m.content === 'string' ? m.content : m.content });
     }
   }
   // Anthropic requires at least one message and it must start with 'user'.
@@ -273,7 +519,7 @@ async function anthropicGenerateText(
         max_tokens: maxTokens ?? 8192,
         ...(typeof temperature === 'number' ? { temperature } : {}),
         ...(systemText ? { system: systemText } : {}),
-        messages: anthropicMsgs,
+        messages: anthropicMsgs as any,
       });
       return extractAnthropicText(response);
     } catch (error: any) {
@@ -379,4 +625,114 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(options: Gene
   return {
     object: options.schema.parse(parsed),
   };
+}
+
+export async function generateToolCalls<TParsed>(
+  options: GenerateToolCallsOptions<TParsed>,
+): Promise<{ calls: ParsedToolCall<TParsed>[]; text: string; providerMessage?: ToolCallProviderMessage }> {
+  const toolMap = new Map(options.tools.map((tool) => [tool.name, tool] as const));
+
+  if (options.model.provider === 'anthropic') {
+    const client = options.model.client as Anthropic;
+    const { system, messages } = splitSystemAndMessages(options.messages);
+    const response = await client.messages.create({
+      model: options.model.model,
+      max_tokens: options.maxTokens ?? 8192,
+      ...(typeof options.temperature === 'number' ? { temperature: options.temperature } : {}),
+      ...(system ? { system } : {}),
+      messages: messages as any,
+      tools: options.tools.map((tool) => ({
+        name: tool.name,
+        ...(tool.description ? { description: tool.description } : {}),
+        input_schema: tool.parameters,
+      })),
+      tool_choice: { type: 'any' },
+    } as any);
+
+    const text = extractAnthropicText(response);
+    try {
+      const toolUses = Array.isArray(response.content)
+        ? response.content.filter((block: any) => block?.type === 'tool_use' && typeof block?.name === 'string') as
+            Array<{ id?: string; name: string; input: unknown }>
+        : [];
+      if (toolUses.length === 0) {
+        const preview = clipPreview(text);
+        throw new NoToolCallGeneratedError(preview ? `No tool call generated: ${preview}` : 'No tool call generated.');
+      }
+
+      return {
+        calls: toolUses.map((toolUse) => {
+          const tool = toolMap.get(toolUse.name);
+          if (!tool) {
+            throw new NoToolCallGeneratedError(`Unknown tool call generated: ${toolUse.name}`);
+          }
+        return {
+          name: tool.name,
+          input: tool.parse(toolUse.input),
+          ...(typeof toolUse.id === 'string' && toolUse.id.trim()
+            ? { providerToolUseId: toolUse.id }
+            : {}),
+        };
+      }),
+        text,
+        providerMessage: Array.isArray(response.content)
+          ? { anthropicAssistantContent: response.content as AnthropicMessageContentBlock[] }
+          : undefined,
+      };
+    } catch (error) {
+      if (!NoToolCallGeneratedError.isInstance(error) && !NoObjectGeneratedError.isInstance(error)) {
+        throw error;
+      }
+      return generateToolCallsJsonFallback(options, toolMap, clipPreview(text));
+    }
+  }
+
+  const client = options.model.client as OpenAI;
+  const completion = await client.chat.completions.create({
+    model: options.model.model,
+    messages: normalizeMessages(options.messages),
+    ...(typeof options.temperature === 'number' ? { temperature: options.temperature } : {}),
+    ...(typeof options.maxTokens === 'number' ? { max_completion_tokens: options.maxTokens } : {}),
+    tools: options.tools.map((tool) => ({
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        ...(tool.description ? { description: tool.description } : {}),
+        parameters: tool.parameters,
+        strict: true,
+      },
+    })),
+    tool_choice: 'required',
+    parallel_tool_calls: true,
+  } as any);
+
+  const text = extractMessageText(completion.choices?.[0]?.message);
+  try {
+    const toolCalls = (completion.choices?.[0]?.message?.tool_calls || []).filter(
+      (toolCall: any) => toolCall?.type === 'function',
+    );
+    if (toolCalls.length === 0) {
+      const preview = clipPreview(text);
+      throw new NoToolCallGeneratedError(preview ? `No tool call generated: ${preview}` : 'No tool call generated.');
+    }
+
+    return {
+      calls: toolCalls.map((toolCall: any) => {
+        const tool = toolMap.get(toolCall.function.name);
+        if (!tool) {
+          throw new NoToolCallGeneratedError(`Unknown tool call generated: ${toolCall.function.name}`);
+        }
+        return {
+          name: tool.name,
+          input: tool.parse(parseJsonObjectText(toolCall.function.arguments)),
+        };
+      }),
+      text,
+    };
+  } catch (error) {
+    if (!NoToolCallGeneratedError.isInstance(error) && !NoObjectGeneratedError.isInstance(error)) {
+      throw error;
+    }
+    return generateToolCallsJsonFallback(options, toolMap, clipPreview(text));
+  }
 }

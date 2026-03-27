@@ -22,7 +22,7 @@ interface ReplayOutcome {
   traceCount: number;
   branchCount: number;
   toolCallCount: number;
-  plannerFallbackCount: number;
+  plannerErrorCount: number;
   connectionError: boolean;
   exhaustedWithoutAnswer: boolean;
   emittedBudgetTrace: boolean;
@@ -62,8 +62,10 @@ function slugifyPrompt(prompt: string): string {
 function detectToolCallLeak(answer: string): boolean {
   const trimmed = answer.trim();
   return /```tool_call/i.test(trimmed)
+    || /\[TOOL_CALL\]/i.test(trimmed)
     || /^```(?:bash|json|sh)\b/i.test(trimmed)
-    || /^tool_call\s*$/im.test(trimmed);
+    || /^tool_call\s*$/im.test(trimmed)
+    || /^PLANNER (?:TOOL|BRANCH|FINAL|SKILLS)\b/im.test(trimmed);
 }
 
 function summarizeOutcome(prompt: string, answer: string, traces: TraceEventLike[], durationMs: number): ReplayOutcome {
@@ -75,7 +77,7 @@ function summarizeOutcome(prompt: string, answer: string, traces: TraceEventLike
     traceCount: traces.length,
     branchCount: traces.filter((trace) => trace.content.includes('[scheduler] Branch')).length,
     toolCallCount: traces.filter((trace) => trace.content.startsWith('Calling ')).length,
-    plannerFallbackCount: traces.filter((trace) => trace.content.includes('Planner returned no valid structured decision')).length,
+    plannerErrorCount: traces.filter((trace) => trace.content.includes('Planner decision generation failed:')).length,
     connectionError: traces.some((trace) => trace.content.includes('Connection error')),
     exhaustedWithoutAnswer: answer.trim() === 'No branch produced a final answer.',
     emittedBudgetTrace: traces.some((trace) => trace.content.includes('Context budget:')),
@@ -83,7 +85,7 @@ function summarizeOutcome(prompt: string, answer: string, traces: TraceEventLike
   };
 }
 
-test('live: planner replay reports fallback markers for configured prompts', { timeout: 300_000 }, async () => {
+test('live: planner replay stays on structured planner decisions for configured prompts', { timeout: 300_000 }, async () => {
   const apiKey = process.env.OPENAI_API_KEY;
   const baseURL = process.env.OPENAI_BASE_URL;
   const model = process.env.OPENAI_MODEL;
@@ -130,7 +132,7 @@ test('live: planner replay reports fallback markers for configured prompts', { t
           `  replay prompt="${prompt}" run=${i + 1}/${iterations}`
           + ` duration=${outcome.durationMs}ms traces=${outcome.traceCount}`
           + ` branches=${outcome.branchCount} tools=${outcome.toolCallCount}`
-          + ` plannerFallbacks=${outcome.plannerFallbackCount}`
+          + ` plannerErrors=${outcome.plannerErrorCount}`
           + ` connectionError=${outcome.connectionError}`
           + ` exhausted=${outcome.exhaustedWithoutAnswer}`
           + ` leakedToolCall=${outcome.leakedToolCallMarkup}`
@@ -153,7 +155,7 @@ test('live: planner replay reports fallback markers for configured prompts', { t
     iterations,
     connectionErrors: outcomes.filter((item) => item.connectionError).length,
     exhaustedWithoutAnswer: outcomes.filter((item) => item.exhaustedWithoutAnswer).length,
-    plannerFallbackRuns: outcomes.filter((item) => item.plannerFallbackCount > 0).length,
+    plannerErrorRuns: outcomes.filter((item) => item.plannerErrorCount > 0).length,
     avgTraceCount: Number((outcomes.reduce((sum, item) => sum + item.traceCount, 0) / outcomes.length).toFixed(1)),
     avgDurationMs: Math.round(outcomes.reduce((sum, item) => sum + item.durationMs, 0) / outcomes.length),
   };

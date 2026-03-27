@@ -99,12 +99,7 @@ test('computeContextBudget: basic computation for gpt-4o', () => {
   assert.equal(result.residualBudget, 119_404);
 
   // With ~119k residual tokens:
-  assert.ok(result.maxSteps >= 2 && result.maxSteps <= 20, `maxSteps should be 2-20, got ${result.maxSteps}`);
-  assert.ok(result.maxBranchDepth >= 2, `large budget should allow depth >= 2, got ${result.maxBranchDepth}`);
-  assert.ok(result.maxBranchWidth >= 3, `large budget should allow width >= 3, got ${result.maxBranchWidth}`);
   assert.ok(result.transcriptBudgetChars >= 4000, `transcriptBudgetChars should be >= 4000, got ${result.transcriptBudgetChars}`);
-  assert.ok(result.beamMaxDepth >= 2, `beamMaxDepth should be >= 2, got ${result.beamMaxDepth}`);
-  assert.ok(result.beamWidth >= 2, `beamWidth should be >= 2, got ${result.beamWidth}`);
 });
 
 test('computeContextBudget: small model context constrains parameters', () => {
@@ -118,13 +113,8 @@ test('computeContextBudget: small model context constrains parameters', () => {
   assert.equal(result.modelLimit, 8_192);
   // committed = 3000 + 2000 + 1000 + 4096 = 10096 > 8192 → residual = 0
   assert.equal(result.residualBudget, 0);
-  // With 0 residual: all params should be at minimum
-  assert.equal(result.maxSteps, 2);
-  assert.equal(result.maxBranchDepth, 0);
-  assert.equal(result.maxBranchWidth, 2);
+  // With 0 residual: transcript chars at minimum
   assert.equal(result.transcriptBudgetChars, 4000);
-  assert.equal(result.beamMaxDepth, 2);
-  assert.equal(result.beamWidth, 2);
 });
 
 test('computeContextBudget: medium residual gives moderate params', () => {
@@ -140,8 +130,7 @@ test('computeContextBudget: medium residual gives moderate params', () => {
   // committed = 40000 + 30000 + 16000 + 4000 = 90000
   // residual = 38000
   assert.equal(result.residualBudget, 38_000);
-  assert.ok(result.maxBranchDepth <= 3, `38k residual should give depth <= 3, got ${result.maxBranchDepth}`);
-  assert.ok(result.maxSteps >= 2 && result.maxSteps <= 20, `maxSteps in valid range, got ${result.maxSteps}`);
+  assert.ok(result.transcriptBudgetChars >= 4000, `transcriptBudgetChars in valid range`);
 });
 
 test('computeContextBudget: very large model (gemini) gives generous params', () => {
@@ -154,8 +143,7 @@ test('computeContextBudget: very large model (gemini) gives generous params', ()
 
   assert.equal(result.modelLimit, 1_000_000);
   assert.ok(result.residualBudget > 900_000);
-  assert.ok(result.maxSteps === 20, `1M context should max out steps at 20, got ${result.maxSteps}`);
-  assert.ok(result.maxBranchDepth === 4, `1M context should allow depth=4, got ${result.maxBranchDepth}`);
+  assert.ok(result.transcriptBudgetChars === 200_000, `1M context should cap transcriptBudgetChars at 200k, got ${result.transcriptBudgetChars}`);
 });
 
 // ── getCompressionLevel ────────────────────────────────────────────────────

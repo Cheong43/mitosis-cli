@@ -31,6 +31,12 @@ export interface FinalAnswer extends AgentStepBase {
   kind: 'final';
   content: string;
   completionSummary?: string;
+  /**
+   * `planner_fallback` means the planner never produced a usable branch-final
+   * step, so the runtime should explicitly finalize the branch instead of
+   * counting this as a natural completion.
+   */
+  finalizationMode?: 'natural' | 'planner_fallback';
 }
 
 /** A tool-execution step. */
@@ -54,10 +60,12 @@ export interface ToolObservation {
   success: boolean;
 }
 
+export type TranscriptMessageContent = any;
+
 /** A single turn in the agent's running transcript. */
 export interface TranscriptMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: TranscriptMessageContent;
 }
 
 /** Trace event emitted by the agent runtime for UI/logging. */

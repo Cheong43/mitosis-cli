@@ -104,10 +104,10 @@ export function estimateTokens(text: string): number {
 }
 
 /** Estimate tokens for an array of transcript messages. */
-export function estimateTranscriptTokens(messages: Array<{ role: string; content: string }>): number {
+export function estimateTranscriptTokens(messages: Array<{ role: string; content: any }>): number {
   let total = 0;
   for (const m of messages) {
-    total += estimateTokens(m.content) + 4; // ~4 tokens overhead per message
+    total += estimateTokens(extractTranscriptContentText(m.content)) + 4; // ~4 tokens overhead per message
   }
   return total;
 }
@@ -148,22 +148,8 @@ export interface ContextBudgetResult {
   committedTokens: number;
   /** Tokens available for the ReAct loop transcript. */
   residualBudget: number;
-  /** Recommended max steps per branch. */
-  maxSteps: number;
-  /** Recommended max branch depth. */
-  maxBranchDepth: number;
-  /** Recommended max branch width. */
-  maxBranchWidth: number;
-  /** Recommended total step budget across all branches. */
-  maxTotalSteps: number;
   /** Recommended transcript budget in characters (for buildMessages). */
   transcriptBudgetChars: number;
-  /** Recommended beam search depth (for BeamSearchAgentRuntime). */
-  beamMaxDepth: number;
-  /** Recommended beam width. */
-  beamWidth: number;
-  /** Recommended beam expansion factor. */
-  beamExpansionFactor: number;
 }
 
 /**
@@ -175,35 +161,6 @@ export function computeContextBudget(input: ContextBudgetInput): ContextBudgetRe
   const committed = input.systemPromptTokens + input.conversationContextTokens + input.memoryContextTokens + safetyMargin;
   const residual = Math.max(0, modelLimit - committed);
 
-  // ── Branching ReAct parameters ─────────────────────────────────────────
-
-  // maxSteps: how many ReAct iterations can fit in the residual budget per branch.
-  const rawMaxSteps = Math.floor(residual / TOKENS_PER_STEP.total);
-  const maxSteps = clamp(rawMaxSteps, 2, 20);
-
-  // maxBranchDepth: deeper branching multiplies token usage exponentially.
-  // With branch-spawn transcript compression (~75% savings per depth level),
-  // effective per-depth cost is much lower, so we can afford deeper trees.
-  const maxBranchDepth = residual >= 60_000 ? 4
-    : residual >= 35_000 ? 3
-    : residual >= 18_000 ? 2
-    : residual >= 8_000 ? 1
-    : 0;
-
-  // maxBranchWidth: transcript compression on spawn reduces inherited cost.
-  const maxBranchWidth = residual >= 40_000 ? 5
-    : residual >= 25_000 ? 4
-    : residual >= 12_000 ? 3
-    : 2;
-
-  // maxTotalSteps: global ceiling on total work.
-  // With compression, branches are cheaper — use 0.45 multiplier instead of 0.6.
-  const maxTotalSteps = clamp(
-    Math.floor(residual / (TOKENS_PER_STEP.total * 0.45)),
-    maxSteps,
-    maxSteps * maxBranchWidth * (maxBranchDepth + 1),
-  );
-
   // transcriptBudgetChars: character budget for buildMessages windowing.
   // ~4 chars per token (with mixed content assumption).
   // Raise cap for large context models (Gemini 1M, Claude 200k).
@@ -213,34 +170,11 @@ export function computeContextBudget(input: ContextBudgetInput): ContextBudgetRe
     200_000,
   );
 
-  // ── Beam Search parameters ─────────────────────────────────────────────
-
-  // Each beam step keeps beamWidth × expansionFactor LLM calls.
-  // Per step, each candidate adds ~TOKENS_PER_STEP.total to its path.
-  const beamWidth = residual >= 80_000 ? 4
-    : residual >= 40_000 ? 3
-    : 2;
-
-  const beamExpansionFactor = residual >= 60_000 ? 4
-    : residual >= 30_000 ? 3
-    : 2;
-
-  // beamMaxDepth: each depth level each path grows by ~TOKENS_PER_STEP.total.
-  const rawBeamDepth = Math.floor(residual / (TOKENS_PER_STEP.total * beamWidth));
-  const beamMaxDepth = clamp(rawBeamDepth, 2, 10);
-
   return {
     modelLimit,
     committedTokens: committed,
     residualBudget: residual,
-    maxSteps,
-    maxBranchDepth,
-    maxBranchWidth,
-    maxTotalSteps,
     transcriptBudgetChars,
-    beamMaxDepth,
-    beamWidth,
-    beamExpansionFactor,
   };
 }
 
@@ -262,7 +196,38 @@ export function getCompressionLevel(usedTokens: number, budgetTokens: number): C
 
 interface TranscriptMessage {
   role: string;
-  content: string;
+  content: any;
+}
+
+function extractTranscriptContentText(content: any): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === 'string') {
+          return item;
+        }
+        if (item && typeof item === 'object') {
+          if (typeof (item as { text?: unknown }).text === 'string') {
+            return (item as { text: string }).text;
+          }
+          if (typeof (item as { thinking?: unknown }).thinking === 'string') {
+            return (item as { thinking: string }).thinking;
+          }
+          if (typeof (item as { content?: unknown }).content === 'string') {
+            return (item as { content: string }).content;
+          }
+        }
+        return JSON.stringify(item);
+      })
+      .join('\n');
+  }
+  if (content == null) {
+    return '';
+  }
+  return String(content);
 }
 
 /**
@@ -286,7 +251,7 @@ export function compressTranscript(
 ): TranscriptMessage[] {
   if (messages.length <= 1) return messages;
 
-  const totalLen = messages.reduce((s, m) => s + m.content.length, 0);
+  const totalLen = messages.reduce((s, m) => s + extractTranscriptContentText(m.content).length, 0);
   const effectiveLevel = level ?? (totalLen <= budgetChars ? 'none' : undefined);
 
   if (effectiveLevel === 'none' && totalLen <= budgetChars) {
@@ -305,8 +270,9 @@ export function compressTranscript(
   if (appliedLevel === 'soft') {
     // Truncate long observations in middle messages (>800 chars → keep head+tail).
     const compressed = rest.map((m) => {
-      if (m.role === 'user' && m.content.length > 800 && m.content.startsWith('TOOL OBSERVATION')) {
-        const lines = m.content.split('\n');
+      const contentText = extractTranscriptContentText(m.content);
+      if (m.role === 'user' && contentText.length > 800 && contentText.startsWith('TOOL OBSERVATION')) {
+        const lines = contentText.split('\n');
         const header = lines.slice(0, 2).join('\n');
         const tail = lines.slice(-3).join('\n');
         return { ...m, content: `${header}\n...[observation truncated]...\n${tail}` };
@@ -319,9 +285,10 @@ export function compressTranscript(
   if (appliedLevel === 'medium') {
     // Replace tool observations with one-line summaries.
     const compressed = rest.map((m) => {
-      if (m.role === 'user' && m.content.startsWith('TOOL OBSERVATION')) {
-        const firstLine = m.content.split('\n')[0];
-        const charCount = m.content.length;
+      const contentText = extractTranscriptContentText(m.content);
+      if (m.role === 'user' && contentText.startsWith('TOOL OBSERVATION')) {
+        const firstLine = contentText.split('\n')[0];
+        const charCount = contentText.length;
         return { ...m, content: `${firstLine} [${charCount} chars compressed]` };
       }
       return m;
@@ -342,11 +309,11 @@ function fitFromEnd(
   rest: TranscriptMessage[],
   budgetChars: number,
 ): TranscriptMessage[] {
-  const headLen = head.reduce((s, m) => s + m.content.length, 0);
+  const headLen = head.reduce((s, m) => s + extractTranscriptContentText(m.content).length, 0);
   let budget = budgetChars - headLen;
   const kept: TranscriptMessage[] = [];
   for (let i = rest.length - 1; i >= 0 && budget > 0; i--) {
-    const len = rest[i].content.length;
+    const len = extractTranscriptContentText(rest[i].content).length;
     if (len <= budget) {
       kept.unshift(rest[i]);
       budget -= len;
@@ -364,6 +331,74 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 // ── Branch-spawn transcript compression ────────────────────────────────────
+
+const PLANNER_TOOL_DECISION_PREFIX = 'PLANNER TOOL DECISION:';
+const PLANNER_BRANCH_DECISION_PREFIX = 'PLANNER BRANCH DECISION:';
+
+function parseLegacyPlannerTranscript(content: unknown): any | null {
+  if (typeof content !== 'string') {
+    return null;
+  }
+  try {
+    return JSON.parse(content);
+  } catch {
+    return null;
+  }
+}
+
+function extractPlannerToolLines(content: unknown): string[] {
+  const legacy = parseLegacyPlannerTranscript(content);
+  if (legacy?.kind === 'tool' && Array.isArray(legacy.tool_calls)) {
+    return legacy.tool_calls.map((tc: { name?: string; goal?: string }) => {
+      const name = typeof tc?.name === 'string' ? tc.name : 'unknown';
+      const goal = typeof tc?.goal === 'string' && tc.goal.trim() ? ` — ${tc.goal.trim()}` : '';
+      return `${name}${goal}`;
+    });
+  }
+
+  if (typeof content !== 'string' || !content.startsWith(PLANNER_TOOL_DECISION_PREFIX)) {
+    return [];
+  }
+
+  return content
+    .split('\n')
+    .slice(1)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('- '))
+    .map((line) => line.slice(2).trim())
+    .filter(Boolean);
+}
+
+function extractPlannerToolNames(content: unknown): string[] {
+  const legacy = parseLegacyPlannerTranscript(content);
+  if (legacy?.kind === 'tool' && Array.isArray(legacy.tool_calls)) {
+    return legacy.tool_calls
+      .map((tc: { name?: string }) => (typeof tc?.name === 'string' ? tc.name.trim() : ''))
+      .filter(Boolean);
+  }
+
+  return extractPlannerToolLines(content)
+    .map((line) => line.match(/^([^|:]+)/)?.[1]?.trim() || line)
+    .filter(Boolean);
+}
+
+function extractPlannerBranchChildCount(content: unknown): number | null {
+  const legacy = parseLegacyPlannerTranscript(content);
+  if (legacy?.kind === 'branch' && Array.isArray(legacy.branches)) {
+    return legacy.branches.length;
+  }
+
+  if (typeof content !== 'string' || !content.startsWith(PLANNER_BRANCH_DECISION_PREFIX)) {
+    return null;
+  }
+
+  return content
+    .split('\n')
+    .slice(1)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('- '))
+    .length;
+}
 
 /**
  * Compress a parent branch's transcript before passing to child branches.
@@ -394,26 +429,31 @@ export function compressBranchTranscript(
 
   for (const m of middle) {
     if (m.role === 'assistant') {
-      try {
-        const parsed = JSON.parse(m.content);
-        if (parsed.kind === 'tool' && Array.isArray(parsed.tool_calls)) {
-          for (const tc of parsed.tool_calls) {
-            toolCallCount++;
-            const goal = tc.goal ? ` — ${tc.goal}` : '';
-            summaryLines.push(`> ${tc.name}${goal}`);
-          }
-        } else if (parsed.kind === 'branch') {
-          branchCount++;
-          summaryLines.push(`>> branched into ${parsed.branches?.length ?? '?'} children`);
+      const toolLines = extractPlannerToolLines(m.content);
+      if (toolLines.length > 0) {
+        for (const line of toolLines) {
+          toolCallCount++;
+          summaryLines.push(`> ${line}`);
         }
-      } catch {
-        const line = m.content.split('\n')[0].slice(0, 120);
-        if (line) summaryLines.push(`# ${line}`);
+        continue;
       }
-    } else if (m.role === 'user' && m.content.startsWith('TOOL OBSERVATION')) {
-      const firstLine = m.content.split('\n')[0];
-      const hasError = m.content.includes('ERROR:');
-      summaryLines.push(`  ${firstLine}${hasError ? ' [ERROR]' : ' [OK]'} (${m.content.length}ch)`);
+
+      const branchChildren = extractPlannerBranchChildCount(m.content);
+      if (branchChildren !== null) {
+        branchCount++;
+        summaryLines.push(`>> branched into ${branchChildren || '?'} children`);
+        continue;
+      }
+
+      const line = extractTranscriptContentText(m.content).split('\n')[0].slice(0, 120);
+      if (line) summaryLines.push(`# ${line}`);
+    } else {
+      const contentText = extractTranscriptContentText(m.content);
+      if (m.role === 'user' && contentText.startsWith('TOOL OBSERVATION')) {
+        const firstLine = contentText.split('\n')[0];
+        const hasError = contentText.includes('ERROR:');
+        summaryLines.push(`  ${firstLine}${hasError ? ' [ERROR]' : ' [OK]'} (${contentText.length}ch)`);
+      }
     }
   }
 
@@ -440,7 +480,7 @@ export function progressiveCompressBranch(
   budgetChars: number,
   recentKeep: number = 6,
 ): TranscriptMessage[] {
-  const totalLen = messages.reduce((s, m) => s + m.content.length, 0);
+  const totalLen = messages.reduce((s, m) => s + extractTranscriptContentText(m.content).length, 0);
   if (totalLen <= budgetChars) return messages;
 
   if (messages.length <= recentKeep + 1) {
@@ -454,24 +494,22 @@ export function progressiveCompressBranch(
   // Aggressively compress middle: tool observations → one-liners,
   // assistant tool-call messages → name-only summaries.
   const compressed = middle.map((m) => {
-    if (m.role === 'user' && m.content.startsWith('TOOL OBSERVATION')) {
-      const firstLine = m.content.split('\n')[0];
+    const contentText = extractTranscriptContentText(m.content);
+    if (m.role === 'user' && contentText.startsWith('TOOL OBSERVATION')) {
+      const firstLine = contentText.split('\n')[0];
       return { ...m, content: `${firstLine} [compressed]` };
     }
     if (m.role === 'assistant') {
-      try {
-        const parsed = JSON.parse(m.content);
-        if (parsed.kind === 'tool' && Array.isArray(parsed.tool_calls)) {
-          const names = parsed.tool_calls.map((tc: { name: string }) => tc.name).join(', ');
-          return { ...m, content: JSON.stringify({ kind: 'tool', tool_calls_summary: names }) };
-        }
-      } catch { /* keep as-is */ }
+      const toolNames = extractPlannerToolNames(m.content);
+      if (toolNames.length > 0) {
+        return { ...m, content: `${PLANNER_TOOL_DECISION_PREFIX} ${toolNames.join(', ')} [compressed]` };
+      }
     }
     return m;
   });
 
   const result = [first, ...compressed, ...tail];
-  const resultLen = result.reduce((s, m) => s + m.content.length, 0);
+  const resultLen = result.reduce((s, m) => s + extractTranscriptContentText(m.content).length, 0);
 
   if (resultLen > budgetChars) {
     return compressTranscript(result, budgetChars, 'hard');
@@ -484,7 +522,7 @@ export function progressiveCompressBranch(
 
 export interface ContextCheckResult {
   /** Transcript after potential compression. */
-  transcript: Array<{ role: string; content: string }>;
+  transcript: Array<{ role: string; content: any }>;
   /** Whether compression was applied. */
   compressed: boolean;
   /** Whether more steps can safely be taken. */
@@ -511,7 +549,7 @@ export interface ContextCheckResult {
  * is compacted so execution can keep going.
  */
 export function checkContextAndCompress(
-  transcript: Array<{ role: string; content: string }>,
+  transcript: Array<{ role: string; content: any }>,
   modelLimit: number,
   committedTokens: number,
   options: {
@@ -553,10 +591,30 @@ export function checkContextAndCompress(
   newTokens = estimateTranscriptTokens(result);
   newRatio = modelLimit > 0 ? (committedTokens + newTokens) / modelLimit : 1;
 
+  if (newRatio < 0.95) {
+    return { transcript: result, compressed: true, canContinue: true, usageRatio: newRatio, transcriptTokens: newTokens };
+  }
+
+  // Nuclear compression: keep only first message + last 2 messages.
+  // This is the last resort before giving up — ensures the branch can continue
+  // with minimal context rather than being terminated.
+  const nuclearKeep = 2;
+  if (result.length > nuclearKeep + 1) {
+    const first = result[0];
+    const tail = result.slice(-nuclearKeep);
+    const summaryMsg: { role: string; content: string } = {
+      role: 'user',
+      content: `[CONTEXT COMPRESSED — ${result.length - 1 - nuclearKeep} earlier messages were removed to free context space. Continue from the most recent state below.]`,
+    };
+    result = [first, summaryMsg, ...tail];
+    newTokens = estimateTranscriptTokens(result);
+    newRatio = modelLimit > 0 ? (committedTokens + newTokens) / modelLimit : 1;
+  }
+
   return {
     transcript: result,
     compressed: true,
-    canContinue: newRatio < 0.95,
+    canContinue: newRatio < 0.98,
     usageRatio: newRatio,
     transcriptTokens: newTokens,
   };

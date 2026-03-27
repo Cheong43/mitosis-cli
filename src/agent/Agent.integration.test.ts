@@ -21,19 +21,19 @@ function installAgentTestDoubles(agent: Agent, answerForRequest: (request: strin
     selectedNodeIds: [],
     rationale: 'test',
   });
-  anyAgent.generateJsonPromptText = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+  anyAgent.generatePlannerDecision = async ({ messages }: { messages: Array<{ content?: string }> }) => {
     const joined = Array.isArray(messages)
       ? messages.map((message) => String(message?.content || '')).join('\n\n')
       : '';
     const requestMatch = joined.match(/Original user request:\n([\s\S]*?)(?:\n\nStart with the root loop\.|\n\nActive branch:|$)/);
     const request = requestMatch?.[1]?.trim() || 'unknown';
     const answer = await answerForRequest(request);
-    return JSON.stringify({
+    return {
       kind: 'final',
       thought: 'Return final answer.',
       final_answer: answer,
       completion_summary: answer,
-    });
+    };
   };
 }
 
@@ -84,13 +84,34 @@ test('one Agent instance supports concurrent runs across different conversation 
   agent.stop();
 });
 
-test('beam planner forces structured outputs for custom model ids', () => {
+test('planner uses structured decision generation instead of raw JSON text repair', async () => {
   const projectRoot = createTempProjectRoot('mempedia-agent-structured-');
   const agent = new Agent({ apiKey: 'test-key', model: 'Doubao-Seed-2.0-pro' }, projectRoot);
   const anyAgent = agent as any;
+  let plannerCalls = 0;
 
-  assert.equal(anyAgent.beamPlannerStructuredOpenai.supportsStructuredOutputs, true);
-  assert.equal(anyAgent.beamPlannerCompatOpenai.supportsStructuredOutputs, false);
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+  anyAgent.generatePlannerDecision = async () => {
+    plannerCalls += 1;
+    return {
+      kind: 'final',
+      thought: 'Done.',
+      final_answer: 'ok',
+      completion_summary: 'ok',
+    };
+  };
+  anyAgent.generateJsonPromptText = async () => {
+    throw new Error('planner should not call generateJsonPromptText');
+  };
+
+  const answer = await agent.run('测试结构化 planner', () => {}, { conversationId: 'thread-structured-planner' });
+  assert.equal(answer, 'ok');
+  assert.equal(plannerCalls, 1);
 
   agent.stop();
 });
@@ -106,7 +127,7 @@ test('unwraps raw planner JSON from final answer before returning to user', asyn
   agent.stop();
 });
 
-test('planner fallback returns natural language error instead of echoing raw bash blocks', async () => {
+test('planner generation failure returns a user-safe fallback answer', async () => {
   const projectRoot = createTempProjectRoot('mempedia-agent-fallback-natural-');
   const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
   const anyAgent = agent as any;
@@ -116,50 +137,14 @@ test('planner fallback returns natural language error instead of echoing raw bas
     selectedNodeIds: [],
     rationale: 'test',
   });
-  anyAgent.generateJsonPromptText = async () => '```bash\nfind . -name "mempedia"\nls -la ./target/release/\n```';
-
-  const answer = await agent.run('我已经重新build', () => {}, { conversationId: 'thread-fallback-natural' });
-  assert.match(answer, /内部规划器输出成了命令或草稿/);
-  assert.doesNotMatch(answer, /```bash/);
-  assert.doesNotMatch(answer, /find \./);
-
-  agent.stop();
-});
-
-test('planner retries malformed structured reply before failing a branch', async () => {
-  const projectRoot = createTempProjectRoot('mempedia-agent-format-retry-');
-  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
-  const anyAgent = agent as any;
-  anyAgent.retrieveRelevantContext = async () => ({
-    contextText: '',
-    recalledNodeIds: [],
-    selectedNodeIds: [],
-    rationale: 'test',
-  });
-
-  let plannerCalls = 0;
-  anyAgent.generateJsonPromptText = async () => {
-    plannerCalls += 1;
-    if (plannerCalls === 1) {
-      return '{"tool":"read","args":{"filePath":"note.txt"}}';
-    }
-    return JSON.stringify({
-      kind: 'final',
-      thought: 'Recovered after schema retry.',
-      final_answer: '恢复成功',
-      completion_summary: '恢复成功',
-    });
+  anyAgent.generatePlannerDecision = async () => {
+    throw new Error('```bash\nfind . -name "mempedia"\nls -la ./target/release/\n```');
   };
 
-  const traces: TraceEvent[] = [];
-  const answer = await agent.run('测试格式重试', (event) => { traces.push(event); }, { conversationId: 'thread-format-retry' });
-
-  assert.equal(answer, '恢复成功');
-  assert.ok(plannerCalls >= 2, `Expected planner to be retried, got ${plannerCalls} call(s)`);
-  assert.ok(
-    !traces.some((event) => event.content.includes('内部规划结果格式异常')),
-    'Did not expect branch to terminate with planner format fallback after retry',
-  );
+  const answer = await agent.run('我已经重新build', () => {}, { conversationId: 'thread-fallback-natural' });
+  assert.match(answer, /内部规划步骤失败/);
+  assert.doesNotMatch(answer, /```bash/);
+  assert.doesNotMatch(answer, /find \./);
 
   agent.stop();
 });
@@ -176,30 +161,130 @@ test('planner prompt keeps branching guidance principle-based without root coerc
   });
 
   let capturedPrompt = '';
-  anyAgent.generateJsonPromptText = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+  anyAgent.generatePlannerDecision = async ({ messages }: { messages: Array<{ content?: string }> }) => {
     capturedPrompt = Array.isArray(messages)
       ? messages.map((message) => String(message?.content || '')).join('\n\n')
       : '';
-    return JSON.stringify({
+    return {
       kind: 'final',
       thought: 'Done.',
       final_answer: 'ok',
       completion_summary: 'ok',
-    });
+    };
   };
 
   const answer = await agent.run('竭尽所能收集中英今天的盘前信源', () => {}, { conversationId: 'thread-branch-guidance' });
   assert.equal(answer, 'ok');
-  assert.match(capturedPrompt, /multiple viable possibilities are worth exploring in parallel/i);
-  assert.match(capturedPrompt, /parallel execution would materially help/i);
+  assert.match(capturedPrompt, /independent sub-goals that are worth exploring in parallel/i);
+  assert.match(capturedPrompt, /Decompose aggressively/i);
+  assert.match(capturedPrompt, /default toward planner_branch on the first meaningful step/i);
+  assert.match(capturedPrompt, /task can be decomposed into independent parts/i);
+  assert.match(capturedPrompt, /multiple plausible independent avenues to explore/i);
+  assert.match(capturedPrompt, /call read\/search\/edit\/bash\/web directly for work/i);
+  assert.match(capturedPrompt, /Prefer materially diverse search strategies/i);
+  assert.match(capturedPrompt, /If this branch can still be split into 2 or more genuinely independent evidence streams or workstreams/i);
+  assert.match(capturedPrompt, /each must target a genuinely different evidence stream or hypothesis/i);
+  assert.match(capturedPrompt, /After 2-3 consecutive web\/search rounds without clear new information/i);
   assert.doesNotMatch(capturedPrompt, /Always provide at least 2 branches/i);
   assert.doesNotMatch(capturedPrompt, /NEVER branch on the first step/i);
   assert.doesNotMatch(capturedPrompt, /default to one `web` tool call before branching/i);
+  assert.doesNotMatch(capturedPrompt, /Return exactly one JSON object/i);
+  assert.doesNotMatch(capturedPrompt, /planner_tool/i);
 
   agent.stop();
 });
 
-test('normalizes pseudo tool_call planner output into a real tool execution', async () => {
+test('child branch prompts stay on direct work tools instead of inheriting legacy planner JSON', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-child-tool-regression-');
+  fs.writeFileSync(path.join(projectRoot, 'note.txt'), 'evidence from note\n', 'utf-8');
+
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+
+  let sawChildPrompt = false;
+  let sawPostToolPrompt = false;
+  anyAgent.generatePlannerDecision = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+    const joined = Array.isArray(messages)
+      ? messages.map((message) => String(message?.content || '')).join('\n\n')
+      : '';
+
+    if (!joined.includes('child branch "Source audit"')) {
+      return {
+        kind: 'branch',
+        thought: 'Split root from evidence collection.',
+        branches: [
+          {
+            label: 'Source audit',
+            goal: 'Read note.txt and ground the answer in workspace evidence.',
+            why: 'The answer should be evidence-backed.',
+            priority: 1,
+          },
+        ],
+      };
+    }
+
+    assert.match(joined, /Call read\/search\/edit\/bash\/web directly for work/i);
+    assert.doesNotMatch(joined, /Return exactly one JSON object/i);
+    assert.doesNotMatch(joined, /\{"kind":"branch"/);
+    assert.doesNotMatch(joined, /planner_tool/i);
+
+    if (joined.includes('TOOL OBSERVATION for read:')) {
+      sawPostToolPrompt = true;
+      assert.match(joined, /PLANNER TOOL DECISION:/);
+      assert.doesNotMatch(joined, /\{"kind":"tool"/);
+      return {
+        kind: 'final',
+        thought: 'Done.',
+        final_answer: '已基于 note.txt 完成验证。',
+        completion_summary: '已基于 note.txt 完成验证。',
+      };
+    }
+
+    sawChildPrompt = true;
+    assert.match(joined, /PLANNER BRANCH DECISION:/);
+    return {
+      kind: 'tool',
+      thought: 'Read the note file for concrete evidence.',
+      tool_calls: [
+        {
+          name: 'read',
+          arguments: { target: 'workspace', path: 'note.txt' },
+          goal: 'Read note.txt',
+        },
+      ],
+    };
+  };
+
+  const answer = await agent.run('检查子分支 planner transcript', () => {}, { conversationId: 'thread-child-tool-regression' });
+  assert.equal(answer, '已基于 note.txt 完成验证。');
+  assert.equal(sawChildPrompt, true);
+  assert.equal(sawPostToolPrompt, true);
+
+  agent.stop();
+});
+
+test('sanitizes leaked bracketed tool-call markup from final answers', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-tool-leak-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  installAgentTestDoubles(
+    agent,
+    () => '[TOOL_CALL]\n{tool => "web", args => { --query "OpenAI latest" }}\n[/TOOL_CALL]',
+  );
+
+  const answer = await agent.run('测试工具泄漏清洗', () => {}, { conversationId: 'thread-tool-leak' });
+  assert.doesNotMatch(answer, /\[TOOL_CALL\]/i);
+  assert.match(answer, /(不可安全展示|暂时没能生成可展示的回答)/);
+
+  agent.stop();
+});
+
+test('planner executes structured tool decisions directly', async () => {
   const projectRoot = createTempProjectRoot('mempedia-agent-pseudo-tool-call-');
   fs.writeFileSync(path.join(projectRoot, 'note.txt'), 'hello from note\n', 'utf-8');
 
@@ -211,19 +296,29 @@ test('normalizes pseudo tool_call planner output into a real tool execution', as
     selectedNodeIds: [],
     rationale: 'test',
   });
-  anyAgent.generateJsonPromptText = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+  anyAgent.generatePlannerDecision = async ({ messages }: { messages: Array<{ content?: string }> }) => {
     const joined = Array.isArray(messages)
       ? messages.map((message) => String(message?.content || '')).join('\n\n')
       : '';
     if (joined.includes('TOOL OBSERVATION for read:')) {
-      return JSON.stringify({
+      return {
         kind: 'final',
         thought: 'Done.',
         final_answer: '已读取 note 文件。',
         completion_summary: '已读取 note 文件。',
-      });
+      };
     }
-    return '```tool_call\n{"tool":"read","args":{"target":"workspace","path":"note.txt"},"goal":"Read the note file"}\n```';
+    return {
+      kind: 'tool',
+      thought: 'Read the workspace note.',
+      tool_calls: [
+        {
+          name: 'read',
+          arguments: { target: 'workspace', path: 'note.txt' },
+          goal: 'Read the note file',
+        },
+      ],
+    };
   };
 
   const traces: TraceEvent[] = [];

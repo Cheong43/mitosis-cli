@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { generateText, type LanguageModelV1 } from './llm.js';
 import { ToolAction } from '../mempedia/types.js';
+import { RpmLimiter } from '../utils/RpmLimiter.js';
 
 export interface MemoryClassifierTraceEvent {
   type: 'thought' | 'action' | 'observation' | 'error';
@@ -50,6 +51,7 @@ interface MemoryClassifierOptions {
   autoLinkEnabled: boolean;
   autoLinkMaxNodes: number;
   autoLinkLimit: number;
+  rpmLimiter?: RpmLimiter;
 }
 
 export interface MemoryClassifierContext {
@@ -75,6 +77,7 @@ export class MemoryClassifierAgent {
   private readonly autoLinkEnabled: boolean;
   private readonly autoLinkMaxNodes: number;
   private readonly autoLinkLimit: number;
+  private readonly rpmLimiter: RpmLimiter;
   private jsonObjectResponseFormatSupported = true;
 
   constructor(options: MemoryClassifierOptions) {
@@ -86,6 +89,7 @@ export class MemoryClassifierAgent {
     this.autoLinkEnabled = options.autoLinkEnabled;
     this.autoLinkMaxNodes = options.autoLinkMaxNodes;
     this.autoLinkLimit = options.autoLinkLimit;
+    this.rpmLimiter = options.rpmLimiter ?? new RpmLimiter(0);
   }
 
   async persist(job: MemoryClassifierJob, context: MemoryClassifierContext): Promise<void> {
@@ -407,17 +411,20 @@ export class MemoryClassifierAgent {
   }
 
   private async generateJsonPromptText(messages: Array<{ role: 'system' | 'user'; content: string }>): Promise<string> {
-    const run = (useJsonObject: boolean) => this.withTimeout(
-      generateText({
-        model: this.chatClient,
-        messages,
-        ...(useJsonObject
-          ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
-          : {}),
-      }),
-      this.memoryExtractTimeoutMs,
-      'memory extraction llm'
-    );
+    const run = async (useJsonObject: boolean) => {
+      await this.rpmLimiter.acquire();
+      return this.withTimeout(
+        generateText({
+          model: this.chatClient,
+          messages,
+          ...(useJsonObject
+            ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
+            : {}),
+        }),
+        this.memoryExtractTimeoutMs,
+        'memory extraction llm'
+      );
+    };
 
     try {
       const { text } = await run(this.jsonObjectResponseFormatSupported);

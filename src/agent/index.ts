@@ -2,7 +2,13 @@ import {
   buildLanguageModel,
   buildAnthropicLanguageModel,
   generateText,
+  generateToolCalls,
+  type ParseableFunctionTool,
   type LanguageModelV1,
+  type ChatMessage,
+  type ChatMessageContent,
+  type AnthropicMessageContentBlock,
+  type AnthropicToolResultContentBlock,
 } from './llm.js';
 import { MempediaClient } from '../mempedia/client.js';
 import { ToolAction } from '../mempedia/types.js';
@@ -32,11 +38,13 @@ import {
   estimateTranscriptTokens,
   compressTranscript,
   compressBranchTranscript,
+  checkContextAndCompress,
   getCompressionLevel,
   type ContextBudgetResult,
 } from './contextBudget.js';
 import { SessionCompressor, isRunExhausted } from './sessionCompressor.js';
 import { PlannerToolAdapter } from './PlannerToolAdapter.js';
+import { RpmLimiter } from '../utils/RpmLimiter.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -58,17 +66,81 @@ const PlannerBranchSchema = z.object({
   priority: z.number().min(0).max(1).optional(),
 });
 
-const PlannerDecisionSchema = z.object({
-  kind: z.enum(['tool', 'branch', 'final', 'skills']),
-  thought: z.string().trim().min(1),
-  tool_calls: z.array(PlannerToolCallSchema).optional(),
-  branches: z.array(PlannerBranchSchema).optional(),
-  skills_to_load: z.array(z.string().trim().min(1)).max(2).optional(),
-  final_answer: z.string().optional(),
+const PlannerThoughtSchema = z.string().trim().min(1);
+
+const PlannerToolDecisionSchema = z.object({
+  kind: z.literal('tool'),
+  thought: PlannerThoughtSchema,
+  tool_calls: z.array(PlannerToolCallSchema).min(1).max(5),
+});
+
+const PlannerBranchDecisionSchema = z.object({
+  kind: z.literal('branch'),
+  thought: PlannerThoughtSchema,
+  branches: z.array(PlannerBranchSchema).min(1).max(8),
+});
+
+const PlannerFinalDecisionSchema = z.object({
+  kind: z.literal('final'),
+  thought: PlannerThoughtSchema,
+  final_answer: z.string().trim().min(1),
   completion_summary: z.string().trim().min(1).max(280).optional(),
 });
 
+const PlannerSkillsDecisionSchema = z.object({
+  kind: z.literal('skills'),
+  thought: PlannerThoughtSchema,
+  skills_to_load: z.array(z.string().trim().min(1)).min(1).max(2),
+});
+
+const PlannerDecisionSchema = z.discriminatedUnion('kind', [
+  PlannerToolDecisionSchema,
+  PlannerBranchDecisionSchema,
+  PlannerFinalDecisionSchema,
+  PlannerSkillsDecisionSchema,
+]);
+
 type PlannerDecision = z.infer<typeof PlannerDecisionSchema>;
+type ExecutablePlannerDecision = Exclude<PlannerDecision, { kind: 'skills' }>;
+interface PlannerDecisionResult {
+  decision: PlannerDecision;
+  anthropicAssistantContent?: AnthropicMessageContentBlock[];
+  anthropicToolUseIds?: string[];
+}
+interface ExecutablePlannerDecisionResult extends Omit<PlannerDecisionResult, 'decision'> {
+  decision: ExecutablePlannerDecision;
+}
+type PlannerInvocation =
+  | { kind: 'work_tool'; tool_call: z.infer<typeof PlannerToolCallSchema> }
+  | { kind: 'control'; decision: PlannerDecision };
+
+const PLANNER_BRANCH_JSON_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    label: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 80,
+    },
+    goal: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 240,
+    },
+    why: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 240,
+    },
+    priority: {
+      type: 'number',
+      minimum: 0,
+      maximum: 1,
+    },
+  },
+  required: ['label', 'goal'],
+} as const;
 
 const ContextSelectionSchema = z.object({
   relevant_node_ids: z.array(z.string()).max(4).default([]),
@@ -79,7 +151,7 @@ type ContextSelection = z.infer<typeof ContextSelectionSchema>;
 
 interface BranchTranscriptMessage {
   role: 'user' | 'assistant';
-  content: string;
+  content: ChatMessageContent;
 }
 
 interface ContextCandidate {
@@ -104,8 +176,11 @@ interface BranchState {
   goal: string;
   priority: number;
   steps: number;
+  inheritedMessageCount: number;
   transcript: BranchTranscriptMessage[];
   savedNodeIds: string[];
+  pendingAnthropicAssistantContent?: AnthropicMessageContentBlock[] | null;
+  pendingAnthropicToolUseIds?: string[];
   completionSummary?: string;
   finalAnswer?: string;
 }
@@ -260,11 +335,10 @@ export class Agent {
   private readonly relationSearchMinScore: number;
   private readonly relationSearchLimit: number;
   private readonly relationMax: number;
-  private readonly branchMaxDepth: number;
   private readonly branchMaxWidth: number;
-  private readonly branchMaxSteps: number;
   private readonly branchMaxCompleted: number;
   private readonly branchConcurrency: number;
+  private readonly llmRpmLimiter: RpmLimiter;
   private readonly agentLlmTimeoutMs: number;
   private readonly plannerTemperature: number;
   private readonly responseTemperature: number;
@@ -346,16 +420,14 @@ export class Agent {
     this.relationSearchLimit = Number.isFinite(rawRelationSearchLimit) ? Math.max(1, Math.min(10, Math.floor(rawRelationSearchLimit))) : 3;
     const rawRelationMax = Number(process.env.MEMORY_RELATION_MAX ?? 6);
     this.relationMax = Number.isFinite(rawRelationMax) ? Math.max(0, Math.min(20, Math.floor(rawRelationMax))) : 6;
-    const rawBranchMaxDepth = Number(process.env.REACT_BRANCH_MAX_DEPTH ?? 2);
-    this.branchMaxDepth = Number.isFinite(rawBranchMaxDepth) ? Math.max(0, Math.min(6, Math.floor(rawBranchMaxDepth))) : 2;
-    const rawBranchMaxWidth = Number(process.env.REACT_BRANCH_MAX_WIDTH ?? 3);
-    this.branchMaxWidth = Number.isFinite(rawBranchMaxWidth) ? Math.max(1, Math.min(6, Math.floor(rawBranchMaxWidth))) : 3;
-    const rawBranchMaxSteps = Number(process.env.REACT_BRANCH_MAX_STEPS ?? 8);
-    this.branchMaxSteps = Number.isFinite(rawBranchMaxSteps) ? Math.max(2, Math.min(24, Math.floor(rawBranchMaxSteps))) : 8;
+    const rawBranchMaxWidth = Number(process.env.REACT_BRANCH_MAX_WIDTH ?? 5);
+    this.branchMaxWidth = Number.isFinite(rawBranchMaxWidth) ? Math.max(1, Math.min(10, Math.floor(rawBranchMaxWidth))) : 5;
     const rawBranchMaxCompleted = Number(process.env.REACT_BRANCH_MAX_COMPLETED ?? 4);
     this.branchMaxCompleted = Number.isFinite(rawBranchMaxCompleted) ? Math.max(1, Math.min(8, Math.floor(rawBranchMaxCompleted))) : 4;
-    const rawBranchConcurrency = Number(process.env.REACT_BRANCH_CONCURRENCY ?? 3);
-    this.branchConcurrency = Number.isFinite(rawBranchConcurrency) ? Math.max(1, Math.min(8, Math.floor(rawBranchConcurrency))) : 3;
+    const rawBranchConcurrency = Number(process.env.REACT_BRANCH_CONCURRENCY ?? 0);
+    this.branchConcurrency = Number.isFinite(rawBranchConcurrency) ? Math.max(0, Math.min(64, Math.floor(rawBranchConcurrency))) : 0;
+    const rawLlmRpm = Number(process.env.LLM_RPM_LIMIT ?? 0);
+    this.llmRpmLimiter = new RpmLimiter(Number.isFinite(rawLlmRpm) ? Math.max(0, Math.floor(rawLlmRpm)) : 0);
     const rawAgentLlmTimeoutMs = Number(process.env.AGENT_LLM_TIMEOUT_MS ?? 120000);
     this.agentLlmTimeoutMs = Number.isFinite(rawAgentLlmTimeoutMs) ? Math.max(5000, Math.floor(rawAgentLlmTimeoutMs)) : 120000;
     const rawPlannerTemperature = Number(process.env.PLANNER_TEMPERATURE ?? 0.1);
@@ -377,6 +449,7 @@ export class Agent {
       autoLinkEnabled: this.autoLinkEnabled,
       autoLinkMaxNodes: this.autoLinkMaxNodes,
       autoLinkLimit: this.autoLinkLimit,
+      rpmLimiter: this.llmRpmLimiter,
     });
     this.sessionCompressor = new SessionCompressor();
   }
@@ -411,6 +484,220 @@ export class Agent {
       && /(not supported|unsupported)/i.test(message);
   }
 
+  private buildPlannerWorkToolParameters(parameters: Record<string, unknown>): Record<string, unknown> {
+    const schema = (parameters && typeof parameters === 'object') ? parameters as Record<string, unknown> : {};
+    const rawProperties = schema.properties;
+    const properties = rawProperties && typeof rawProperties === 'object'
+      ? rawProperties as Record<string, unknown>
+      : {};
+    const required = Array.isArray(schema.required)
+      ? schema.required.filter((value): value is string => typeof value === 'string' && value !== 'goal')
+      : [];
+
+    return {
+      ...schema,
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        ...properties,
+        goal: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 240,
+        },
+      },
+      required,
+    };
+  }
+
+  private parsePlannerWorkToolInvocation(
+    toolName: z.infer<typeof PlannerToolNameSchema>,
+    input: unknown,
+  ): PlannerInvocation {
+    const record = input && typeof input === 'object' && !Array.isArray(input)
+      ? input as Record<string, unknown>
+      : {};
+    const { goal, ...argumentsRecord } = record;
+    return {
+      kind: 'work_tool',
+      tool_call: PlannerToolCallSchema.parse({
+        name: toolName,
+        arguments: argumentsRecord,
+        ...(typeof goal === 'string' && goal.trim() ? { goal: goal.trim() } : {}),
+      }),
+    };
+  }
+
+  private derivePlannerToolThought(text: string, toolCalls: Array<z.infer<typeof PlannerToolCallSchema>>): string {
+    const normalizedText = this.clipText(String(text || '').replace(/\s+/g, ' ').trim(), 280);
+    if (normalizedText) {
+      return normalizedText;
+    }
+    const goalSummary = this.clipText(
+      toolCalls
+        .map((toolCall) => toolCall.goal?.trim())
+        .filter((goal): goal is string => Boolean(goal))
+        .join(' | '),
+      280,
+    );
+    if (goalSummary) {
+      return goalSummary;
+    }
+    return `Continue with ${toolCalls.map((toolCall) => toolCall.name).join(', ')}.`;
+  }
+
+  private buildPlannerDecisionTools(allowBranching: boolean): Array<ParseableFunctionTool<PlannerInvocation>> {
+    const tools: Array<ParseableFunctionTool<PlannerInvocation>> = TOOLS.map((tool) => {
+      const toolName = tool.function.name as z.infer<typeof PlannerToolNameSchema>;
+      return {
+        name: toolName,
+        description: tool.function.description,
+        parameters: this.buildPlannerWorkToolParameters(tool.function.parameters),
+        parse: (input) => this.parsePlannerWorkToolInvocation(toolName, input),
+      };
+    });
+
+    tools.push(
+      {
+        name: 'planner_final',
+        description: 'Finish the run with a direct user-facing answer.',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            thought: {
+              type: 'string',
+              minLength: 1,
+            },
+            final_answer: {
+              type: 'string',
+              minLength: 1,
+            },
+            completion_summary: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 280,
+            },
+          },
+          required: ['thought', 'final_answer'],
+        },
+        parse: (input) => ({
+          kind: 'control',
+          decision: PlannerFinalDecisionSchema.parse({ kind: 'final', ...(input as Record<string, unknown>) }),
+        }),
+      },
+      {
+        name: 'planner_skills',
+        description: 'Load one or two local skills before making the next planning decision.',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            thought: {
+              type: 'string',
+              minLength: 1,
+            },
+            skills_to_load: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 2,
+              items: {
+                type: 'string',
+                minLength: 1,
+              },
+            },
+          },
+          required: ['thought', 'skills_to_load'],
+        },
+        parse: (input) => ({
+          kind: 'control',
+          decision: PlannerSkillsDecisionSchema.parse({ kind: 'skills', ...(input as Record<string, unknown>) }),
+        }),
+      },
+    );
+
+    if (allowBranching) {
+      tools.push({
+        name: 'planner_branch',
+        description: 'Split the work into distinct independent child loops that should be explored in parallel.',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            thought: {
+              type: 'string',
+              minLength: 1,
+            },
+            branches: {
+              type: 'array',
+              minItems: 1,
+              maxItems: this.branchMaxWidth,
+              items: PLANNER_BRANCH_JSON_SCHEMA,
+            },
+          },
+          required: ['thought', 'branches'],
+        },
+        parse: (input) => ({
+          kind: 'control',
+          decision: PlannerBranchDecisionSchema.parse({ kind: 'branch', ...(input as Record<string, unknown>) }),
+        }),
+      });
+    }
+
+    return tools;
+  }
+
+  private async generatePlannerDecision(options: {
+    messages: ChatMessage[];
+    timeoutMs: number;
+    timeoutLabel: string;
+    temperature?: number;
+    allowBranching: boolean;
+  }): Promise<PlannerDecisionResult> {
+    await this.llmRpmLimiter.acquire();
+    const { calls, text, providerMessage } = await this.withTimeout(
+      generateToolCalls({
+        model: this.openai,
+        messages: options.messages,
+        tools: this.buildPlannerDecisionTools(options.allowBranching),
+        temperature: options.temperature,
+        maxTokens: 2400,
+      }),
+      options.timeoutMs,
+      options.timeoutLabel,
+    );
+    const controlDecisions = calls
+      .filter((call): call is { name: string; input: Extract<PlannerInvocation, { kind: 'control' }> } => call.input.kind === 'control')
+      .map((call) => call.input.decision);
+    const workToolCalls = calls
+      .filter((call): call is { name: string; input: Extract<PlannerInvocation, { kind: 'work_tool' }> } => call.input.kind === 'work_tool')
+      .map((call) => call.input.tool_call);
+
+    if (controlDecisions.length > 0 && workToolCalls.length > 0) {
+      throw new Error('Planner mixed control tools with direct work tools in one response.');
+    }
+    if (controlDecisions.length > 1) {
+      throw new Error('Planner emitted multiple control tools in one response.');
+    }
+    if (controlDecisions.length === 1) {
+      return { decision: controlDecisions[0] };
+    }
+    if (workToolCalls.length > 0) {
+      return {
+        decision: {
+          kind: 'tool',
+          thought: this.derivePlannerToolThought(text, workToolCalls),
+          tool_calls: workToolCalls,
+        },
+        anthropicAssistantContent: providerMessage?.anthropicAssistantContent,
+        anthropicToolUseIds: calls
+          .map((call) => call.providerToolUseId)
+          .filter((value): value is string => typeof value === 'string' && value.trim().length > 0),
+      };
+    }
+    throw new Error('Planner emitted no actionable tool calls.');
+  }
+
   private async generateJsonPromptText(options: {
     model: LanguageModelV1;
     messages: any;
@@ -419,19 +706,22 @@ export class Agent {
     temperature?: number;
     onFallback?: () => void | Promise<void>;
   }): Promise<string> {
-    const run = (messages: any, useJsonObject: boolean) => this.withTimeout(
-      generateText({
-        model: options.model,
-        messages,
-        temperature: options.temperature ?? this.plannerTemperature,
-        maxTokens: 2400,
-        ...(useJsonObject
-          ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
-          : {}),
-      }),
-      options.timeoutMs,
-      options.timeoutLabel,
-    );
+    const run = async (messages: any, useJsonObject: boolean) => {
+      await this.llmRpmLimiter.acquire();
+      return this.withTimeout(
+        generateText({
+          model: options.model,
+          messages,
+          temperature: options.temperature ?? this.plannerTemperature,
+          maxTokens: 2400,
+          ...(useJsonObject
+            ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
+            : {}),
+        }),
+        options.timeoutMs,
+        options.timeoutLabel,
+      );
+    };
 
     const maybeRepairInvalidJsonReply = async (text: string, useJsonObject: boolean): Promise<string> => {
       if (this.hasParseableJsonishPayload(text) || !Array.isArray(options.messages)) {
@@ -818,6 +1108,30 @@ export class Agent {
     return current;
   }
 
+  private containsInternalToolMarkup(raw: string): boolean {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) {
+      return false;
+    }
+    return /<Function::[a-z0-9_:-]+>/i.test(trimmed)
+      || /<\/Function>/i.test(trimmed)
+      || /\[TOOL_CALL\]/i.test(trimmed)
+      || /\[\/TOOL_CALL\]/i.test(trimmed)
+      || /```tool_call/i.test(trimmed)
+      || /^tool_call\s*$/im.test(trimmed);
+  }
+
+  private sanitizeUserFacingAnswer(answer: string, fallback = ''): string {
+    const normalized = this.normalizeUserFacingAnswer(answer);
+    if (!normalized) {
+      return fallback.trim();
+    }
+    if (this.containsInternalToolMarkup(normalized) || this.looksLikeNonUserFacingPlannerOutput(normalized)) {
+      return fallback.trim();
+    }
+    return normalized;
+  }
+
   private hasParseableJsonishPayload(raw: string): boolean {
     const trimmed = String(raw || '').trim();
     if (!trimmed) {
@@ -841,51 +1155,19 @@ export class Agent {
     if (!trimmed) {
       return false;
     }
+    if (this.containsInternalToolMarkup(trimmed)) {
+      return true;
+    }
     if (/^```[\s\S]*```$/u.test(trimmed)) {
       return true;
     }
     if (/^\s*[{[][\s\S]*[}\]]\s*$/u.test(trimmed) && !this.hasParseableJsonishPayload(trimmed)) {
       return true;
     }
+    if (/^PLANNER (?:TOOL|BRANCH|FINAL|SKILLS)\b/im.test(trimmed)) {
+      return true;
+    }
     return /(^|\n)\s*(find|ls|cat|grep|rg|echo|printf|cd|pwd|npm|pnpm|yarn|cargo|python|python3|node|git|curl|BIN=|\[\[)\b/m.test(trimmed);
-  }
-
-  private buildPlannerFallbackFinalAnswer(raw: string, looksLikePromptEcho: boolean): string {
-    if (looksLikePromptEcho || !raw.trim()) {
-      return '抱歉，刚才内部规划结果格式异常，没有生成可展示的回答。请重试一次。';
-    }
-    if (this.looksLikeNonUserFacingPlannerOutput(raw)) {
-      return '抱歉，刚才内部规划器输出成了命令或草稿，而不是正式答复。我没有继续把那段代码直接返回给你。请重试一次；如果你愿意，我也可以继续根据上一步结果接着处理。';
-    }
-    // If the raw text looks like a natural-language answer (not JSON, not code,
-    // not a prompt echo), use it directly instead of losing the content.
-    const stripped = raw.replace(/^```[\s\S]*?```$/gm, '').trim();
-    if (stripped.length >= 20) {
-      return stripped;
-    }
-    return '抱歉，刚才内部规划结果格式异常，没有生成可展示的自然语言回答。请重试一次。';
-  }
-
-  private isPlannerFormatFallbackAnswer(answer: string): boolean {
-    const normalized = String(answer || '').trim();
-    if (!normalized) {
-      return false;
-    }
-    return normalized.includes('内部规划结果格式异常')
-      || normalized.includes('内部规划器输出成了命令或草稿');
-  }
-
-  private buildPlannerSchemaRepairPrompt(): string {
-    return [
-      'Your previous planner reply could not be normalized into the required planner schema.',
-      'Reply again with exactly one JSON object and nothing else.',
-      'Allowed shapes only:',
-      '{"kind":"tool","thought":"...","tool_calls":[{"name":"read|search|edit|bash|web","arguments":{},"goal":"optional"}]}',
-      '{"kind":"branch","thought":"...","branches":[{"label":"...","goal":"...","why":"optional","priority":0.5}]}',
-      '{"kind":"final","thought":"...","final_answer":"...","completion_summary":"optional"}',
-      '{"kind":"skills","thought":"...","skills_to_load":["skill-name"]}',
-      'No markdown fences. No prose before or after the JSON. Do not output raw shell commands unless they are inside tool_calls[].arguments.command.',
-    ].join('\n');
   }
 
   private extractFinalAnswerFromJsonPayload(raw: string): string | null {
@@ -1762,57 +2044,6 @@ export class Agent {
     return lines.join('\n');
   }
 
-  private normalizeLegacyToolCallProbe(
-    toolNameRaw: unknown,
-    rawArgs: unknown,
-    rawGoal: unknown,
-  ): z.infer<typeof PlannerToolCallSchema> | null {
-    const toolName = typeof toolNameRaw === 'string' ? toolNameRaw.trim() : '';
-    if (!toolName) {
-      return null;
-    }
-    const args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
-      ? { ...(rawArgs as Record<string, unknown>) }
-      : {};
-    const goal = typeof rawGoal === 'string' && rawGoal.trim()
-      ? rawGoal.trim().slice(0, 240)
-      : undefined;
-
-    if (TOOL_NAMES.includes(toolName as any)) {
-      return { name: toolName as z.infer<typeof PlannerToolNameSchema>, arguments: args, ...(goal ? { goal } : {}) };
-    }
-
-    const pseudoKind = String(args['--kind'] || args.kind || '').trim().toLowerCase();
-    const pseudoQuery = args['--query'] ?? args.query;
-    const pseudoUrl = args['--url'] ?? args.url;
-    const pseudoLimit = Number(args['--limit'] ?? args.limit ?? 6);
-
-    if ((toolName === 'search' || toolName === 'web_search' || pseudoKind === 'web_search') && typeof pseudoQuery === 'string' && pseudoQuery.trim()) {
-      return {
-        name: 'web',
-        arguments: {
-          mode: 'search',
-          query: pseudoQuery.trim(),
-          limit: Number.isFinite(pseudoLimit) ? Math.max(1, Math.min(10, Math.floor(pseudoLimit))) : 6,
-        },
-        ...(goal ? { goal } : {}),
-      };
-    }
-
-    if ((toolName === 'fetch' || toolName === 'web_fetch' || pseudoKind === 'web_fetch') && typeof pseudoUrl === 'string' && pseudoUrl.trim()) {
-      return {
-        name: 'web',
-        arguments: {
-          mode: 'fetch',
-          url: pseudoUrl.trim(),
-        },
-        ...(goal ? { goal } : {}),
-      };
-    }
-
-    return null;
-  }
-
   private isTrivialMemoryCandidate(text: string): boolean {
     const compact = text.replace(/\s+/g, ' ').trim().toLowerCase();
     if (!compact) {
@@ -2653,9 +2884,10 @@ Treat ReAct as a functional loop. A branch is an independent child loop with its
 
 BRANCHING PHILOSOPHY:
 Before deciding on any action, first ask: "Can this goal be decomposed into independent sub-goals that are worth exploring in parallel?"
-If yes, prefer kind="branch" over a single sequential kind="tool" step.
+If yes, prefer the control tool named planner_branch over direct work-tool calls.
 Decompose aggressively — many goals that appear simple on the surface have multiple angles (different sources, different sub-tasks, alternative strategies, independent file locations, etc.) that benefit from concurrent exploration.
-However, only branch when branches are genuinely distinct. If two branches would perform the exact same work or one is strictly a prerequisite of the other, do NOT split them — use kind="tool" sequentially instead.
+In branching mode, default toward planner_branch on the first meaningful step whenever the task can be decomposed into independent parts or there are multiple plausible independent avenues to explore. Only skip branching when the next action is clearly atomic and parallel exploration would not help.
+However, only branch when branches are genuinely distinct. If two branches would perform the exact same work or one is strictly a prerequisite of the other, do NOT split them — call the needed work tool directly instead.
 
 You only use five top-level tools:
   read   -> read semantic targets such as workspace files, memory nodes, preferences, or skills
@@ -2677,56 +2909,45 @@ When you save knowledge, prefer markdown-first notes that preserve concrete fact
     Separate facts from opinions or viewpoints. Never fabricate facts; if something is uncertain, attribute it or mark it as uncertain.
 
 
-Allowed JSON schema:
-{
-  "kind": "tool" | "branch" | "final" | "skills",
-  "thought": "string",
-  "skills_to_load": ["skill-name"],
-  "tool_calls": [{ "name": "tool_name", "arguments": {}, "goal": "optional" }],
-  "branches": [{ "label": "short label", "goal": "what this child branch should try", "why": "optional", "priority": 0.0 }],
-  "final_answer": "string",
-  "completion_summary": "optional short summary"
-}
-
-STRICT OUTPUT CONTRACT:
-- Return exactly one JSON object.
-- Start the reply with "{" and end it with "}".
-- Do not wrap the JSON in Markdown fences.
-- Do not add explanation text before or after the JSON object.
-- Do not output raw shell commands, pseudo-code, or checklists as the top-level reply.
-- If you need to show commands to the user, place them inside "final_answer" as a JSON string.
-
-VALID EXAMPLES:
-{"kind":"tool","thought":"Use web search first.","tool_calls":[{"name":"web","arguments":{"mode":"search","query":"Ryan Gosling review","limit":5},"goal":"Gather current external evidence."}]}
-{"kind":"branch","thought":"The task has independent parts that benefit from parallel exploration.","branches":[{"label":"Chinese sources","goal":"Search Chinese financial news channels","priority":0.8},{"label":"English sources","goal":"Search English financial news channels","priority":0.8}]}
-{"kind":"final","thought":"Enough evidence is available.","final_answer":"我查到的主流评价是正面的。"}
+CONTROL TOOLS:
+- planner_branch: split the work into distinct independent child loops.
+- planner_final: finish with a direct user-facing answer in final_answer.
+- planner_skills: request full guidance for one or two local skills before continuing.
+- For normal work, call read/search/edit/bash/web directly.
+- Your response must be one or more tool calls. Never reply with plain text or raw JSON.
+- Never mix control tools with direct work-tool calls in the same response.
 
 Rules:
-1. DECOMPOSE FIRST: Before executing any single tool call, ask "can this goal be split into independent sub-goals?" If yes, return kind="branch" instead of kind="tool". Only fall back to kind="tool" when the next action is atomic and cannot be meaningfully parallelised.
-2. Use kind="branch" liberally for: (a) independent sub-tasks within a goal, (b) parallel information gathering from different sources, (c) alternative strategies or hypotheses to evaluate concurrently, (d) different files/modules/topics that can be researched simultaneously, (e) multi-part user requests where parts do not depend on each other.
-3. Each branch must have a genuinely distinct purpose and a different goal string. Do NOT branch when: both branches would issue the same tool call, one branch is a strict prerequisite of the other, or the task is a single atomic read/write/search. Redundant or near-duplicate branches waste budget and degrade quality.
-4. Never create more than ${this.branchMaxWidth} child branches in one step. Aim for 2–${this.branchMaxWidth} well-scoped branches rather than one monolithic sequential thread.
-5. Prefer search before edit when the correct answer may already exist in repository files.
-6. For repository discovery, prefer read and search on workspace evidence before using web.
-7. Prefer relative file paths rooted at the current project. Use absolute paths only when necessary for clarity or when the tool requires them.
-8. The skill catalog is lightweight; request full skill guidance only when it materially changes the next step.
-9. Do not answer a project-overview question by listing local skills unless the user explicitly asked about the skill system.
-10. Use bash whenever shell is the practical tool, but remember dangerous shell operations are sandboxed and should require confirmation.
-11. Use web for questions about external topics, current events, APIs, libraries, or anything not answerable from workspace files. Prefer workspace evidence only for project-specific questions. When web search returns results, read the snippet field first — only fetch a page if the snippet is insufficient.
-11a. web mode=search returns {title, url, snippet} — use snippets to decide which results are relevant before fetching full pages.
-11b. When you need current/external information, use web proactively — do not guess or rely on training data when a quick search would give a definitive answer.
-12. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
-13. When you finish, return kind="final" with a direct user-facing answer.
-18. NEVER use \`edit target=workspace\` to write directly into raw \`.mempedia\` storage. Use semantic targets instead: \`target=memory\`, \`target=preferences\`, or \`target=skills\`.
-14. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via kind="skills". For other skills in the catalog whose description overlaps with the task, return kind="skills" to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to kind="tool" or kind="branch".
-15. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
-16. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
-17. If the user asks what is in Mempedia or what skills are available, prefer \`search/read\` with \`target=memory\` or \`target=skills\` before final_answer.
-19. NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value. Saving a greeting or one-liner response wastes storage and pollutes search results.
+1. DECOMPOSE FIRST: Before executing any single tool call, ask "can this goal be split into independent sub-goals?" If yes, call planner_branch instead of direct work tools. Only fall back to direct work-tool calls when the next action is atomic and cannot be meaningfully parallelised.
+2. DEFAULT TO BRANCHING: In branch mode, start with planner_branch whenever the task can be split into independent sub-problems or there are multiple plausible independent approaches, hypotheses, evidence sources, or workstreams worth exploring. If the next action is obviously atomic, direct work tools are fine.
+3. Use planner_branch liberally for: (a) independent sub-tasks within a goal, (b) parallel information gathering from different sources, (c) alternative strategies or hypotheses to evaluate concurrently, (d) different files/modules/topics that can be researched simultaneously, (e) multi-part user requests where parts do not depend on each other.
+4. Each branch must have a genuinely distinct purpose and a different goal string. Do NOT branch when: both branches would issue the same tool call, one branch is a strict prerequisite of the other, or the task is a single atomic read/write/search. Redundant or near-duplicate branches waste budget and degrade quality.
+4a. Inside an existing child branch, if the child goal can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing batches of direct work tools.
+5. Never create more than ${this.branchMaxWidth} child branches in one step. Aim for 2–${this.branchMaxWidth} well-scoped branches rather than one monolithic sequential thread.
+6. Prefer search before edit when the correct answer may already exist in repository files.
+7. For repository discovery, prefer read and search on workspace evidence before using web.
+8. Prefer relative file paths rooted at the current project. Use absolute paths only when necessary for clarity or when the tool requires them.
+9. The skill catalog is lightweight; request full skill guidance only when it materially changes the next step.
+10. Do not answer a project-overview question by listing local skills unless the user explicitly asked about the skill system.
+11. Use bash whenever shell is the practical tool, but remember dangerous shell operations are sandboxed and should require confirmation.
+12. Use web for questions about external topics, current events, APIs, libraries, or anything not answerable from workspace files. Prefer workspace evidence only for project-specific questions. When web search returns results, read the snippet field first — only fetch a page if the snippet is insufficient.
+12a. web mode=search returns {title, url, snippet} — use snippets to decide which results are relevant before fetching full pages.
+12b. When you need current/external information, use web proactively — do not guess or rely on training data when a quick search would give a definitive answer.
+12bb. If you issue multiple web/search calls in one response, each one must target a genuinely different evidence stream or hypothesis. Do not emit paraphrased or near-duplicate queries that chase the same evidence.
+12c. When a web search is weak, noisy, or repetitive, change strategy materially before searching again. Vary keywords, aliases, dates, source types, domains, languages, jurisdictions, or fetch a promising result instead of issuing another broad near-duplicate search.
+12d. Avoid near-duplicate web searches. After 2-3 consecutive web/search rounds without clear new information, you MUST either call planner_final using the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy. Do not continue the same-category search loop.
+13. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
+14. When you finish, call planner_final with a direct user-facing answer.
+15. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via planner_skills. For other skills in the catalog whose description overlaps with the task, call planner_skills to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to read/search/edit/bash/web or planner_branch.
+16. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
+17. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
+18. If the user asks what is in Mempedia or what skills are available, prefer \`search/read\` with \`target=memory\` or \`target=skills\` before final_answer.
+19. NEVER use \`edit target=workspace\` to write directly into raw \`.mempedia\` storage. Use semantic targets instead: \`target=memory\`, \`target=preferences\`, or \`target=skills\`.
+20. NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value. Saving a greeting or one-liner response wastes storage and pollutes search results.
 ${alwaysIncludeBlock ? `
 ${alwaysIncludeBlock}
 
-IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool_calls.arguments.command — they are NOT the planner response format. Your planner response must always follow the JSON schema above (kind/thought/tool_calls/etc.).
+IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool-call arguments — they are NOT the planner response format. Your planner response must always be tool calls, never plain text.
 ` : ''}
 Available tools:
 ${toolCatalog}
@@ -2763,32 +2984,16 @@ When you save knowledge, prefer markdown-first notes that preserve concrete fact
     Separate facts from opinions or viewpoints. Never fabricate facts; if something is uncertain, attribute it or mark it as uncertain.
 
 
-Allowed JSON schema:
-{
-  "kind": "tool" | "final" | "skills",
-  "thought": "string",
-  "skills_to_load": ["skill-name"],
-  "tool_calls": [{ "name": "tool_name", "arguments": {}, "goal": "optional" }],
-  "final_answer": "string",
-  "completion_summary": "optional short summary"
-}
-
-STRICT OUTPUT CONTRACT:
-- Return exactly one JSON object.
-- Start the reply with "{" and end it with "}".
-- Do not wrap the JSON in Markdown fences.
-- Do not add explanation text before or after the JSON object.
-- Do not output raw shell commands, pseudo-code, or checklists as the top-level reply.
-- If you need to show commands to the user, place them inside "final_answer" as a JSON string.
-- NEVER use kind="branch". You are in classic ReAct mode — always pick one tool at a time.
-
-VALID EXAMPLES:
-{"kind":"tool","thought":"Use web search first.","tool_calls":[{"name":"web","arguments":{"mode":"search","query":"Ryan Gosling review","limit":5},"goal":"Gather current external evidence."}]}
-{"kind":"final","thought":"Enough evidence is available.","final_answer":"我查到的主流评价是正面的。"}
+Planner decision kinds:
+- planner_final: finish with a direct user-facing answer in final_answer.
+- planner_skills: request full guidance for one or two local skills before continuing.
+- NEVER call planner_branch in classic ReAct mode.
+- For normal work, call exactly one direct work tool: read/search/edit/bash/web.
+- Your response must be exactly one tool call. Never reply with plain text or raw JSON.
 
 Rules:
-1. Always use kind="tool" with exactly one tool call when you need more information.
-2. Do NOT use kind="branch" — you are running in classic sequential ReAct mode.
+1. Always use exactly one direct work-tool call when you need more information.
+2. Do NOT call planner_branch — you are running in classic sequential ReAct mode.
 3. Prefer search before edit when the correct answer may already exist in repository files.
 4. For repository discovery, prefer read and search on workspace evidence before using web.
 5. Prefer relative file paths rooted at the current project. Use absolute paths only when necessary for clarity or when the tool requires them.
@@ -2798,10 +3003,12 @@ Rules:
 9. Use web for questions about external topics, current events, APIs, libraries, or anything not answerable from workspace files. Prefer workspace evidence only for project-specific questions. When web search returns results, read the snippet field first — only fetch a page if the snippet is insufficient.
 9a. web mode=search returns {title, url, snippet} — use snippets to decide which results are relevant before fetching full pages.
 9b. When you need current/external information, use web proactively — do not guess or rely on training data when a quick search would give a definitive answer.
+9c. When a web search is weak, noisy, or repetitive, change strategy materially before searching again. Vary keywords, aliases, dates, source types, domains, languages, jurisdictions, or fetch a promising result instead of issuing another broad near-duplicate search.
+9d. Avoid near-duplicate web searches. After 2-3 consecutive web/search rounds without clear new information, you MUST either call planner_final using the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy. Do not continue the same-category search loop.
 10. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
-11. When you finish, return kind="final" with a direct user-facing answer.
+11. When you finish, call planner_final with a direct user-facing answer.
 12. NEVER use \`edit target=workspace\` to write directly into raw \`.mempedia\` storage. Use semantic targets instead: \`target=memory\`, \`target=preferences\`, or \`target=skills\`.
-13. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via kind="skills". For other skills in the catalog whose description overlaps with the task, return kind="skills" to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to kind="tool".
+13. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via planner_skills. For other skills in the catalog whose description overlaps with the task, call planner_skills to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to read/search/edit/bash/web.
 14. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
 15. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
 16. If the user asks what is in Mempedia or what skills are available, prefer \`search/read\` with \`target=memory\` or \`target=skills\` before final_answer.
@@ -2809,7 +3016,7 @@ Rules:
 ${alwaysIncludeBlock ? `
 ${alwaysIncludeBlock}
 
-IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool_calls.arguments.command — they are NOT the planner response format. Your planner response must always follow the JSON schema above (kind/thought/tool_calls/etc.).
+IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool-call arguments — they are NOT the planner response format. Your planner response must always be exactly one tool call.
 ` : ''}
 Available tools:
 ${toolCatalog}
@@ -2836,17 +3043,9 @@ ${soulsGuidance}
     });
     emitTrace({
       type: 'observation',
-      content: `Context budget: model=${this.model} limit=${ctxBudget.modelLimit} committed=${ctxBudget.committedTokens} residual=${ctxBudget.residualBudget} → maxSteps=${ctxBudget.maxSteps} depth=${ctxBudget.maxBranchDepth} width=${ctxBudget.maxBranchWidth} totalSteps=${ctxBudget.maxTotalSteps} transcriptChars=${ctxBudget.transcriptBudgetChars} agentMode=${agentMode} [dynamic-budget: ON, compress@92%]`,
+      content: `Context budget: model=${this.model} limit=${ctxBudget.modelLimit} committed=${ctxBudget.committedTokens} residual=${ctxBudget.residualBudget} transcriptChars=${ctxBudget.transcriptBudgetChars} agentMode=${agentMode} rpm=${this.llmRpmLimiter.disabled ? 'unlimited' : process.env.LLM_RPM_LIMIT} [per-branch context compression]`,
     });
 
-    // Effective parameters: take the minimum of env-configured and budget-computed values.
-    const effectiveMaxSteps = Math.min(this.branchMaxSteps, ctxBudget.maxSteps);
-    const effectiveMaxDepth = Math.min(this.branchMaxDepth, ctxBudget.maxBranchDepth);
-    const effectiveMaxWidth = Math.min(this.branchMaxWidth, ctxBudget.maxBranchWidth);
-    const effectiveMaxTotalSteps = Math.min(
-      this.branchMaxSteps * this.branchMaxWidth * (this.branchMaxDepth + 1),
-      ctxBudget.maxTotalSteps,
-    );
     const effectiveTranscriptBudgetChars = ctxBudget.transcriptBudgetChars;
 
     const extractText = (content: any): string => {
@@ -2858,8 +3057,16 @@ ${soulsGuidance}
           if (typeof item === 'string') {
             return item;
           }
-          if (item && typeof item === 'object' && typeof item.text === 'string') {
-            return item.text;
+          if (item && typeof item === 'object') {
+            if (typeof item.text === 'string') {
+              return item.text;
+            }
+            if (typeof item.thinking === 'string') {
+              return item.thinking;
+            }
+            if (typeof item.content === 'string') {
+              return item.content;
+            }
           }
           return JSON.stringify(item);
         }).join('\n');
@@ -2872,7 +3079,7 @@ ${soulsGuidance}
 
     const loadedSkillMarker = 'SKILL ROUTER LOAD:';
 
-    const getLoadedSkillNames = (transcript: Array<{ role: string; content: string }>) => {
+    const getLoadedSkillNames = (transcript: Array<{ role: string; content: ChatMessageContent }>) => {
       // Always-active skills are pre-loaded in the system prompt; treat them as already loaded.
       const loaded = new Set<string>(alwaysIncludeSkills.map((s) => s.name.toLowerCase()));
       for (const message of transcript) {
@@ -2897,7 +3104,7 @@ ${soulsGuidance}
     };
 
     const appendSkillGuidance = (
-      transcript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+      transcript: ChatMessage[],
       skillsToInject: SkillRecord[],
     ) => {
       if (skillsToInject.length === 0) {
@@ -2909,12 +3116,12 @@ ${soulsGuidance}
         { role: 'assistant' as const, content: `${loadedSkillMarker} Loaded skills: ${names}` },
         {
           role: 'user' as const,
-          content: `Skill Router loaded the following full guidance because you requested it:\n\n${renderSkillGuidance(skillsToInject)}\n\nContinue the current ReAct step and return exactly one JSON object.`
+          content: `Skill Router loaded the following full guidance because you requested it:\n\n${renderSkillGuidance(skillsToInject)}\n\nContinue the current ReAct step by calling tool(s), not plain text. Use read/search/edit/bash/web directly for work, and use planner_final or planner_branch only for control flow.`
         },
       ];
     };
 
-    const buildEvidenceFirstFallbackDecision = (): PlannerDecision | null => {
+    const buildEvidenceFirstFallbackDecision = (): ExecutablePlannerDecision | null => {
       const toolCalls: Array<z.infer<typeof PlannerToolCallSchema>> = [];
       if (asksAboutLocalSkills) {
         toolCalls.push({
@@ -2968,232 +3175,59 @@ ${soulsGuidance}
       emitTrace({ type, content, metadata: traceMeta(branch, extra) });
     };
 
-    const parseDecision = (raw: string): PlannerDecision => {
-      const rawTrimmed = raw.trim();
-      // Diagnostic: log every planner raw output for debugging parse failures.
-      emitTrace({ type: 'observation', content: `[planner-raw] ${rawTrimmed.slice(0, 500)}${rawTrimmed.length > 500 ? '...[truncated]' : ''}` });
-      const candidates = extractJsonishCandidates(raw);
-      let normalized: Record<string, unknown> | null = null;
-
-      for (const candidate of candidates) {
-        let parsed: unknown;
-        try {
-          parsed = parseJsonish(candidate);
-        } catch {
-          continue;
-        }
-        const obj = Array.isArray(parsed) ? (parsed[0] || {}) : parsed;
-        if (!obj || typeof obj !== 'object') {
-          continue;
-        }
-        const probe: Record<string, unknown> = { ...obj as Record<string, unknown> };
-        const legacyToolCall = this.normalizeLegacyToolCallProbe(
-          probe.tool ?? probe.tool_name ?? probe.name,
-          probe.args ?? probe.arguments,
-          probe.goal ?? probe.reason,
-        );
-        if (legacyToolCall && !Array.isArray(probe.tool_calls)) {
-          probe.kind = 'tool';
-          probe.tool_calls = [legacyToolCall];
-        }
-        const VALID_KINDS = new Set(['tool', 'branch', 'final', 'skills']);
-        const rawKind = typeof probe.kind === 'string' ? probe.kind.trim().toLowerCase() : null;
-        const inferredKind = rawKind && VALID_KINDS.has(rawKind)
-          ? rawKind
-          : rawKind && !VALID_KINDS.has(rawKind) && (Array.isArray(probe.tool_calls) || TOOL_NAMES.includes(rawKind as any))
-            ? 'tool'
-          : Array.isArray(probe.skills_to_load) && probe.skills_to_load.length > 0
-            ? 'skills'
-          : typeof probe.final_answer === 'string' || typeof probe.finalAnswer === 'string' || typeof probe.answer === 'string' || typeof probe.content === 'string'
-            ? 'final'
-            : Array.isArray(probe.tool_calls)
-              ? 'tool'
-              : Array.isArray(probe.branches)
-                ? 'branch'
-                : null;
-        if (!inferredKind) {
-          continue;
-        }
-        probe.kind = inferredKind;
-        if (inferredKind === 'final') {
-          const finalAnswer = [probe.final_answer, probe.finalAnswer, probe.answer, probe.content]
-            .find((value) => typeof value === 'string' && value.trim().length > 0);
-          if (typeof finalAnswer !== 'string') {
-            continue;
-          }
-          probe.final_answer = this.normalizeUserFacingAnswer(finalAnswer);
-        }
-        if (inferredKind === 'tool' && (!Array.isArray(probe.tool_calls) || probe.tool_calls.length === 0)) {
-          continue;
-        }
-        if (inferredKind === 'branch' && (!Array.isArray(probe.branches) || probe.branches.length === 0)) {
-          continue;
-        }
-        if (inferredKind === 'skills' && (!Array.isArray(probe.skills_to_load) || probe.skills_to_load.length === 0)) {
-          continue;
-        }
-        normalized = probe;
-        break;
+    const summarizePlannerDecision = (decision: PlannerDecision): string => {
+      if (decision.kind === 'tool') {
+        const names = decision.tool_calls.map((toolCall) => toolCall.name).join(',');
+        return `[planner] kind=tool tools=${names}`;
       }
-
-      if (!normalized) {
-        const looksLikePromptEcho = /Original user request:|Current branch state:|MEMPEDIA_BINARY_PATH|list_skills|record_episodic/i.test(rawTrimmed)
-          || (/agent_upsert_markdown/i.test(rawTrimmed) && !/"name"\s*:\s*"bash"/i.test(rawTrimmed));
-        // Log raw output to stderr for diagnosis.
-        process.stderr.write(`[parseDecision] no valid structured decision (looksLikePromptEcho=${looksLikePromptEcho}). Raw preview: ${rawTrimmed.slice(0, 400)}\n`);
-        // Detect mempedia-action JSON output: model confused by skill examples and
-        // output {"action":"agent_upsert_markdown",...} instead of planner JSON.
-        // Wrap it as a bash tool call so the action still executes.
-        if (!looksLikePromptEcho && rawTrimmed.startsWith('{')) {
-          try {
-            const maybeAction = JSON.parse(rawTrimmed) as Record<string, unknown>;
-            if (typeof maybeAction.action === 'string' && maybeAction.action.length > 0) {
-              return PlannerDecisionSchema.parse({
-                kind: 'tool',
-                thought: `Model output a mempedia action directly; wrapping as bash CLI call.`,
-                tool_calls: [{
-                  name: 'bash',
-                  arguments: {
-                    command: `BIN="\${MEMPEDIA_BINARY_PATH:-./target/debug/mempedia}"\n[[ -x "$BIN" ]] || BIN=./target/release/mempedia\nprintf '%s' ${JSON.stringify(rawTrimmed)} | "$BIN" --project "$PWD" --stdin`,
-                  },
-                }],
-              });
-            }
-          } catch { /* not JSON, fall through */ }
-        }
-        const evidenceFirstDecision = buildEvidenceFirstFallbackDecision();
-        if (evidenceFirstDecision && !looksLikePromptEcho) {
-          emitTrace({
-            type: 'observation',
-            content: 'Planner returned unstructured output for a project-specific request; forcing local evidence inspection before answering.',
-          });
-          return PlannerDecisionSchema.parse(evidenceFirstDecision);
-        }
-        return PlannerDecisionSchema.parse({
-          kind: 'final',
-          thought: 'Planner returned no valid structured decision; using fallback final answer.',
-          final_answer: this.buildPlannerFallbackFinalAnswer(rawTrimmed, looksLikePromptEcho),
-        });
+      if (decision.kind === 'branch') {
+        return `[planner] kind=branch branches=${decision.branches.length}`;
       }
-
-      const normalizedRecord: Record<string, unknown> = normalized;
-
-      if (typeof normalizedRecord.kind !== 'string') {
-        if (typeof normalizedRecord.final_answer === 'string') {
-          normalizedRecord.kind = 'final';
-        } else if (Array.isArray(normalizedRecord.tool_calls)) {
-          normalizedRecord.kind = 'tool';
-        } else if (Array.isArray(normalizedRecord.skills_to_load)) {
-          normalizedRecord.kind = 'skills';
-        } else if (Array.isArray(normalizedRecord.branches)) {
-          normalizedRecord.kind = 'branch';
-        } else {
-          normalizedRecord.kind = 'final';
-        }
+      if (decision.kind === 'skills') {
+        return `[planner] kind=skills skills=${decision.skills_to_load.join(',')}`;
       }
-
-      if (typeof normalizedRecord.thought !== 'string' || !normalizedRecord.thought.trim()) {
-        const kind = String(normalizedRecord.kind || 'tool');
-        if (kind === 'tool' && Array.isArray(normalizedRecord.tool_calls)) {
-          const names = normalizedRecord.tool_calls
-            .map((call: any) => (call && typeof call.name === 'string' ? call.name : 'tool'))
-            .filter((name: string) => name.length > 0)
-            .slice(0, 3)
-            .join(', ');
-          normalizedRecord.thought = names
-            ? `Call tools for progress: ${names}`
-            : 'Call tool to gather required context.';
-        } else if (kind === 'branch') {
-          normalizedRecord.thought = 'Split into distinct strategies to improve solution quality.';
-        } else if (kind === 'skills') {
-          normalizedRecord.thought = 'Load additional skill guidance before the next planning step.';
-        } else {
-          normalizedRecord.thought = 'Provide the final answer for the user.';
-        }
-      }
-
-      if (normalizedRecord.kind === 'skills' && (!Array.isArray(normalizedRecord.skills_to_load) || normalizedRecord.skills_to_load.length === 0)) {
-        normalizedRecord.kind = 'final';
-        normalizedRecord.final_answer = '抱歉，当前没有生成有效回答。请重试一次。';
-      }
-
-      if (normalizedRecord.kind === 'final' && (typeof normalizedRecord.final_answer !== 'string' || !normalizedRecord.final_answer.trim())) {
-        const fallback = [normalizedRecord.answer, normalizedRecord.content, normalizedRecord.finalAnswer]
-          .find((value) => typeof value === 'string' && value.trim().length > 0);
-        if (typeof fallback === 'string') {
-          normalizedRecord.final_answer = fallback;
-        } else {
-          normalizedRecord.final_answer = '抱歉，当前没有生成有效回答。请重试一次。';
-        }
-      }
-
-      // Deduplicate tool_calls: some models (e.g. MiniMax via Anthropic format)
-      // occasionally return each tool call twice in the JSON response.
-      if (Array.isArray(normalizedRecord.tool_calls) && normalizedRecord.tool_calls.length > 1) {
-        const seen = new Set<string>();
-        normalizedRecord.tool_calls = (normalizedRecord.tool_calls as Array<Record<string, unknown>>).filter((call) => {
-          const key = JSON.stringify({ n: call.name, a: call.arguments });
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        });
-      }
-
-      try {
-        const result = PlannerDecisionSchema.parse(normalizedRecord);
-        const branchCount = Array.isArray(result.branches) ? result.branches.length : 0;
-        emitTrace({ type: 'observation', content: `[planner-parsed] kind=${result.kind}${branchCount > 0 ? ` branches=${branchCount}` : ''}${result.kind === 'tool' && result.tool_calls ? ` tools=${result.tool_calls.map(t => t.name).join(',')}` : ''}` });
-        return result;
-      } catch (zodError: any) {
-        // Zod validation failed on the normalized record — typically branch
-        // objects with out-of-range fields (priority > 1, label too long, etc.).
-        // Fall back to a safe decision instead of crashing the planner.
-        process.stderr.write(`[parseDecision] Zod validation failed: ${zodError?.message?.slice?.(0, 300) ?? zodError}\n`);
-        if (normalizedRecord.kind === 'branch' && Array.isArray(normalizedRecord.branches)) {
-          // Try to salvage: strip invalid branches and re-parse, or downgrade to final.
-          const salvaged = (normalizedRecord.branches as any[]).filter((b: any) => {
-            try { PlannerBranchSchema.parse(b); return true; } catch { return false; }
-          });
-          if (salvaged.length > 0) {
-            normalizedRecord.branches = salvaged;
-            try { return PlannerDecisionSchema.parse(normalizedRecord); } catch { /* fall through */ }
-          }
-        }
-        return PlannerDecisionSchema.parse({
-          kind: 'final',
-          thought: 'Planner output failed schema validation; using fallback.',
-          final_answer: typeof normalizedRecord.thought === 'string' ? normalizedRecord.thought : '抱歉，刚才内部规划结果格式异常，请重试。',
-        });
-      }
+      return '[planner] kind=final';
     };
 
     const planWithSkillRouting = async (
-      initialTranscript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-      invoke: (transcript: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>) => Promise<string>,
-    ): Promise<PlannerDecision> => {
+      initialTranscript: ChatMessage[],
+      invoke: (transcript: ChatMessage[]) => Promise<PlannerDecisionResult>,
+    ): Promise<ExecutablePlannerDecisionResult> => {
       let workingTranscript = initialTranscript;
       for (let attempt = 0; attempt < 3; attempt += 1) {
-        const raw = await invoke(workingTranscript);
-        const decision = parseDecision(raw);
-        if (
-          decision.kind === 'final'
-          && this.isPlannerFormatFallbackAnswer(decision.final_answer || '')
-          && attempt < 2
-        ) {
+        let plannerResult: PlannerDecisionResult;
+        try {
+          plannerResult = await invoke(workingTranscript);
+        } catch (error) {
+          const detail = this.clipText(String((error as any)?.message || error || 'unknown planner error'), 400);
           emitTrace({
-            type: 'observation',
-            content: 'Planner returned no valid structured decision; retrying the same branch with a stricter JSON-only repair prompt.',
+            type: 'error',
+            content: `Planner decision generation failed: ${detail}`,
           });
-          workingTranscript = [
-            ...workingTranscript,
-            { role: 'user', content: this.buildPlannerSchemaRepairPrompt() },
-          ];
-          continue;
+          const evidenceFirstDecision = buildEvidenceFirstFallbackDecision();
+          if (evidenceFirstDecision) {
+            emitTrace({
+              type: 'observation',
+              content: 'Planner failed before producing a structured decision; forcing local evidence inspection before answering.',
+            });
+            return { decision: evidenceFirstDecision };
+          }
+          return {
+            decision: {
+              kind: 'final',
+              thought: 'Planner decision generation failed.',
+              final_answer: '抱歉，内部规划步骤失败了，请重试一次。',
+            },
+          };
         }
+
+        const decision = plannerResult.decision;
+        emitTrace({ type: 'observation', content: summarizePlannerDecision(decision) });
         if (decision.kind !== 'skills') {
-          return decision;
+          return plannerResult as ExecutablePlannerDecisionResult;
         }
-        const requestedNames = Array.isArray(decision.skills_to_load) ? decision.skills_to_load : [];
+
+        const requestedNames = decision.skills_to_load;
         const loadedSkillNames = getLoadedSkillNames(workingTranscript);
         const skillsToInject = resolveSkillsByName(availableSkills, requestedNames, 2)
           .filter((skill) => !loadedSkillNames.has(skill.name.toLowerCase()));
@@ -3203,10 +3237,12 @@ ${soulsGuidance}
             content: `Skill router could not resolve requested skills: ${requestedNames.join(', ') || '(none)'}.`,
           });
           return {
-            kind: 'final',
-            thought: 'Skill router request could not be resolved to new skills; using fallback final answer.',
-            final_answer: '抱歉，当前请求的技能不可用。请重试或手动指定技能。',
-          } as PlannerDecision;
+            decision: {
+              kind: 'final',
+              thought: 'Skill router request could not be resolved to new skills; using fallback final answer.',
+              final_answer: '抱歉，当前请求的技能不可用。请重试或手动指定技能。',
+            },
+          };
         }
         emitTrace({
           type: 'observation',
@@ -3215,10 +3251,53 @@ ${soulsGuidance}
         workingTranscript = appendSkillGuidance(workingTranscript, skillsToInject);
       }
       return {
-        kind: 'final',
-        thought: 'Skill router exceeded load attempts; using fallback final answer.',
-        final_answer: '抱歉，技能路由未能收敛为有效回答。请重试一次。',
-      } as PlannerDecision;
+        decision: {
+          kind: 'final',
+          thought: 'Skill router exceeded load attempts; using fallback final answer.',
+          final_answer: '抱歉，技能路由未能收敛为有效回答。请重试一次。',
+        },
+      };
+    };
+
+    const clearPendingAnthropicToolState = (branch: BranchState) => {
+      branch.pendingAnthropicAssistantContent = null;
+      branch.pendingAnthropicToolUseIds = [];
+    };
+
+    const applyPlannerResultToBranch = (branch: BranchState, result: PlannerDecisionResult) => {
+      if (this.openai.provider === 'anthropic' && result.decision.kind === 'tool') {
+        branch.pendingAnthropicAssistantContent = result.anthropicAssistantContent ?? null;
+        branch.pendingAnthropicToolUseIds = result.anthropicToolUseIds ?? [];
+        return;
+      }
+      clearPendingAnthropicToolState(branch);
+    };
+
+    const buildAnthropicToolTranscript = (
+      branch: BranchState,
+      observations: Array<{ result: string; success: boolean }>,
+    ): Array<{ role: 'assistant' | 'user'; content: ChatMessageContent }> | null => {
+      if (this.openai.provider !== 'anthropic') {
+        return null;
+      }
+      const assistantContent = branch.pendingAnthropicAssistantContent;
+      const toolUseIds = branch.pendingAnthropicToolUseIds ?? [];
+      clearPendingAnthropicToolState(branch);
+      if (!assistantContent || assistantContent.length === 0 || toolUseIds.length !== observations.length) {
+        return null;
+      }
+
+      const toolResults: AnthropicToolResultContentBlock[] = observations.map((observation, index) => ({
+        type: 'tool_result',
+        tool_use_id: toolUseIds[index],
+        content: observation.result,
+        ...(observation.success ? {} : { is_error: true }),
+      }));
+
+      return [
+        { role: 'assistant', content: assistantContent },
+        { role: 'user', content: toolResults },
+      ];
     };
 
     const buildBranchMemoryJob = (
@@ -3231,7 +3310,7 @@ ${soulsGuidance}
         const eventBranchId = event.metadata?.branchId;
         return typeof eventBranchId === 'string' ? eventBranchId.startsWith(branch.id) : branch.id === 'B0';
       });
-      const branchSummary = branch.finalAnswer || branch.completionSummary || branch.transcript.slice(-6).map((item) => item.content).join('\n\n');
+      const branchSummary = branch.finalAnswer || branch.completionSummary || branch.transcript.slice(-6).map((item) => extractText(item.content)).join('\n\n');
       return {
         input: `Original user request:\n${input}\n\nActive branch: ${branch.id} (${branch.label})\nBranch goal: ${branch.goal}`,
         traces: branchTraces,
@@ -3247,19 +3326,48 @@ ${soulsGuidance}
     };
 
     const buildMessages = (branch: BranchState) => {
-      const compressed = compressTranscript(
-        branch.transcript,
-        effectiveTranscriptBudgetChars,
+      let branchTranscript = branch.transcript;
+      const inheritedCount = Math.max(0, Math.min(branch.inheritedMessageCount, branchTranscript.length));
+      const inheritedTranscript = branchTranscript.slice(0, inheritedCount);
+      let localTranscript = branchTranscript.slice(inheritedCount);
+      if (ctxBudget.modelLimit > 0) {
+        const inheritedTokens = estimateTranscriptTokens(inheritedTranscript);
+        const checked = checkContextAndCompress(
+          localTranscript,
+          ctxBudget.modelLimit,
+          ctxBudget.committedTokens + inheritedTokens,
+        );
+        if (checked.compressed) {
+          localTranscript = checked.transcript as typeof branch.transcript;
+        }
+      } else {
+        const inheritedChars = inheritedTranscript.reduce((sum, message) => sum + extractText(message.content).length, 0);
+        localTranscript = compressTranscript(
+          localTranscript,
+          Math.max(4000, effectiveTranscriptBudgetChars - inheritedChars),
+        ) as typeof branch.transcript;
+      }
+      branchTranscript = [
+        ...inheritedTranscript,
+        ...localTranscript,
+      ];
+      branch.transcript = branchTranscript;
+
+      const branchTranscriptTokens = estimateTranscriptTokens(branchTranscript);
+      const branchResidualBudget = Math.max(
+        0,
+        ctxBudget.modelLimit - ctxBudget.committedTokens - branchTranscriptTokens,
       );
+
       return [
         { role: 'system', content: systemPrompt },
         ...recentConversationMessages,
-        ...compressed,
+        ...branchTranscript,
         {
-          role: 'user',
-          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}\n- remaining_branch_depth: ${Math.max(0, effectiveMaxDepth - branch.depth)}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- step_budget: ${branch.steps}/${effectiveMaxSteps}\n- context_budget_residual: ${ctxBudget.residualBudget} tokens\n\nReturn exactly one JSON object.`,
+          role: 'user' as const,
+          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- steps_so_far: ${branch.steps}\n- branch_inherited_messages: ${inheritedCount}\n- branch_local_messages: ${Math.max(0, branchTranscript.length - inheritedCount)}\n- branch_transcript_tokens: ${branchTranscriptTokens}\n- branch_context_budget_residual: ${branchResidualBudget} tokens\n\nLoop guard:\n- Prefer materially diverse search strategies over paraphrased near-duplicate queries.\n- If this branch can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing batches of direct work tools.\n- If you issue multiple web/search calls in one response, each must target a genuinely different evidence stream or hypothesis. Do not batch paraphrased versions of the same search.\n- If recent web/search rounds have been weak, noisy, or repetitive, change keywords, aliases, dates, domains, languages, source types, or switch from search to fetch.\n- After 2-3 consecutive web/search rounds without clear new information, do not continue the same-category search loop. Call planner_final with the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy.\n\nRespond by calling tool(s), not plain text. Call read/search/edit/bash/web directly for work. Use planner_branch/planner_final/planner_skills only for control flow, and never mix control tools with direct work-tool calls in the same response.`,
         },
-      ];
+      ] as ChatMessage[];
     };
 
     const executePlannerTool = async (fnName: string, args: Record<string, unknown>): Promise<string> => {
@@ -3300,11 +3408,24 @@ ${soulsGuidance}
       return clipped;
     };
 
+    const buildSafeBranchDisplayFallback = (branch: Pick<BranchState, 'label' | 'completionSummary' | 'finalAnswer'>): string => {
+      const safeSummary = this.sanitizeUserFacingAnswer(branch.completionSummary || '', '');
+      if (safeSummary) {
+        return safeSummary;
+      }
+      const safeFirstSentence = this.firstSentence(this.sanitizeUserFacingAnswer(branch.finalAnswer || '', ''));
+      if (safeFirstSentence) {
+        return safeFirstSentence;
+      }
+      return `分支 ${branch.label} 已完成，但最终内容不可安全展示。`;
+    };
+
     const finalizeFromBranch = async (branch: BranchState, reason: string): Promise<string> => {
       emitBranchTrace('thought', branch, `Forcing finalization for ${branch.id}: ${reason}`);
       const compressedTranscript = compressBranchTranscript(branch.transcript, { tailKeep: 6, maxSummaryChars: 2000 });
-      const { text: _finalizeText } = await this.measure(perfEntries, `finalize_${branch.id}`, async () =>
-        this.withTimeout(
+      const { text: _finalizeText } = await this.measure(perfEntries, `finalize_${branch.id}`, async () => {
+        await this.llmRpmLimiter.acquire();
+        return this.withTimeout(
           generateText({
             model: this.openai,
             temperature: this.responseTemperature,
@@ -3318,14 +3439,41 @@ ${soulsGuidance}
           }),
           this.agentLlmTimeoutMs,
           `finalize_${branch.id} llm`
-        )
-      );
-      return extractText(_finalizeText).trim();
+        );
+      });
+      const fallback = buildSafeBranchDisplayFallback(branch);
+      return this.sanitizeUserFacingAnswer(extractText(_finalizeText).trim(), fallback)
+        || fallback;
+    };
+
+    const buildDeterministicSynthesisFallback = (branches: BranchState[]): string => {
+      const sections = branches
+        .map((branch) => {
+          const safeAnswer = this.sanitizeUserFacingAnswer(
+            branch.finalAnswer || '',
+            buildSafeBranchDisplayFallback(branch),
+          );
+          if (!safeAnswer) {
+            return '';
+          }
+          return `## ${branch.label}\n${this.clipText(safeAnswer, 1600)}`;
+        })
+        .filter(Boolean);
+
+      if (sections.length === 0) {
+        return '抱歉，分支汇总阶段返回了内部格式，当前没有可安全展示的最终总结。';
+      }
+
+      return `以下是各已完成分支的整理结果：\n\n${sections.join('\n\n')}`;
     };
 
     const synthesizeCompletedBranches = async (branches: BranchState[]): Promise<string> => {
       if (branches.length === 1 && branches[0].finalAnswer) {
-        return branches[0].finalAnswer;
+        const fallback = buildSafeBranchDisplayFallback(branches[0]);
+        return this.sanitizeUserFacingAnswer(
+          branches[0].finalAnswer,
+          fallback,
+        ) || fallback;
       }
       emitTrace({ type: 'thought', content: `Synthesizing ${branches.length} completed branches into one final answer...` });
       const branchSummary = branches
@@ -3339,8 +3487,9 @@ ${soulsGuidance}
         ].join('\n'))
         .join('\n\n---\n\n');
 
-      const { text: _synthesisText } = await this.measure(perfEntries, 'branch_synthesis', async () =>
-        this.withTimeout(
+      const { text: _synthesisText } = await this.measure(perfEntries, 'branch_synthesis', async () => {
+        await this.llmRpmLimiter.acquire();
+        return this.withTimeout(
           generateText({
             model: this.openai,
             temperature: this.responseTemperature,
@@ -3358,10 +3507,19 @@ ${soulsGuidance}
           }),
           this.agentLlmTimeoutMs,
           'branch_synthesis llm'
-        )
-      );
+        );
+      });
 
-      return extractText(_synthesisText).trim();
+      const synthesized = extractText(_synthesisText).trim();
+      const sanitized = this.sanitizeUserFacingAnswer(synthesized);
+      if (sanitized) {
+        return sanitized;
+      }
+      emitTrace({
+        type: 'observation',
+        content: 'Synthesis returned internal tool/planner markup; falling back to deterministic branch merge.',
+      });
+      return buildDeterministicSynthesisFallback(branches);
     };
     let completedBranchesForRun: Array<BranchSynthesisInput['branches'][number]> = [];
     let finalAnswer: string;
@@ -3370,54 +3528,59 @@ ${soulsGuidance}
       // ── Classic ReAct mode (sequential: think → act → observe → …) ────
       emitTrace({ type: 'thought', content: 'Using classic ReAct mode (sequential, no branching).' });
       const runtime = new AgentRuntime({
-        planner: { plan: async (transcript) => ({ kind: 'final', content: transcript.at(-1)?.content || '' }) },
+        planner: { plan: async (transcript) => ({ kind: 'final', content: extractText(transcript.at(-1)?.content || '') }) },
         toolRuntime: {
           execute: async () => ({ success: false, error: 'unreachable tool runtime fallback', durationMs: 0 }),
           resetSession: () => runRuntimeHandle.toolRuntime.resetSession(),
         },
-        maxSteps: effectiveMaxSteps,
+        maxSteps: 60,
         maxBranchDepth: 0,
         maxBranchWidth: 1,
         maxCompletedBranches: 1,
         branchConcurrency: 1,
-        maxTotalSteps: effectiveMaxSteps,
+        maxTotalSteps: 60,
         transcriptBudgetChars: effectiveTranscriptBudgetChars,
         modelLimit: ctxBudget.modelLimit,
         committedTokens: ctxBudget.committedTokens,
         planBranch: async ({ branch }) => {
-          const decision = await planWithSkillRouting(
-            buildMessages(branch as BranchState) as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+          const plannerResult = await planWithSkillRouting(
+            buildMessages(branch as BranchState),
             async (workingTranscript) => {
               return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
-                this.generateJsonPromptText({
-                  model: this.openai,
-                  messages: workingTranscript as any,
+                this.generatePlannerDecision({
+                  messages: workingTranscript,
                   timeoutMs: this.agentLlmTimeoutMs,
                   timeoutLabel: `planBranch_${branch.id} llm`,
                   temperature: this.plannerTemperature,
-                  onFallback: () => emitTrace({
-                    type: 'observation',
-                    content: `Model ${this.model} does not support response_format=json_object; switching planner JSON prompts to plain-text mode.`,
-                  }),
+                  allowBranching: false,
                 })
               );
             }
           );
+          applyPlannerResultToBranch(branch as BranchState, plannerResult);
+          const decision = plannerResult.decision;
           if (decision.kind === 'tool') {
             // In classic react, limit to one tool call at a time
-            const toolCalls = (decision.tool_calls || []).slice(0, 1);
+            const toolCalls = decision.tool_calls.slice(0, 1);
             return { kind: 'tool' as const, thought: decision.thought, toolCalls };
           }
           if (decision.kind === 'branch') {
             // Classic react does not support branching — ask model to continue sequentially
+            clearPendingAnthropicToolState(branch as BranchState);
             branch.transcript.push({
               role: 'user' as const,
-              content: 'Branching is not available in classic ReAct mode. Please use kind="tool" to proceed step by step, or kind="final" to finish.',
+              content: 'Branching is not available in classic ReAct mode. Please call exactly one direct work tool to proceed step by step, or call planner_final to finish.',
             });
             return { kind: 'tool' as const, thought: decision.thought, toolCalls: [] };
           }
-          return { kind: 'final' as const, thought: decision.thought, content: String(decision.final_answer || ''), completionSummary: decision.completion_summary };
+          return {
+            kind: 'final' as const,
+            thought: decision.thought,
+            content: decision.final_answer,
+            completionSummary: decision.completion_summary,
+          };
         },
+        buildToolTranscript: ({ branch, observations }) => buildAnthropicToolTranscript(branch as BranchState, observations),
         executeToolCall: async ({ branch, toolCall }) => {
           const result = await executeToolCall(branch as BranchState, toolCall as z.infer<typeof PlannerToolCallSchema>);
           return {
@@ -3436,58 +3599,48 @@ ${soulsGuidance}
     } else {
       // ── Branching ReAct mode (default) ──────────────────────────────────
     const runtime = new AgentRuntime({
-      planner: { plan: async (transcript) => ({ kind: 'final', content: transcript.at(-1)?.content || '' }) },
+      planner: { plan: async (transcript) => ({ kind: 'final', content: extractText(transcript.at(-1)?.content || '') }) },
       toolRuntime: {
         execute: async () => ({ success: false, error: 'unreachable tool runtime fallback', durationMs: 0 }),
         resetSession: () => runRuntimeHandle.toolRuntime.resetSession(),
       },
-      maxSteps: effectiveMaxSteps,
-      maxBranchDepth: effectiveMaxDepth,
-      maxBranchWidth: effectiveMaxWidth,
+      maxBranchWidth: this.branchMaxWidth,
       maxCompletedBranches: this.branchMaxCompleted,
       branchConcurrency: this.branchConcurrency,
-      maxTotalSteps: effectiveMaxTotalSteps,
       transcriptBudgetChars: effectiveTranscriptBudgetChars,
       modelLimit: ctxBudget.modelLimit,
       committedTokens: ctxBudget.committedTokens,
       planBranch: async ({ branch }) => {
-        const decision = await planWithSkillRouting(
-          buildMessages(branch as BranchState) as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+        const plannerResult = await planWithSkillRouting(
+          buildMessages(branch as BranchState),
           async (workingTranscript) => {
             return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
-              this.generateJsonPromptText({
-                model: this.openai,
-                messages: workingTranscript as any,
+              this.generatePlannerDecision({
+                messages: workingTranscript,
                 timeoutMs: this.agentLlmTimeoutMs,
                 timeoutLabel: `planBranch_${branch.id} llm`,
                 temperature: this.plannerTemperature,
-                onFallback: () => emitTrace({
-                  type: 'observation',
-                  content: `Model ${this.model} does not support response_format=json_object; switching planner JSON prompts to plain-text mode.`,
-                }),
+                allowBranching: true,
               })
             );
           }
         );
+        applyPlannerResultToBranch(branch as BranchState, plannerResult);
+        const decision = plannerResult.decision;
         if (decision.kind === 'tool') {
-          return { kind: 'tool' as const, thought: decision.thought, toolCalls: decision.tool_calls || [] };
+          return { kind: 'tool' as const, thought: decision.thought, toolCalls: decision.tool_calls };
         }
         if (decision.kind === 'branch') {
-          const branches = decision.branches || [];
-          if (branches.length === 0) {
-            // Model chose branch but provided no branches — treat as thought-only step,
-            // push a correction into the transcript so the model can retry.
-            emitTrace({ type: 'observation', content: `Planner returned kind="branch" but branches array was empty for ${branch.id}; asking for retry.` });
-            branch.transcript.push({
-              role: 'user' as const,
-              content: 'You selected kind="branch" but provided an empty branches array. Either provide concrete branches, use kind="tool", or finish with kind="final".',
-            });
-            return { kind: 'tool' as const, thought: decision.thought, toolCalls: [] };
-          }
-          return { kind: 'branch' as const, thought: decision.thought, branches };
+          return { kind: 'branch' as const, thought: decision.thought, branches: decision.branches };
         }
-        return { kind: 'final' as const, thought: decision.thought, content: String(decision.final_answer || ''), completionSummary: decision.completion_summary };
+        return {
+          kind: 'final' as const,
+          thought: decision.thought,
+          content: decision.final_answer,
+          completionSummary: decision.completion_summary,
+        };
       },
+      buildToolTranscript: ({ branch, observations }) => buildAnthropicToolTranscript(branch as BranchState, observations),
       executeToolCall: async ({branch, toolCall }) => {
         const result = await executeToolCall(branch as BranchState, toolCall as z.infer<typeof PlannerToolCallSchema>);
         return {
@@ -3507,6 +3660,7 @@ ${soulsGuidance}
           goal: branch.goal,
           priority: 1,
           steps: 0,
+          inheritedMessageCount: 0,
           transcript: [],
           savedNodeIds: branch.savedNodeIds,
           completionSummary: branch.completionSummary,
@@ -3525,8 +3679,30 @@ ${soulsGuidance}
         });
       }
     });
-    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. Choose tool, branch, or final based on the task structure.`);
+    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. In branching mode, default to planner_branch whenever the task can be decomposed into independent parts or there are multiple plausible independent avenues to explore. Only start with direct work tools if the next action is clearly atomic. Call planner_final when you are ready to answer.`);
     }
+
+    finalAnswer = this.sanitizeUserFacingAnswer(
+      finalAnswer,
+      completedBranchesForRun.length > 0
+        ? buildDeterministicSynthesisFallback(
+          completedBranchesForRun.map((branch) => ({
+            id: branch.id,
+            parentId: null,
+            depth: 0,
+            label: branch.label,
+            goal: branch.goal,
+            priority: 1,
+            steps: 0,
+            inheritedMessageCount: 0,
+            transcript: [],
+            savedNodeIds: branch.savedNodeIds,
+            completionSummary: branch.completionSummary,
+            finalAnswer: branch.finalAnswer,
+          })) as BranchState[],
+        )
+        : '抱歉，我暂时没能生成可展示的回答，请重试一次。',
+    ) || '抱歉，我暂时没能生成可展示的回答，请重试一次。';
 
     // ── Session carry-over: detect exhaustion and record/clear ──────────
     if (isRunExhausted(traceBuffer, finalAnswer)) {
@@ -3565,6 +3741,7 @@ ${soulsGuidance}
           goal: bestBranch.goal,
           priority: 1,
           steps: 0,
+          inheritedMessageCount: 0,
           transcript: [],
           savedNodeIds: bestBranch.savedNodeIds,
           completionSummary: bestBranch.completionSummary,
@@ -3578,6 +3755,7 @@ ${soulsGuidance}
           goal: 'Solve the user request end-to-end.',
           priority: 1,
           steps: 0,
+          inheritedMessageCount: 0,
           transcript: [],
           savedNodeIds: [],
           finalAnswer,

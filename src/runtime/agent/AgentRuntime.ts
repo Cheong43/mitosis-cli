@@ -1,7 +1,12 @@
 import { AgentTraceEvent, PlannedBranch, PlannedToolCall, ToolObservation, TranscriptMessage } from './types.js';
 import { Planner } from './SimplePlanner.js';
 import { ToolExecutionResult } from '../tools/types.js';
-import { compressBranchTranscript, progressiveCompressBranch, checkContextAndCompress } from '../../agent/contextBudget.js';
+import {
+  compressBranchTranscript,
+  progressiveCompressBranch,
+  checkContextAndCompress,
+  estimateTranscriptTokens,
+} from '../../agent/contextBudget.js';
 
 interface AgentToolRuntime {
   execute(toolName: string, args: Record<string, unknown>): Promise<ToolExecutionResult>;
@@ -16,6 +21,7 @@ export interface AgentBranchState {
   goal: string;
   priority: number;
   steps: number;
+  inheritedMessageCount: number;
   transcript: TranscriptMessage[];
   savedNodeIds: string[];
   completionSummary?: string;
@@ -49,6 +55,12 @@ export interface BranchSynthesisInput {
   }>;
 }
 
+export interface BranchToolTranscriptInput {
+  branch: AgentBranchState;
+  toolCalls: PlannedToolCall[];
+  observations: ToolObservation[];
+}
+
 export interface AgentRuntimeOptions {
   planner: Planner;
   toolRuntime: AgentToolRuntime;
@@ -74,12 +86,33 @@ export interface AgentRuntimeOptions {
   planBranch?: (input: BranchPlanInput) => Promise<import('./types.js').AgentStep>;
   /** Optional branch-aware tool execution override. */
   executeToolCall?: (input: BranchToolExecutionInput) => Promise<ToolObservation>;
+  /** Optional override for how tool calls/results are written back into the transcript. */
+  buildToolTranscript?: (input: BranchToolTranscriptInput) => TranscriptMessage[] | null | undefined;
   /** Optional branch finalization override when a branch hits budget. */
   finalizeBranch?: (input: BranchFinalizeInput) => Promise<string>;
   /** Optional final synthesis hook when multiple branches finish. */
   synthesizeFinal?: (input: BranchSynthesisInput) => Promise<string>;
   /** Trace callback invoked after each loop step. */
   onTrace?: (event: AgentTraceEvent) => void;
+}
+
+function formatPlannerToolDecisionMessage(toolCalls: PlannedToolCall[]): string {
+  const lines = toolCalls.map((toolCall) => {
+    const goal = toolCall.goal?.trim() ? ` | goal: ${toolCall.goal.trim()}` : '';
+    const hasArguments = toolCall.arguments && Object.keys(toolCall.arguments).length > 0;
+    const args = hasArguments ? ` | arguments: ${JSON.stringify(toolCall.arguments)}` : '';
+    return `- ${toolCall.name}${goal}${args}`;
+  });
+  return ['PLANNER TOOL DECISION:', ...lines].join('\n');
+}
+
+function formatPlannerBranchDecisionMessage(branches: PlannedBranch[]): string {
+  const lines = branches.map((branch) => {
+    const why = branch.why?.trim() ? ` | why: ${branch.why.trim()}` : '';
+    const priority = typeof branch.priority === 'number' ? ` | priority: ${branch.priority}` : '';
+    return `- ${branch.label}: ${branch.goal}${why}${priority}`;
+  });
+  return ['PLANNER BRANCH DECISION:', ...lines].join('\n');
 }
 
 /**
@@ -108,6 +141,7 @@ export class AgentRuntime {
   private readonly committedTokens: number;
   private readonly planBranch?: (input: BranchPlanInput) => Promise<import('./types.js').AgentStep>;
   private readonly executeToolCall?: (input: BranchToolExecutionInput) => Promise<ToolObservation>;
+  private readonly buildToolTranscript?: (input: BranchToolTranscriptInput) => TranscriptMessage[] | null | undefined;
   private readonly finalizeBranch?: (input: BranchFinalizeInput) => Promise<string>;
   private readonly synthesizeFinal?: (input: BranchSynthesisInput) => Promise<string>;
   private readonly onTrace: (event: AgentTraceEvent) => void;
@@ -115,17 +149,20 @@ export class AgentRuntime {
   constructor(options: AgentRuntimeOptions) {
     this.planner = options.planner;
     this.toolRuntime = options.toolRuntime;
-    this.maxSteps = options.maxSteps ?? 10;
-    this.maxBranchDepth = options.maxBranchDepth ?? 2;
-    this.maxBranchWidth = options.maxBranchWidth ?? 3;
-    this.maxCompletedBranches = options.maxCompletedBranches ?? 4;
-    this.branchConcurrency = options.branchConcurrency ?? 3;
+    this.maxSteps = options.maxSteps ?? 200;
+    this.maxBranchDepth = options.maxBranchDepth ?? 100;
+    this.maxBranchWidth = options.maxBranchWidth ?? 5;
+    this.maxCompletedBranches = options.maxCompletedBranches ?? 8;
+    this.branchConcurrency = Number.isFinite(options.branchConcurrency)
+      ? Math.max(0, Math.floor(options.branchConcurrency ?? 0))
+      : 0;
     this.maxTotalSteps = options.maxTotalSteps ?? null;
     this.transcriptBudgetChars = options.transcriptBudgetChars ?? 80_000;
     this.modelLimit = options.modelLimit ?? 0;
     this.committedTokens = options.committedTokens ?? 0;
     this.planBranch = options.planBranch;
     this.executeToolCall = options.executeToolCall;
+    this.buildToolTranscript = options.buildToolTranscript;
     this.finalizeBranch = options.finalizeBranch;
     this.synthesizeFinal = options.synthesizeFinal;
     this.onTrace = options.onTrace ?? (() => undefined);
@@ -153,6 +190,7 @@ export class AgentRuntime {
       goal: 'Solve the user request end-to-end.',
       priority: 1,
       steps: 0,
+      inheritedMessageCount: 0,
       savedNodeIds: [],
       transcript: [
         ...priorTranscript,
@@ -192,6 +230,24 @@ export class AgentRuntime {
         : `ERROR: ${execResult.error ?? 'unknown error'}`,
       success: execResult.success,
     });
+
+    const splitBranchTranscript = (branch: AgentBranchState) => {
+      const inheritedCount = Math.max(0, Math.min(branch.inheritedMessageCount, branch.transcript.length));
+      return {
+        inheritedTranscript: branch.transcript.slice(0, inheritedCount),
+        localTranscript: branch.transcript.slice(inheritedCount),
+      };
+    };
+
+    const setBranchLocalTranscript = (
+      branch: AgentBranchState,
+      localTranscript: TranscriptMessage[],
+      inheritedTranscript?: TranscriptMessage[],
+    ) => {
+      const inherited = inheritedTranscript ?? splitBranchTranscript(branch).inheritedTranscript;
+      branch.inheritedMessageCount = inherited.length;
+      branch.transcript = [...inherited, ...localTranscript];
+    };
 
     // When a custom executeToolCall hook is provided, the hook is responsible
     // for emitting its own action/observation traces.  The runtime should NOT
@@ -247,16 +303,21 @@ export class AgentRuntime {
         }
       }
 
-      branch.transcript.push({
-        role: 'assistant',
-        content: JSON.stringify({ kind: 'tool', tool_calls: toolCalls }),
-      });
-      branch.transcript.push({
-        role: 'user',
-        content: observations
-          .map((o) => `TOOL OBSERVATION for ${o.toolName}:\n${o.result}`)
-          .join('\n\n'),
-      });
+      const customTranscript = this.buildToolTranscript?.({ branch, toolCalls, observations });
+      if (customTranscript && customTranscript.length > 0) {
+        branch.transcript.push(...customTranscript);
+      } else {
+        branch.transcript.push({
+          role: 'assistant',
+          content: formatPlannerToolDecisionMessage(toolCalls),
+        });
+        branch.transcript.push({
+          role: 'user',
+          content: observations
+            .map((o) => `TOOL OBSERVATION for ${o.toolName}:\n${o.result}`)
+            .join('\n\n'),
+        });
+      }
     };
 
     const buildChildBranches = (
@@ -270,44 +331,55 @@ export class AgentRuntime {
         maxSummaryChars: 1500,
       }) as TranscriptMessage[];
 
-      return branches.map((child, index) => ({
-        id: `${branch.id}.${index + 1}`,
-        parentId: branch.id,
-        depth: branch.depth + 1,
-        label: child.label,
-        goal: child.goal,
-        priority: Math.max(0.05, branch.priority * (child.priority ?? Math.max(0.2, 1 - index * 0.2))),
-        steps: 0,
-        savedNodeIds: branch.savedNodeIds.slice(),
-        transcript: [
+      return branches.map((child, index) => {
+        const transcript: TranscriptMessage[] = [
           ...compressedParentTranscript,
           {
             role: 'assistant',
-            content: JSON.stringify({ kind: 'branch', branches }),
+            content: formatPlannerBranchDecisionMessage(branches),
           },
           {
             role: 'user',
-            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nYou may use tool calls, branch further if the goal benefits from parallel exploration, or return a final answer. Avoid repeating sibling work.`,
+            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nIf this child goal can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing direct work tools.\nDo not use multiple near-duplicate web searches as a substitute for branching.\nYou may use tool calls, branch further if the goal benefits from parallel exploration, or return a final answer. Avoid repeating sibling work.`,
           },
-        ],
-      }));
+        ];
+
+        return {
+          id: `${branch.id}.${index + 1}`,
+          parentId: branch.id,
+          depth: branch.depth + 1,
+          label: child.label,
+          goal: child.goal,
+          priority: Math.max(0.05, branch.priority * (child.priority ?? Math.max(0.2, 1 - index * 0.2))),
+          steps: 0,
+          inheritedMessageCount: transcript.length,
+          savedNodeIds: branch.savedNodeIds.slice(),
+          transcript,
+        };
+      });
     };
 
     const runBranch = async (branch: AgentBranchState): Promise<AgentBranchState[]> => {
       while (true) {
-        // ── Context / budget gate ──────────────────────────────────────
+        // ── Context gate ───────────────────────────────────────────────
+        // Each branch's ONLY hard limit is its context window. When the
+        // transcript approaches the model context limit, compress it.
+        // Only stop when even nuclear compression cannot free enough room.
         if (this.modelLimit > 0) {
-          // Dynamic mode: check actual context utilisation, compress at 92%
+          const { inheritedTranscript, localTranscript } = splitBranchTranscript(branch);
+          const inheritedTokens = estimateTranscriptTokens(inheritedTranscript);
           const check = checkContextAndCompress(
-            branch.transcript, this.modelLimit, this.committedTokens,
+            localTranscript,
+            this.modelLimit,
+            this.committedTokens + inheritedTokens,
           );
           if (check.compressed) {
-            branch.transcript = check.transcript as TranscriptMessage[];
+            setBranchLocalTranscript(branch, check.transcript as TranscriptMessage[], inheritedTranscript);
             emitBranchTrace('observation', branch,
               `Context ${(check.usageRatio * 100).toFixed(1)}% — auto-compressed transcript.`);
           }
           if (!check.canContinue) {
-            const reason = 'context window exhausted after compression';
+            const reason = 'context window exhausted after maximum compression';
             if (this.finalizeBranch) {
               branch.finalAnswer = await this.finalizeBranch({ branch, reason });
             }
@@ -317,19 +389,8 @@ export class AgentRuntime {
               `Branch completed: context exhausted (${(check.usageRatio * 100).toFixed(1)}%).`);
             return [];
           }
-          // Absolute safety cap (3× per-branch, 2× global)
-          if (branch.steps >= this.maxSteps * 3 || totalLoopSteps >= totalLoopBudget * 2) {
-            const reason = 'absolute safety step limit reached';
-            if (this.finalizeBranch) {
-              branch.finalAnswer = await this.finalizeBranch({ branch, reason });
-            }
-            branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped: ${reason}.`;
-            completed.push(branch);
-            emitBranchTrace('observation', branch, `Branch completed after hitting ${reason}.`);
-            return [];
-          }
         } else {
-          // Legacy mode: hard step budget
+          // Legacy mode (no model limit known): use transcript budget compression.
           if (branch.steps >= this.maxSteps || totalLoopSteps >= totalLoopBudget) {
             const reason = totalLoopSteps >= totalLoopBudget ? 'total budget reached' : 'step budget reached';
             if (this.finalizeBranch) {
@@ -354,10 +415,22 @@ export class AgentRuntime {
         }
 
         if (agentStep.kind === 'final') {
-          branch.finalAnswer = agentStep.content;
+          const needsExplicitFinalize = agentStep.finalizationMode === 'planner_fallback';
+          if (needsExplicitFinalize) {
+            emitBranchTrace('thought', branch, `Planner fallback reply is not treated as a real final step; explicitly finalizing ${branch.id}.`);
+            if (this.finalizeBranch) {
+              branch.finalAnswer = await this.finalizeBranch({
+                branch,
+                reason: 'planner format fallback after schema repair retries',
+              });
+            }
+            branch.finalAnswer = branch.finalAnswer || agentStep.content;
+          } else {
+            branch.finalAnswer = agentStep.content;
+          }
           branch.completionSummary = agentStep.completionSummary ?? branch.completionSummary;
           completed.push(branch);
-          emitBranchTrace('observation', branch, 'Branch completed.');
+          emitBranchTrace('observation', branch, needsExplicitFinalize ? 'Branch finalized after planner fallback.' : 'Branch completed.');
           return [];
         }
 
@@ -366,7 +439,7 @@ export class AgentRuntime {
           if (toolCalls.length === 0) {
             branch.transcript.push({
               role: 'user',
-              content: 'You selected kind="tool" but provided no tool calls. Either call a tool or finish.',
+              content: 'You chose a tool step but did not include any usable tool calls. Continue with at least one tool call or finish this branch.',
             });
             continue;
           }
@@ -375,20 +448,34 @@ export class AgentRuntime {
           // In dynamic mode, compression is handled by checkContextAndCompress
           // at the top of the loop.  Legacy mode: progressive compression fallback.
           if (this.modelLimit <= 0 && branch.steps >= 3) {
-            branch.transcript = progressiveCompressBranch(
-              branch.transcript,
-              this.transcriptBudgetChars,
-              6,
-            ) as TranscriptMessage[];
+            const { inheritedTranscript, localTranscript } = splitBranchTranscript(branch);
+            const inheritedChars = inheritedTranscript.reduce((sum, message) => sum + message.content.length, 0);
+            const localBudgetChars = Math.max(4000, this.transcriptBudgetChars - inheritedChars);
+            setBranchLocalTranscript(
+              branch,
+              progressiveCompressBranch(localTranscript, localBudgetChars, 6) as TranscriptMessage[],
+              inheritedTranscript,
+            );
           }
           continue;
         }
 
+        if (branch.depth >= this.maxBranchDepth) {
+          const reason = `maximum branch depth ${this.maxBranchDepth} reached`;
+          if (this.finalizeBranch) {
+            branch.finalAnswer = await this.finalizeBranch({ branch, reason });
+          }
+          branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped because ${reason}.`;
+          completed.push(branch);
+          emitBranchTrace('observation', branch, `Branch completed after hitting ${reason}.`);
+          return [];
+        }
+
         const childPlans = agentStep.branches.slice(0, this.maxBranchWidth);
-        if (branch.depth >= this.maxBranchDepth || childPlans.length === 0) {
+        if (childPlans.length === 0) {
           branch.transcript.push({
             role: 'user',
-            content: `Branching was rejected because ${branch.depth >= this.maxBranchDepth ? 'the branch depth budget is exhausted' : 'no valid child branches were provided'}. Continue this branch without splitting.`,
+            content: 'Branching was rejected because no valid child branches were provided. Continue this branch without splitting.',
           });
           continue;
         }
@@ -409,45 +496,53 @@ export class AgentRuntime {
     const prioritySort = (a: AgentBranchState, b: AgentBranchState) =>
       (b.priority - a.priority) || (a.depth - b.depth) || (a.steps - b.steps);
     const active = new Set<Promise<void>>();
-    const canContinue = () =>
-      completed.length < this.maxCompletedBranches && totalLoopSteps < totalLoopBudget;
+    const canLaunchMoreBranches = () =>
+      (this.branchConcurrency <= 0 || active.size < this.branchConcurrency)
+      && (this.modelLimit > 0 ? true : totalLoopSteps < totalLoopBudget);
 
-    const fillSlots = () => {
+    const launchQueuedBranches = () => {
       queue.sort(prioritySort);
-      while (active.size < this.branchConcurrency && queue.length > 0 && canContinue()) {
+      while (queue.length > 0 && canLaunchMoreBranches()) {
         const branch = queue.shift()!;
         let task: Promise<void>;
         task = runBranch(branch)
           .then((childBranches) => {
             active.delete(task);
-            if (canContinue()) {
+            if (canLaunchMoreBranches()) {
               childBranches.forEach((child) => queue.push(child));
             }
-            fillSlots();
+            launchQueuedBranches();
           })
           .catch((error: unknown) => {
             active.delete(task);
             emitBranchTrace('error', branch, error instanceof Error ? error.message : String(error));
-            fillSlots();
+            launchQueuedBranches();
           });
         active.add(task);
-        emitBranchTrace('thought', branch, `[scheduler] Branch ${branch.id} started (${active.size}/${this.branchConcurrency} slots in use).`);
+        emitBranchTrace('thought', branch, `[scheduler] Branch ${branch.id} started (RPM-governed queue, active=${active.size}).`);
       }
     };
 
-    fillSlots();
+    launchQueuedBranches();
     while (active.size > 0) {
       await Promise.race(active);
     }
 
     if (completed.length === 0 && lastTouchedBranch) {
+      if (this.finalizeBranch) {
+        emitBranchTrace('thought', lastTouchedBranch, `No branch reached a natural final answer; explicitly finalizing ${lastTouchedBranch.id}.`);
+        lastTouchedBranch.finalAnswer = await this.finalizeBranch({
+          branch: lastTouchedBranch,
+          reason: 'no branch reached a natural final answer',
+        });
+        emitBranchTrace('observation', lastTouchedBranch, 'Branch finalized because no branch reached a natural final answer.');
+      }
       lastTouchedBranch.finalAnswer = lastTouchedBranch.finalAnswer || 'No branch produced a final answer.';
       completed.push(lastTouchedBranch);
     }
 
     const finalBranches = completed
-      .filter((branch) => typeof branch.finalAnswer === 'string' && branch.finalAnswer.length > 0)
-      .slice(0, this.maxCompletedBranches);
+      .filter((branch) => typeof branch.finalAnswer === 'string' && branch.finalAnswer.length > 0);
     const synthesized = await this.synthesize(userMessage, priorTranscript, finalBranches);
     this.emit({ type: 'final', content: synthesized });
     return synthesized;
