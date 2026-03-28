@@ -5,6 +5,7 @@ import {
   estimateTranscriptTokens,
   getModelContextLimit,
   computeContextBudget,
+  compressBranchTranscript,
   compressTranscript,
   getCompressionLevel,
   checkContextAndCompress,
@@ -235,6 +236,28 @@ test('compressTranscript: single message returned as-is', () => {
   const result = compressTranscript(messages, 10);
   assert.equal(result.length, 1);
   assert.equal(result[0].content, 'Just one message');
+});
+
+test('compressBranchTranscript: preserves web search query in compressed observation markers', () => {
+  const messages = [
+    { role: 'user', content: 'Research Qin Shi Huang' },
+    {
+      role: 'assistant',
+      content: 'PLANNER TOOL DECISION:\n- web | arguments: {"mode":"search","query":"Qin Shi Huang burning books historical debate"}',
+    },
+    {
+      role: 'user',
+      content: 'TOOL OBSERVATION for web search query="Qin Shi Huang burning books historical debate":\n{"kind":"web_search","query":"Qin Shi Huang burning books historical debate","results":[{"title":"Britannica","url":"https://example.com","snippet":"..." }]}',
+    },
+    { role: 'assistant', content: 'Follow-up thought' },
+    { role: 'user', content: 'Recent observation A' },
+    { role: 'assistant', content: 'Recent observation B' },
+    { role: 'user', content: 'Recent observation C' },
+  ];
+
+  const compressed = compressBranchTranscript(messages, { tailKeep: 3, maxSummaryChars: 600 });
+  const summary = String(compressed[1]?.content || '');
+  assert.match(summary, /web search query="Qin Shi Huang burning books historical debate"/);
 });
 
 // ── checkContextAndCompress ────────────────────────────────────────────────

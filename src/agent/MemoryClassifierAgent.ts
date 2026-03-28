@@ -394,12 +394,9 @@ export class MemoryClassifierAgent {
         atomic_knowledge: atomic.slice(0, 20) as AtomicKnowledgeItem[],
       };
     } catch {
-      // LLM threw an exception — run heuristic fallback, but skip it for
-      // error/failure/no-result answers since there's nothing useful to extract.
-      if (this.isErrorOrFailureAnswer(answer)) {
-        return { user_preferences: [], agent_skills: [], atomic_knowledge: [] };
-      }
-      return this.fallbackExtractMemory(input, answer);
+      // Stay conservative on extraction failure instead of guessing semantics
+      // from hard-coded keyword heuristics.
+      return { user_preferences: [], agent_skills: [], atomic_knowledge: [] };
     }
   }
 
@@ -439,41 +436,6 @@ export class MemoryClassifierAgent {
     }
   }
 
-  private fallbackExtractMemory(input: string, answer: string): MemoryExtraction {
-    const text = `${input}\n${answer}`;
-    const preferences: Array<{ topic: string; preference: string; evidence: string }> = [];
-    const skills: Array<{ skill_id: string; title: string; content: string; tags: string[] }> = [];
-
-    const habitRegex = /(偏好|喜欢|习惯|不喜欢|讨厌|避免)[^。\\n]{0,120}/;
-    const habitMatch = text.match(habitRegex);
-    if (habitMatch) {
-      const phrase = habitMatch[0].trim();
-      const topic = phrase.slice(0, 32);
-      preferences.push({
-        topic,
-        preference: this.normalizeSummary(phrase, topic),
-        evidence: this.normalizeDetails(phrase, topic),
-      });
-    }
-
-    const hasSteps = /步骤|流程|最佳实践|注意事项|操作方法|建议/.test(text) || /\\n\\s*\\d+\./.test(text);
-    if (hasSteps) {
-      const key = this.toSlug(answer.slice(0, 64) || 'general_skill').slice(0, 56) || 'general_skill';
-      skills.push({
-        skill_id: `skill_${key}`,
-        title: this.normalizeSummary(answer.slice(0, 120), key),
-        content: this.normalizeDetails(answer.slice(0, 600), key),
-        tags: ['auto'],
-      });
-    }
-
-    return {
-      user_preferences: preferences.slice(0, 8),
-      agent_skills: skills.slice(0, 8),
-      atomic_knowledge: this.fallbackExtractAtomic(input, answer),
-    };
-  }
-
   private loadMemoryClassifierSkill(): string {
     const skillPath = path.join(this.codeCliRoot, 'skills', 'memory-classification', 'SKILL.md');
     if (!fs.existsSync(skillPath)) {
@@ -485,46 +447,6 @@ export class MemoryClassifierAgent {
     } catch {
       return '';
     }
-  }
-
-  private isPreferenceLine(line: string): boolean {
-    const lc = line.toLowerCase();
-    return lc.includes('prefer')
-      || lc.includes('preference')
-      || lc.includes('习惯')
-      || lc.includes('偏好')
-      || lc.includes('默认')
-      || lc.includes('希望')
-      || lc.includes('请用')
-      || lc.includes('请保持');
-  }
-
-  private isNoiseLine(line: string): boolean {
-    const lc = line.toLowerCase();
-    if (lc.length < 8) {
-      return true;
-    }
-    return lc.includes('command executed successfully')
-      || lc.includes('deprecatedwarning')
-      || lc.includes('unknown tool')
-      || lc.includes('initializing react agent context')
-      || lc.includes('initializing branching react context')
-      || lc.includes('mempedia process exited with code');
-  }
-
-  private isValuableKnowledgeLine(line: string): boolean {
-    if (this.isNoiseLine(line)) {
-      return false;
-    }
-    const cleaned = line.trim();
-    if (cleaned.length < 12) {
-      return false;
-    }
-    const lc = cleaned.toLowerCase();
-    if (lc.includes('hello') || lc.includes('hi') || lc.includes('thanks') || lc.includes('你好')) {
-      return false;
-    }
-    return true;
   }
 
   private firstSentence(text: string): string {
@@ -539,144 +461,6 @@ export class MemoryClassifierAgent {
       return trimmed.slice(0, match[0].length).replace(/[\n\r]+/g, ' ').trim();
     }
     return trimmed.slice(0, 200);
-  }
-
-  private collectAtomicCandidates(input: string, answer: string): string[] {
-    const candidates: string[] = [];
-    const seen = new Set<string>();
-    const push = (value: string) => {
-      const cleaned = value.replace(/\s+/g, ' ').trim();
-      if (cleaned.length < 2 || cleaned.length > 80) {
-        return;
-      }
-      if (this.isPreferenceLine(cleaned)) {
-        return;
-      }
-      const slug = this.toSlug(cleaned);
-      if (seen.has(slug)) {
-        return;
-      }
-      seen.add(slug);
-      candidates.push(cleaned);
-    };
-
-    const backtickRegex = /`([^`]{2,80})`/g;
-    const quotedRegex = /"([^"]{2,80})"/g;
-    const pathRegex = /\b[\w.-]+\/[\w./-]+\b/g;
-
-    // Only scan the answer text — scanning input (which contains skill guidance with
-    // backtick-wrapped tool names) causes framework tool names to be extracted as keywords.
-    const textPool = answer;
-    let match: RegExpExecArray | null = null;
-    while ((match = backtickRegex.exec(textPool))) {
-      push(match[1]);
-    }
-    while ((match = quotedRegex.exec(textPool))) {
-      push(match[1]);
-    }
-    while ((match = pathRegex.exec(textPool))) {
-      push(match[0]);
-    }
-
-    const answerLines = answer.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    for (const line of answerLines) {
-      if (line.startsWith('#')) {
-        push(line.replace(/^#+\s*/, ''));
-        continue;
-      }
-      const colonIndex = line.indexOf(':') >= 0 ? line.indexOf(':') : line.indexOf('：');
-      if (colonIndex > 1 && colonIndex < 60) {
-        push(line.slice(0, colonIndex));
-        continue;
-      }
-      if (line.includes(' - ')) {
-        const [left] = line.split(' - ');
-        push(left);
-      }
-    }
-
-    // For the user request line, strip skill guidance first so we don't extract tool names.
-    const strippedRequest = this.stripSkillGuidance(input);
-    const requestFirstLine = strippedRequest.split(/\r?\n/).map((line) => line.trim()).find((line) => line.length >= 8);
-    if (requestFirstLine) {
-      const trimmed = requestFirstLine.replace(/[\p{P}\p{S}]+/gu, ' ').trim();
-      push(trimmed.slice(0, 60));
-    }
-
-    return candidates.slice(0, 8);
-  }
-
-  private isErrorOrFailureAnswer(answer: string): boolean {
-    const compact = answer.replace(/\s+/g, ' ').trim();
-    if (compact.length < 20) {
-      return false;
-    }
-    // Hard infrastructure errors
-    if (/\b(no such file or directory|binary not found|command not found|cannot connect|connection refused|inaccessible or invalid|failed to fetch|unable to access|permission denied|404 not found|403 forbidden|requested wikipedia url)\b/i.test(compact)) {
-      return true;
-    }
-    // Negative-result / "no info found" responses — these carry no reusable knowledge
-    if (/\b(no information about|contain no information|no results? (?:found|about|for)|nothing (?:found|about|related)|no relevant information|not found in (?:the|this)|does not contain|doesn['’]t contain|had no results?|returned no results?|failed due to connectivity|web search (?:attempt )?failed)\b/i.test(compact)) {
-      return true;
-    }
-    if (compact.length < 400 && /^(error|an error|the system encountered an error|failed to|could not|unable to|sorry|unfortunately)\b/i.test(compact)) {
-      return true;
-    }
-    return false;
-  }
-
-  private fallbackExtractAtomic(input: string, answer: string): AtomicKnowledgeItem[] {
-    if (this.isErrorOrFailureAnswer(answer)) {
-      return [];
-    }
-    const candidates = this.collectAtomicCandidates(input, answer);
-    if (candidates.length === 0) {
-      return [];
-    }
-    const answerLines = answer
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0 && this.isValuableKnowledgeLine(line));
-    // Discard answers that are purely greeting text — they have no extractable knowledge.
-    const safeSummarySeed = this.firstSentence(answer) || this.firstSentence(input) || '';
-    const summarySeed = this.isGreetingText(safeSummarySeed) ? '' : safeSummarySeed;
-    const candidateSet = new Set(candidates.map((candidate) => candidate.toLowerCase()));
-
-    return candidates.map((candidate) => {
-      // Re-apply weak keyword filter on candidates from the fallback extractor
-      // (collectAtomicCandidates doesn't call this check).
-      if (this.isWeakAtomicKeyword(candidate)) {
-        return null;
-      }
-      const candidateLower = candidate.toLowerCase();
-      const matchingLines = answerLines.filter((line) => line.toLowerCase().includes(candidateLower));
-      const detailsSource = matchingLines.slice(0, 3).join('\n') || answerLines.slice(0, 3).join('\n') || summarySeed || candidate;
-      const summarySource = matchingLines[0] || summarySeed || candidate;
-      const history = detailsSource === summarySource ? [] : [detailsSource];
-      const facts = matchingLines.slice(0, 4);
-      const dataPoints = facts.filter((line) => /\d/.test(line)).slice(0, 4);
-      const relations = candidates
-        .filter((other) => other.toLowerCase() !== candidateLower && candidateSet.has(other.toLowerCase()))
-        .slice(0, 4);
-      const summary = this.normalizeSummary(summarySource, candidate);
-      // Skip fallback candidates that can't produce a real summary.
-      if (this.isGreetingText(summary) || summary === `${candidate} summary`) {
-        return null;
-      }
-      return {
-        keyword: candidate,
-        summary,
-        description: this.normalizeDetails(detailsSource, candidate),
-        facts,
-        data_points: dataPoints,
-        truths: [],
-        viewpoints: [],
-        history,
-        uncertainties: [],
-        evidence: [],
-        relations,
-      };
-    }).filter((item): item is NonNullable<typeof item> => item !== null && Boolean(item.keyword) && Boolean(item.summary)) as AtomicKnowledgeItem[];
   }
 
   private normalizeStringList(value: unknown, limit: number): string[] {

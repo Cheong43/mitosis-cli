@@ -390,6 +390,75 @@ function parseToolCallsFromFallbackPayload<TParsed>(
   };
 }
 
+/**
+ * Try to parse XML-formatted tool calls that some models (MiniMax, Qwen, etc.)
+ * emit in the text body instead of native tool-call blocks.
+ * Supports patterns:
+ *   <minimax:tool_call><invoke name="..."><parameter name="...">...</parameter></invoke></minimax:tool_call>
+ *   <tool_call><invoke name="...">...</invoke></tool_call>
+ *   <invoke name="..."><parameter name="...">...</parameter></invoke>
+ * Returns null if no parseable XML tool calls are found.
+ */
+function tryParseXmlToolCalls<TParsed>(
+  text: string,
+  toolMap: Map<string, ParseableFunctionTool<TParsed>>,
+): JsonFallbackParseResult<TParsed> | null {
+  if (!text || !/<invoke\s+name=/i.test(text)) {
+    return null;
+  }
+
+  // Extract all <invoke name="toolName">...</invoke> blocks
+  const invokePattern = /<invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/invoke>/gi;
+  const rawCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  let match: RegExpExecArray | null;
+  while ((match = invokePattern.exec(text)) !== null) {
+    const toolName = match[1];
+    const body = match[2];
+    const args: Record<string, unknown> = {};
+    // Extract <parameter name="key">value</parameter>
+    const paramPattern = /<parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/parameter>/gi;
+    let paramMatch: RegExpExecArray | null;
+    while ((paramMatch = paramPattern.exec(body)) !== null) {
+      const key = paramMatch[1];
+      let value: unknown = paramMatch[2];
+      // Try to parse JSON values (objects, arrays, numbers, booleans)
+      const trimmedValue = String(value).trim();
+      if (/^[{\[]/.test(trimmedValue)) {
+        try { value = JSON.parse(trimmedValue); } catch { /* keep as string */ }
+      }
+      args[key] = value;
+    }
+    rawCalls.push({ name: toolName, args });
+  }
+
+  if (rawCalls.length === 0) {
+    return null;
+  }
+
+  // Verify all tool names are known
+  const calls: ParsedToolCall<TParsed>[] = [];
+  for (const rawCall of rawCalls) {
+    const tool = toolMap.get(rawCall.name);
+    if (!tool) {
+      return null; // Unknown tool — fall through to JSON fallback
+    }
+    try {
+      calls.push({
+        name: tool.name,
+        input: tool.parse(rawCall.args),
+      });
+    } catch {
+      return null; // Parse failure — fall through to JSON fallback
+    }
+  }
+
+  // Extract thought text (everything before the first XML tool block)
+  const firstXmlIndex = text.search(/<(?:[a-z_][a-z0-9_-]*:)?(?:tool_call|invoke)\b/i);
+  const thoughtText = firstXmlIndex > 0 ? text.slice(0, firstXmlIndex).trim() : '';
+
+  return { calls, text: thoughtText };
+}
+
 async function generateToolCallsJsonFallback<TParsed>(
   options: GenerateToolCallsOptions<TParsed>,
   toolMap: Map<string, ParseableFunctionTool<TParsed>>,
@@ -683,6 +752,11 @@ export async function generateToolCalls<TParsed>(
       if (!NoToolCallGeneratedError.isInstance(error) && !NoObjectGeneratedError.isInstance(error)) {
         throw error;
       }
+      // Middle fallback: try parsing XML tool calls from text before re-prompting
+      const xmlResult = tryParseXmlToolCalls(text, toolMap);
+      if (xmlResult) {
+        return xmlResult;
+      }
       return generateToolCallsJsonFallback(options, toolMap, clipPreview(text));
     }
   }
@@ -732,6 +806,11 @@ export async function generateToolCalls<TParsed>(
   } catch (error) {
     if (!NoToolCallGeneratedError.isInstance(error) && !NoObjectGeneratedError.isInstance(error)) {
       throw error;
+    }
+    // Middle fallback: try parsing XML tool calls from text before re-prompting
+    const xmlResult = tryParseXmlToolCalls(text, toolMap);
+    if (xmlResult) {
+      return xmlResult;
     }
     return generateToolCallsJsonFallback(options, toolMap, clipPreview(text));
   }

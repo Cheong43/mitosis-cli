@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentRuntime } from './AgentRuntime.js';
-import type { AgentStep, SynthesisResult, TranscriptMessage } from './types.js';
+import type { AgentStep, AgentTraceEvent, SynthesisResult, TranscriptMessage } from './types.js';
 
 class FakePlanner {
   constructor(private readonly planFn: (transcript: TranscriptMessage[]) => Promise<AgentStep>) {}
@@ -110,6 +110,36 @@ test('branch transcripts record planner decisions as text markers instead of leg
   assert.equal(answer, 'branch transcript clean');
 });
 
+test('web observations keep the search query in the branch transcript', async () => {
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => String(message.content)).join('\n');
+
+    if (serialized.includes('TOOL OBSERVATION for web search query=')) {
+      assert.match(serialized, /TOOL OBSERVATION for web search query="Qin Shi Huang tomb army"/);
+      return {
+        kind: 'final',
+        content: 'web transcript keeps query',
+      };
+    }
+
+    return {
+      kind: 'tool',
+      toolCalls: [
+        { name: 'web', arguments: { mode: 'search', query: 'Qin Shi Huang tomb army' } },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(async () => '{"kind":"web_search","query":"Qin Shi Huang tomb army","results":[]}'),
+    maxSteps: 2,
+  });
+
+  const answer = await runtime.run('search history should be preserved');
+  assert.equal(answer, 'web transcript keeps query');
+});
+
 test('branches execute concurrently up to branchConcurrency', async () => {
   let maxObservedConcurrency = 0;
   let currentConcurrency = 0;
@@ -164,6 +194,140 @@ test('branches execute concurrently up to branchConcurrency', async () => {
   assert.match(answer, /A done/);
   assert.match(answer, /B done/);
   assert.equal(maxObservedConcurrency, 2);
+});
+
+test('execution groups let sibling branches run in waves', async () => {
+  let maxObservedConcurrency = 0;
+  let currentConcurrency = 0;
+  const completedLabels: string[] = [];
+
+  const toolRuntime = new FakeToolRuntime(async (_toolName, args) => {
+    const label = String(args.label || '');
+    if (label === 'C') {
+      assert.ok(completedLabels.includes('A'), 'C should wait for A to complete');
+      assert.ok(completedLabels.includes('B'), 'C should wait for B to complete');
+    }
+    currentConcurrency += 1;
+    maxObservedConcurrency = Math.max(maxObservedConcurrency, currentConcurrency);
+    await new Promise((resolve) => setTimeout(resolve, label === 'C' ? 20 : 80));
+    currentConcurrency -= 1;
+    return { ok: true };
+  });
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => message.content).join('\n');
+    const childMatch = serialized.match(/child branch "([^"]+)"/);
+    const childLabel = childMatch ? childMatch[1] : '';
+
+    if (serialized.includes('TOOL OBSERVATION for wait_tool')) {
+      completedLabels.push(childLabel);
+      return {
+        kind: 'final',
+        content: `${childLabel} done`,
+      };
+    }
+
+    if (childLabel) {
+      return {
+        kind: 'tool',
+        toolCalls: [{ name: 'wait_tool', arguments: { label: childLabel } }],
+      };
+    }
+
+    return {
+      kind: 'branch',
+      branches: [
+        { label: 'A', goal: 'First wave A', priority: 1, executionGroup: 1 },
+        { label: 'B', goal: 'First wave B', priority: 1, executionGroup: 1 },
+        { label: 'C', goal: 'Second wave C', priority: 1, executionGroup: 2 },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime,
+    maxSteps: 2,
+    maxBranchDepth: 1,
+    maxBranchWidth: 3,
+    maxCompletedBranches: 3,
+    branchConcurrency: 2,
+    synthesizeFinal: async ({ branches }) => branches.map((branch) => branch.finalAnswer).join(' | '),
+  });
+
+  const answer = await runtime.run('run grouped waves');
+  assert.match(answer, /A done/);
+  assert.match(answer, /B done/);
+  assert.match(answer, /C done/);
+  assert.equal(maxObservedConcurrency, 2);
+  assert.equal(completedLabels.includes('C'), true);
+});
+
+test('depends_on gates same-group siblings until prerequisites complete', async () => {
+  let maxObservedConcurrency = 0;
+  let currentConcurrency = 0;
+  const completedLabels: string[] = [];
+
+  const toolRuntime = new FakeToolRuntime(async (_toolName, args) => {
+    const label = String(args.label || '');
+    if (label === 'C') {
+      assert.ok(completedLabels.includes('A'), 'C should wait for A to complete');
+      assert.ok(completedLabels.includes('B'), 'C should wait for B to complete');
+    }
+    currentConcurrency += 1;
+    maxObservedConcurrency = Math.max(maxObservedConcurrency, currentConcurrency);
+    await new Promise((resolve) => setTimeout(resolve, label === 'C' ? 20 : 80));
+    currentConcurrency -= 1;
+    return { ok: true };
+  });
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => message.content).join('\n');
+    const childMatch = serialized.match(/child branch "([^"]+)"/);
+    const childLabel = childMatch ? childMatch[1] : '';
+
+    if (serialized.includes('TOOL OBSERVATION for wait_tool')) {
+      completedLabels.push(childLabel);
+      return {
+        kind: 'final',
+        content: `${childLabel} done`,
+      };
+    }
+
+    if (childLabel) {
+      return {
+        kind: 'tool',
+        toolCalls: [{ name: 'wait_tool', arguments: { label: childLabel } }],
+      };
+    }
+
+    return {
+      kind: 'branch',
+      branches: [
+        { label: 'A', goal: 'First dependency A', priority: 1, executionGroup: 1 },
+        { label: 'B', goal: 'First dependency B', priority: 1, executionGroup: 1 },
+        { label: 'C', goal: 'Follow-up C', priority: 1, executionGroup: 1, dependsOn: ['A', 'B'] },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime,
+    maxSteps: 2,
+    maxBranchDepth: 1,
+    maxBranchWidth: 3,
+    maxCompletedBranches: 3,
+    branchConcurrency: 3,
+    synthesizeFinal: async ({ branches }) => branches.map((branch) => branch.finalAnswer).join(' | '),
+  });
+
+  const answer = await runtime.run('run sibling prerequisites');
+  assert.match(answer, /A done/);
+  assert.match(answer, /B done/);
+  assert.match(answer, /C done/);
+  assert.equal(maxObservedConcurrency, 2);
+  assert.equal(completedLabels.includes('C'), true);
 });
 
 test('branches are unlimited by default and rely on external throttling unless a cap is set', async () => {
@@ -221,6 +385,105 @@ test('branches are unlimited by default and rely on external throttling unless a
   assert.match(answer, /B done/);
   assert.match(answer, /C done/);
   assert.equal(maxObservedConcurrency, 3);
+});
+
+test('later branches receive a shared kanban snapshot in their planning transcript', async () => {
+  let sawKanbanSnapshot = false;
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => message.content).join('\n');
+
+    if (serialized.includes('child branch "Alpha"')) {
+      return {
+        kind: 'final' as const,
+        content: 'alpha ready',
+        outcome: 'success',
+      };
+    }
+
+    if (serialized.includes('child branch "Beta"')) {
+      assert.match(serialized, /Shared branch kanban snapshot:/);
+      assert.match(serialized, /\[B0\.1\] Alpha:/);
+      assert.match(serialized, /status=completed/);
+      assert.match(serialized, /result=alpha ready/);
+      sawKanbanSnapshot = true;
+      return {
+        kind: 'final' as const,
+        content: 'beta ready',
+        outcome: 'success',
+      };
+    }
+
+    return {
+      kind: 'branch' as const,
+      thought: 'split into alpha then beta',
+      branches: [
+        { label: 'Alpha', goal: 'Finish alpha first', priority: 1 },
+        { label: 'Beta', goal: 'Reuse sibling results', priority: 0.2 },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 2,
+    maxBranchDepth: 1,
+    maxBranchWidth: 2,
+    branchConcurrency: 1,
+    maxCompletedBranches: 2,
+    synthesizeFinal: async ({ branches }) => branches.map((branch) => branch.finalAnswer).join(' + '),
+  });
+
+  const answer = await runtime.run('share branch board');
+  assert.equal(answer, 'alpha ready + beta ready');
+  assert.equal(sawKanbanSnapshot, true);
+});
+
+test('trace metadata carries structured kanban cards with artifacts and summaries', async () => {
+  const traces: AgentTraceEvent[] = [];
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => message.content).join('\n');
+    if (serialized.includes('TOOL OBSERVATION for read:')) {
+      return {
+        kind: 'final' as const,
+        content: 'note checked',
+        completionSummary: 'Verified note.txt',
+        outcome: 'success',
+      };
+    }
+
+    return {
+      kind: 'tool' as const,
+      toolCalls: [{ name: 'read', arguments: { path: 'note.txt' } }],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(async () => 'contents ok'),
+    maxSteps: 2,
+    onTrace: (event) => {
+      traces.push(event);
+    },
+  });
+
+  const answer = await runtime.run('inspect note');
+  assert.equal(answer, 'note checked');
+
+  const toolObservation = traces.find((event) => event.type === 'observation' && String(event.content).includes('contents ok'));
+  const toolCard = toolObservation?.metadata?.kanbanCard as any;
+  assert.ok(toolCard, 'tool observation should include kanban card metadata');
+  assert.equal(toolCard?.status, 'active');
+  assert.deepEqual(toolCard?.artifacts, ['note.txt']);
+  assert.match(String(toolCard?.summary || ''), /read:/i);
+
+  const completionObservation = traces.find((event) => event.type === 'observation' && String(event.content).includes('Branch completed'));
+  const completionCard = completionObservation?.metadata?.kanbanCard as any;
+  assert.ok(completionCard, 'completion observation should include kanban card metadata');
+  assert.equal(completionCard?.status, 'completed');
+  assert.match(String(completionCard?.summary || ''), /Verified note\.txt|note checked/);
 });
 
 test('planner fallback finals trigger explicit branch finalization before synthesis', async () => {
@@ -439,6 +702,116 @@ test('synthesizeFinal returning done=false triggers remediation re-branch', asyn
   assert.ok(answer.includes('codeA-ok'), 'final answer should include the successful branch result');
 });
 
+test('structured remediation handoff is injected into retry child transcripts', async () => {
+  let sawStructuredHandoff = false;
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => message.content).join('\n');
+
+    if (serialized.includes('child branch "fix: Needs fix"')) {
+      assert.match(serialized, /Structured remediation handoff:/);
+      assert.match(serialized, /canonical_task: Needs fix/);
+      assert.match(serialized, /must_not_repeat:/);
+      assert.match(serialized, /successful_attempts:/);
+      sawStructuredHandoff = true;
+      return {
+        kind: 'final' as const,
+        content: 'retry-fixed',
+        outcome: 'success',
+        disposition: 'resolved',
+      };
+    }
+
+    if (serialized.includes('child branch "Stable"')) {
+      return {
+        kind: 'final' as const,
+        content: 'stable-ok',
+        outcome: 'success',
+        disposition: 'resolved',
+      };
+    }
+
+    if (serialized.includes('child branch "Needs fix"')) {
+      return {
+        kind: 'final' as const,
+        content: 'needs-fix-partial',
+        outcome: 'partial',
+        outcomeReason: 'missing the exact API field',
+        disposition: 'missing_evidence',
+      };
+    }
+
+    return {
+      kind: 'branch' as const,
+      thought: 'split root',
+      branches: [
+        { label: 'Stable', goal: 'Return a stable answer', priority: 1 },
+        { label: 'Needs fix', goal: 'Create a retryable evidence gap', priority: 0.9 },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 3,
+    maxBranchDepth: 2,
+    maxBranchWidth: 3,
+    maxCompletedBranches: 8,
+    maxSynthesisRetries: 2,
+    synthesizeFinal: async ({ branches, synthesisRetry, maxSynthesisRetries }) => {
+      const fixSucceeded = branches.some((branch) => branch.label === 'fix: Needs fix' && branch.outcome === 'success');
+      const unresolved = branches.filter((branch) =>
+        (branch.outcome === 'partial' || branch.outcome === 'failed')
+        && !fixSucceeded,
+      );
+      if (unresolved.length > 0 && synthesisRetry < maxSynthesisRetries) {
+        return {
+          done: false,
+          branches: [{
+            label: 'fix: Needs fix',
+            goal: 'Continue from the previous partial result',
+            priority: 0.9,
+            handoff: {
+              canonicalTaskId: 'Needs fix',
+              retryOfBranchId: unresolved[0].id,
+              disposition: 'missing_evidence',
+              missingFields: ['exact API field'],
+              mustNotRepeat: ['Do not rerun the same generic search'],
+            },
+          }],
+          context: 'Stable succeeded, Needs fix is missing one exact API field.',
+          handoff: {
+            retryIndex: synthesisRetry + 1,
+            successfulAttempts: [{
+              branchId: 'B0.1',
+              label: 'Stable',
+              canonicalTaskId: 'Stable',
+              summary: 'stable-ok',
+            }],
+            unresolvedAttempts: [{
+              canonicalTaskId: 'Needs fix',
+              retryOfBranchId: unresolved[0].id,
+              disposition: 'missing_evidence',
+            }],
+          },
+        } satisfies SynthesisResult;
+      }
+      return {
+        done: true,
+        answer: branches
+          .filter((branch) => branch.outcome === 'success')
+          .map((branch) => branch.finalAnswer)
+          .join(' + '),
+      } satisfies SynthesisResult;
+    },
+  });
+
+  const answer = await runtime.run('test structured remediation handoff');
+  assert.equal(answer, 'stable-ok + retry-fixed');
+  assert.equal(sawStructuredHandoff, true);
+});
+
 test('re-branch respects maxSynthesisRetries and forces done on limit', async () => {
   let synthesisCallCount = 0;
 
@@ -490,6 +863,145 @@ test('re-branch respects maxSynthesisRetries and forces done on limit', async ()
   // 1 initial + 2 retries = 3 synthesis calls
   assert.equal(synthesisCallCount, 3, 'synthesis called 3 times (initial + 2 retries)');
   assert.equal(answer, 'gave-up');
+});
+
+test('branch execution errors are recorded and still reach synthesis', async () => {
+  let sawFailedBranch = false;
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => message.content).join('\n');
+
+    if (serialized.includes('child branch "Pass"')) {
+      return {
+        kind: 'final' as const,
+        content: 'pass-ok',
+        outcome: 'success',
+      };
+    }
+
+    if (serialized.includes('child branch "Boom"')) {
+      throw new Error('simulated planner crash');
+    }
+
+    return {
+      kind: 'branch' as const,
+      thought: 'split into success and failure',
+      branches: [
+        { label: 'Pass', goal: 'Return a success answer', priority: 1 },
+        { label: 'Boom', goal: 'Crash while planning', priority: 0.9 },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 2,
+    maxBranchDepth: 1,
+    maxBranchWidth: 2,
+    maxCompletedBranches: 4,
+    synthesizeFinal: async ({ branches }) => {
+      sawFailedBranch = branches.some((branch) =>
+        branch.label === 'Boom'
+        && branch.outcome === 'failed'
+        && /simulated planner crash/i.test(branch.outcomeReason || ''),
+      );
+      return 'synthesized-after-error';
+    },
+  });
+
+  const answer = await runtime.run('handle branch errors');
+  assert.equal(answer, 'synthesized-after-error');
+  assert.equal(sawFailedBranch, true);
+});
+
+test('finalizeBranch failures fall back to the runtime placeholder answer', async () => {
+  const planner = new FakePlanner(async () => ({
+    kind: 'tool' as const,
+    toolCalls: [{ name: 'read', arguments: { path: 'note.txt' } }],
+  }));
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(async () => 'still-working'),
+    maxSteps: 1,
+    maxTotalSteps: 2,
+    finalizeBranch: async () => {
+      throw new Error('finalize network failed');
+    },
+  });
+
+  const answer = await runtime.run('force finalization failure');
+  assert.equal(answer, 'Branch B0 stopped because step budget reached.');
+});
+
+test('synthesis hook failures fall back to the default runtime synthesis answer', async () => {
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => message.content).join('\n');
+
+    if (serialized.includes('child branch "Only"')) {
+      return {
+        kind: 'final' as const,
+        content: 'single-branch-answer',
+        outcome: 'success',
+      };
+    }
+
+    return {
+      kind: 'branch' as const,
+      thought: 'one child',
+      branches: [{ label: 'Only', goal: 'finish once', priority: 1 }],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 2,
+    maxBranchDepth: 1,
+    synthesizeFinal: async () => {
+      throw new Error('synthesis provider timeout');
+    },
+  });
+
+  const answer = await runtime.run('fallback after synthesis error');
+  assert.equal(answer, 'single-branch-answer');
+});
+
+test('empty remediation requests do not loop forever and fall back to synthesis answer', async () => {
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => message.content).join('\n');
+
+    if (serialized.includes('child branch "Needs fix"')) {
+      return {
+        kind: 'final' as const,
+        content: 'branch-failed',
+        outcome: 'failed',
+        outcomeReason: 'still broken',
+      };
+    }
+
+    return {
+      kind: 'branch' as const,
+      thought: 'create one failing branch',
+      branches: [{ label: 'Needs fix', goal: 'fail once', priority: 1 }],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 2,
+    maxBranchDepth: 1,
+    synthesizeFinal: async () => ({
+      done: false as const,
+      branches: [],
+      context: 'nothing to retry',
+    }),
+  });
+
+  const answer = await runtime.run('avoid empty remediation loop');
+  assert.equal(answer, 'branch-failed');
 });
 
 test('synthesizeFinal returning plain string still works (backward compat)', async () => {

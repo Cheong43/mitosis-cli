@@ -119,26 +119,30 @@ header{display:flex;align-items:center;height:var(--hh);padding:0 16px;backgroun
 .bp-title{font-weight:600;color:var(--tx);font-size:12px}
 .bp-meta{flex:1;font-size:11px}
 .bp-body{display:none;background:var(--sf)}
-.bp.open .bp-body{display:flex;flex-direction:row}
+.bp.open .bp-body{display:flex;flex-direction:row;align-items:stretch}
 
 /* SVG tree panel */
 .bv-svg-wrap{flex:1;min-width:0;overflow:auto;padding:12px;min-height:120px}
 .bv-svg-wrap svg{display:block}
 
 /* Branch sidebar list */
-.bv-sidebar{width:240px;flex-shrink:0;border-left:1px solid var(--bds);overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:5px;max-height:300px}
-.bv-node-card{padding:5px 8px;border-radius:var(--rs);border:1px solid var(--bds);background:var(--sf)}
-.bv-node-card.is-active{border-color:var(--acc);background:var(--acc2)}
+.bv-sidebar{width:240px;flex-shrink:0;align-self:stretch;border-left:1px solid var(--bds);overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:5px;max-height:none}
+.bv-node-card{padding:5px 8px;border-radius:var(--rs);border:1px solid var(--bds);background:var(--sf);transition:background .15s,border-color .15s,box-shadow .15s}
+.bv-node-card.is-active{box-shadow:0 0 0 1px rgba(63,53,43,.06),0 6px 18px rgba(74,60,41,.10)}
 .bv-nc-id{font-size:11px;font-weight:700;font-family:"SFMono-Regular",Consolas,Menlo,monospace}
 .bv-nc-lbl{font-size:11px;color:var(--dim);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bv-nc-tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.bv-tag{display:inline-flex;align-items:center;padding:1px 6px;border-radius:999px;font-size:10px;line-height:1.5;border:1px solid var(--bds);background:var(--sf2);color:var(--dim)}
+.bv-tag.phase{border-color:rgba(47,111,143,.25);color:var(--acc);background:rgba(47,111,143,.08)}
+.bv-tag.kind{border-color:rgba(138,95,35,.18);color:#875d24;background:rgba(194,139,47,.08)}
 .bv-nc-trace{font-size:10.5px;margin-top:2px;line-height:1.4;color:var(--gray);font-style:italic;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-/* Progress row */
-.bp-prog{display:flex;gap:10px;padding:7px 12px;background:var(--sf);border-top:1px solid var(--bds);font-size:11px;align-items:center}
-.pg-lbl{color:var(--dim);width:34px;text-align:right;flex-shrink:0}
-.pg-bar{flex:1;height:5px;background:var(--sf2);border-radius:3px;overflow:hidden}
-.pg-fill{height:100%;border-radius:3px;transition:width .4s}
-.pg-num{width:44px;color:var(--dim);text-align:right}
+/* Summary row */
+.bp-summary{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px;background:var(--sf);border-top:1px solid var(--bds)}
+.bp-chip{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:10.5px;line-height:1.6;background:var(--sf2);color:var(--dim);border:1px solid var(--bds)}
+.bp-chip.phase{font-weight:600}
+.bp-note{padding:0 12px 10px;background:var(--sf);color:var(--dim);font-size:11px;line-height:1.55}
+.bp-note:empty{display:none}
 
 /* Trace accordion */
 .tr-toggle{display:flex;align-items:center;gap:6px;padding:4px 0 5px;font-size:11px;color:var(--dim);cursor:pointer;user-select:none}
@@ -356,6 +360,24 @@ const STATUS_COLOR = {
 };
 const STATUS_GLYPH = {active:'◆', completed:'●', queued:'○', finalizing:'◐', error:'✖'};
 const TRACE_ICON   = {thought:'🤔', action:'⚡', observation:'👁', error:'❌'};
+const PHASE_LABEL  = {
+  branching: 'Branching',
+  synthesizing: 'Synthesizing',
+  rebranching: 'Rebranching',
+  complete: 'Complete'
+};
+const PHASE_COLOR  = {
+  branching: '#539bf5',
+  synthesizing: '#c69026',
+  rebranching: '#9e6dff',
+  complete: '#46954a'
+};
+const BRANCH_CARD_PALETTE = [
+  { border: '#539bf5', bg: 'rgba(83,155,245,0.12)', title: '#2f6f8f', phaseBg: 'rgba(83,155,245,0.10)', phaseBorder: 'rgba(83,155,245,0.28)', kindBg: 'rgba(83,155,245,0.07)', kindBorder: 'rgba(83,155,245,0.20)' },
+  { border: '#c69026', bg: 'rgba(198,144,38,0.12)', title: '#875d24', phaseBg: 'rgba(198,144,38,0.10)', phaseBorder: 'rgba(198,144,38,0.24)', kindBg: 'rgba(198,144,38,0.07)', kindBorder: 'rgba(198,144,38,0.18)' },
+  { border: '#57ab5a', bg: 'rgba(87,171,90,0.12)', title: '#35683a', phaseBg: 'rgba(87,171,90,0.10)', phaseBorder: 'rgba(87,171,90,0.24)', kindBg: 'rgba(87,171,90,0.07)', kindBorder: 'rgba(87,171,90,0.18)' },
+  { border: '#9e6dff', bg: 'rgba(158,109,255,0.12)', title: '#6d43bf', phaseBg: 'rgba(158,109,255,0.10)', phaseBorder: 'rgba(158,109,255,0.24)', kindBg: 'rgba(158,109,255,0.07)', kindBorder: 'rgba(158,109,255,0.18)' }
+];
 
 /* ===================================================================
    State
@@ -380,6 +402,142 @@ function dateGroup(ts) {
   const dd = new Date(ts); dd.setHours(0,0,0,0);
   const diff = td - dd;
   return diff < 864e5 ? 'Today' : diff < 1728e5 ? 'Yesterday' : diff < 6048e5 ? 'This week' : 'Older';
+}
+
+function detectBranchKind(node, id) {
+  if (!node) return 'branch';
+  if (node.kind) return node.kind;
+  if (id === 'B0' && Number(node.depth || 0) === 0) return 'root';
+  if (/^R\d+(?:\.|$)/i.test(id) || /^fix:/i.test(String(node.label || '')) || /^R\d+(?:\.|$)/i.test(String(node.parentId || ''))) {
+    return 'rebranch';
+  }
+  return 'branch';
+}
+
+function detectRetry(node, id) {
+  if (node && Number.isFinite(node.retry)) return Number(node.retry);
+  const match = String(id || '').match(/^R(\d+)(?:\.|$)/i) || String(node?.parentId || '').match(/^R(\d+)(?:\.|$)/i);
+  return match ? Number(match[1]) : null;
+}
+
+function getActiveBranchIds(snap) {
+  if (Array.isArray(snap?.activeBranchIds) && snap.activeBranchIds.length) {
+    return snap.activeBranchIds.slice();
+  }
+  return snap?.activeBranchId ? [snap.activeBranchId] : [];
+}
+
+function summarizeBranchSnap(snap) {
+  const nodes = Object.values(snap?.nodes || {});
+  const activeIds = getActiveBranchIds(snap);
+  const queued = Number.isFinite(snap?.queueCount) ? snap.queueCount : nodes.filter(node => node.status === 'queued').length;
+  const completed = Number.isFinite(snap?.completed) ? snap.completed : nodes.filter(node => node.status === 'completed').length;
+  const errors = Number.isFinite(snap?.errors) ? snap.errors : nodes.filter(node => node.status === 'error').length;
+  const rebranchCount = Number.isFinite(snap?.rebranchCount)
+    ? snap.rebranchCount
+    : nodes.reduce((max, node) => Math.max(max, detectRetry(node, node.id) || 0), 0);
+  const phase = snap?.phase || (rebranchCount > 0 && activeIds.length ? 'rebranching' : activeIds.length ? 'branching' : 'complete');
+  return {
+    nodeCount: nodes.length,
+    activeIds,
+    queued,
+    completed,
+    errors,
+    rebranchCount,
+    phase,
+    phaseLabel: PHASE_LABEL[phase] || PHASE_LABEL.branching,
+    phaseColor: PHASE_COLOR[phase] || PHASE_COLOR.branching,
+    activeLabel: activeIds[0] || (phase === 'synthesizing' ? 'synthesizing' : 'none'),
+    statusMessage: String(snap?.statusMessage || '').trim()
+  };
+}
+
+function branchMetaText(snap) {
+  const summary = summarizeBranchSnap(snap);
+  const retrySuffix = summary.rebranchCount > 0 ? ` · retry ${summary.rebranchCount}` : '';
+  return `R${snap?.round || 1} · ${summary.phaseLabel}${retrySuffix} · ${summary.nodeCount} nodes · active: ${summary.activeLabel}`;
+}
+
+function branchSummaryHtml(snap) {
+  const summary = summarizeBranchSnap(snap);
+  const chips = [
+    `<span class="bp-chip phase" style="color:${summary.phaseColor};border-color:${summary.phaseColor}33;background:${summary.phaseColor}12">${esc(summary.phaseLabel)}</span>`,
+    `<span class="bp-chip">Active ${summary.activeIds.length}</span>`,
+    `<span class="bp-chip">Queued ${summary.queued}</span>`,
+    `<span class="bp-chip">Completed ${summary.completed}</span>`,
+  ];
+  if (summary.errors > 0) chips.push(`<span class="bp-chip">Errors ${summary.errors}</span>`);
+  if (summary.rebranchCount > 0) chips.push(`<span class="bp-chip">Retry ${summary.rebranchCount}</span>`);
+  return chips.join('');
+}
+
+function branchIdHash(id) {
+  return String(id || '').split('').reduce((sum, ch) => sum + ch.charCodeAt(0), 0);
+}
+
+function strengthenAlpha(color, stronger) {
+  return stronger ? color.replace('0.12)', '0.18)').replace('0.10)', '0.16)').replace('0.07)', '0.10)') : color;
+}
+
+function getBranchCardTheme(node, id, isActive) {
+  const kind = detectBranchKind(node, id);
+  const status = String(node?.status || 'queued');
+
+  if (status === 'error') {
+    return {
+      card: `border-color:rgba(229,83,75,.55);background:${isActive ? 'rgba(229,83,75,0.16)' : 'rgba(229,83,75,0.10)'};`,
+      title: 'color:#ad2e2a;',
+      phaseTag: 'border-color:rgba(229,83,75,.34);background:rgba(229,83,75,.12);color:#ad2e2a;',
+      kindTag: 'border-color:rgba(229,83,75,.24);background:rgba(229,83,75,.08);color:#ad2e2a;'
+    };
+  }
+
+  if (status === 'completed') {
+    return {
+      card: `border-color:rgba(87,171,90,.42);background:${isActive ? 'rgba(87,171,90,0.16)' : 'rgba(87,171,90,0.10)'};`,
+      title: 'color:#35683a;',
+      phaseTag: 'border-color:rgba(87,171,90,.30);background:rgba(87,171,90,.10);color:#35683a;',
+      kindTag: 'border-color:rgba(87,171,90,.20);background:rgba(87,171,90,.07);color:#35683a;'
+    };
+  }
+
+  if (kind === 'root') {
+    return {
+      card: `border-color:rgba(83,155,245,.48);background:${isActive ? 'rgba(83,155,245,0.18)' : 'rgba(83,155,245,0.10)'};`,
+      title: 'color:#2f6f8f;',
+      phaseTag: 'border-color:rgba(83,155,245,.30);background:rgba(83,155,245,.10);color:#2f6f8f;',
+      kindTag: 'border-color:rgba(83,155,245,.22);background:rgba(83,155,245,.07);color:#2f6f8f;'
+    };
+  }
+
+  if (kind === 'rebranch') {
+    return {
+      card: `border-color:rgba(158,109,255,.45);background:${isActive ? 'rgba(158,109,255,0.18)' : 'rgba(158,109,255,0.10)'};`,
+      title: 'color:#6d43bf;',
+      phaseTag: 'border-color:rgba(158,109,255,.30);background:rgba(158,109,255,.10);color:#6d43bf;',
+      kindTag: 'border-color:rgba(158,109,255,.22);background:rgba(158,109,255,.07);color:#6d43bf;'
+    };
+  }
+
+  const palette = BRANCH_CARD_PALETTE[branchIdHash(id) % BRANCH_CARD_PALETTE.length];
+  return {
+    card: `border-color:${palette.phaseBorder};background:${strengthenAlpha(palette.bg, isActive)};`,
+    title: `color:${palette.title};`,
+    phaseTag: `border-color:${palette.phaseBorder};background:${strengthenAlpha(palette.phaseBg, isActive)};color:${palette.title};`,
+    kindTag: `border-color:${palette.kindBorder};background:${strengthenAlpha(palette.kindBg, isActive)};color:${palette.title};`
+  };
+}
+
+function buildLastTraces(traces) {
+  const last = {};
+  (traces || []).forEach(trace => {
+    const branchId = trace?.metadata?.branchId;
+    if (!branchId) return;
+    if (trace.type === 'thought' || trace.type === 'action' || trace.type === 'observation') {
+      last[branchId] = String(trace.content || '').slice(0, 80);
+    }
+  });
+  return last;
 }
 async function api(method, url, body) {
   const r = await fetch(url, {
@@ -484,8 +642,8 @@ const SVG_NR = 13;   // node circle radius
 
 function sortBranchIds(ids) {
   return ids.slice().sort((a, b) => {
-    const la = a.replace(/^B/, '').split('.').map(Number);
-    const lb = b.replace(/^B/, '').split('.').map(Number);
+    const la = a.replace(/^[A-Z]+/i, '').split('.').map(Number);
+    const lb = b.replace(/^[A-Z]+/i, '').split('.').map(Number);
     for (let i = 0; i < Math.max(la.length, lb.length); i++) {
       const av = la[i] ?? -1, bv = lb[i] ?? -1;
       if (av !== bv) return av - bv;
@@ -547,7 +705,7 @@ function renderSvgTree(snap) {
   const tree = buildLayout(snap);
   if (!tree) return '';
   const {pos, nodeMap, ids, maxX, maxY} = tree;
-  const activeId = snap.activeBranchId;
+  const activeIds = new Set(getActiveBranchIds(snap));
 
   let edgesSvg = '', nodesSvg = '';
 
@@ -569,7 +727,8 @@ function renderSvgTree(snap) {
     const {x, y} = pos[id];
     const color = STATUS_COLOR[n.status] || '#adbac7';
     const glyph = STATUS_GLYPH[n.status] || '·';
-    const isActive = id === activeId;
+    const isActive = activeIds.has(id);
+    const kind = detectBranchKind(n, id);
     const truncLabel = n.label && n.label !== id
       ? (n.label.length > 12 ? n.label.slice(0, 11) + '…' : n.label)
       : '';
@@ -583,11 +742,16 @@ function renderSvgTree(snap) {
     }
     /* filled circle */
     nodesSvg += `<circle cx="${x}" cy="${y}" r="${SVG_NR}"
-      fill="${color}22" stroke="${color}" stroke-width="${isActive ? 2.5 : 1.8}"/>`;
+      fill="${color}22" stroke="${color}" stroke-width="${isActive ? 2.5 : 1.8}"${kind === 'rebranch' ? ' stroke-dasharray="3 3"' : ''}/>`;
     /* status glyph inside */
     nodesSvg += `<text x="${x}" y="${y + 4}" text-anchor="middle"
       font-size="11" fill="${color}"
       font-family="-apple-system,BlinkMacSystemFont,sans-serif">${glyph}</text>`;
+    if (kind === 'rebranch') {
+      nodesSvg += `<text x="${x + SVG_NR + 6}" y="${y - 6}" text-anchor="middle"
+        font-size="8.5" fill="#9e6dff"
+        font-family="-apple-system,BlinkMacSystemFont,sans-serif">re</text>`;
+    }
     /* branch id below circle */
     nodesSvg += `<text x="${x}" y="${y + SVG_NR + 12}" text-anchor="middle"
       font-size="9.5" fill="#636e7b"
@@ -610,14 +774,23 @@ function renderSvgTree(snap) {
 function renderNodeSidebar(snap, lastTraces) {
   if (!snap || !snap.nodes) return '';
   const ids = sortBranchIds(Object.keys(snap.nodes));
+  const activeIds = new Set(getActiveBranchIds(snap));
   return ids.map(id => {
     const n = snap.nodes[id];
     const color = STATUS_COLOR[n.status] || '#adbac7';
-    const isActive = id === snap.activeBranchId;
+    const isActive = activeIds.has(id);
     const trace = lastTraces && lastTraces[id] ? lastTraces[id] : '';
-    return `<div class="bv-node-card${isActive ? ' is-active' : ''}">
-      <div class="bv-nc-id" style="color:${color}">${STATUS_GLYPH[n.status] || '·'} ${esc(id)}</div>
-      <div class="bv-nc-lbl">${esc(n.label && n.label !== id ? n.label : '—')}</div>
+    const kind = detectBranchKind(n, id);
+    const retry = detectRetry(n, id);
+    const kindLabel = kind === 'rebranch' ? `rebranch${retry ? ` r${retry}` : ''}` : kind;
+    const theme = getBranchCardTheme(n, id, isActive);
+    return `<div class="bv-node-card${isActive ? ' is-active' : ''}" style="${theme.card}">
+      <div class="bv-nc-id" style="${theme.title}">${STATUS_GLYPH[n.status] || '·'} ${esc(id)}</div>
+      <div class="bv-nc-lbl" style="${theme.title}">${esc(n.label && n.label !== id ? n.label : '—')}</div>
+      <div class="bv-nc-tags">
+        <span class="bv-tag phase" style="${theme.phaseTag}">${esc(n.status || 'queued')}</span>
+        <span class="bv-tag kind" style="${theme.kindTag}">${esc(kindLabel)}</span>
+      </div>
       ${trace ? `<div class="bv-nc-trace">${esc(trace)}</div>` : ''}
     </div>`;
   }).join('');
@@ -626,26 +799,17 @@ function renderNodeSidebar(snap, lastTraces) {
 /* ── Build full panel HTML (used for saved rounds) ── */
 function branchPanelHtml(snap, panelId, lastTraces) {
   if (!snap) return '';
-  const nodeCount = Object.keys(snap.nodes || {}).length;
-  const stepPct = Math.min(100, (snap.totalSteps / Math.max(1, snap.totalBudget)) * 100).toFixed(1);
-  const donePct = Math.min(100, (snap.completed / Math.max(1, snap.maxCompleted)) * 100).toFixed(1);
   return `<div class="bp" id="${panelId}">
     <div class="bp-hdr" onclick="toggleBp('${panelId}')">
       <span class="bp-chevron">▶</span>
       <span class="bp-title">Branch Tree</span>
-      <span class="bp-meta" id="${panelId}-meta">R${snap.round || 1} · ${nodeCount} branches · ${snap.totalSteps} steps · active: ${snap.activeBranchId || '—'}</span>
+      <span class="bp-meta" id="${panelId}-meta">${esc(branchMetaText(snap))}</span>
     </div>
+    <div class="bp-summary" id="${panelId}-summary">${branchSummaryHtml(snap)}</div>
+    <div class="bp-note" id="${panelId}-note">${esc(snap.statusMessage || '')}</div>
     <div class="bp-body">
       <div class="bv-svg-wrap" id="${panelId}-svg">${renderSvgTree(snap)}</div>
       <div class="bv-sidebar" id="${panelId}-sb">${renderNodeSidebar(snap, lastTraces)}</div>
-    </div>
-    <div class="bp-prog">
-      <span class="pg-lbl">Steps</span>
-      <div class="pg-bar"><div class="pg-fill" id="${panelId}-sp" style="width:${stepPct}%;background:#539bf5"></div></div>
-      <span class="pg-num">${snap.totalSteps}/${snap.totalBudget}</span>
-      <span class="pg-lbl" style="margin-left:8px">Done</span>
-      <div class="pg-bar"><div class="pg-fill" id="${panelId}-dp" style="width:${donePct}%;background:#46954a"></div></div>
-      <span class="pg-num">${snap.completed}/${snap.maxCompleted}</span>
     </div>
   </div>`;
 }
@@ -655,22 +819,16 @@ function updateBranchPanel(panelId, snap, lastTraces) {
   if (!snap) return;
   const svgEl  = document.getElementById(panelId + '-svg');
   const sbEl   = document.getElementById(panelId + '-sb');
-  const spEl   = document.getElementById(panelId + '-sp');
-  const dpEl   = document.getElementById(panelId + '-dp');
   const metaEl = document.getElementById(panelId + '-meta');
+  const summaryEl = document.getElementById(panelId + '-summary');
+  const noteEl = document.getElementById(panelId + '-note');
   if (!svgEl) return;
 
   svgEl.innerHTML = renderSvgTree(snap);
   if (sbEl) sbEl.innerHTML = renderNodeSidebar(snap, lastTraces);
-
-  const stepPct = Math.min(100, (snap.totalSteps / Math.max(1, snap.totalBudget)) * 100).toFixed(1);
-  const donePct = Math.min(100, (snap.completed / Math.max(1, snap.maxCompleted)) * 100).toFixed(1);
-  if (spEl) spEl.style.width = stepPct + '%';
-  if (dpEl) dpEl.style.width = donePct + '%';
-  if (metaEl) {
-    const nodeCount = Object.keys(snap.nodes || {}).length;
-    metaEl.textContent = `R${snap.round || 1} · ${nodeCount} branches · ${snap.totalSteps} steps · active: ${snap.activeBranchId || 'synthesizing'}`;
-  }
+  if (summaryEl) summaryEl.innerHTML = branchSummaryHtml(snap);
+  if (noteEl) noteEl.textContent = snap.statusMessage || '';
+  if (metaEl) metaEl.textContent = branchMetaText(snap);
 }
 
 function toggleBp(id) { document.getElementById(id)?.classList.toggle('open'); }
@@ -698,7 +856,7 @@ function traceEntryHtml(t) {
 =================================================================== */
 function roundHtml(round) {
   const panelId  = 'bp-' + round.id;
-  const bpHtml   = branchPanelHtml(round.branch_snapshot, panelId, null);
+  const bpHtml   = branchPanelHtml(round.branch_snapshot, panelId, buildLastTraces(round.traces));
   const traces   = round.traces || [];
   const trHtml   = traces.length ? `
     <div class="tr-toggle" id="trh-${round.id}" onclick="toggleTr('${round.id}')">
@@ -765,10 +923,16 @@ async function send() {
 
   /* skeleton branch state (B0 active) */
   const initSnap = {
-    round: 1, totalSteps: 0, totalBudget: 50,
-    completed: 0, maxCompleted: 4,
-    activeBranchId: 'B0', queueCount: 0,
-    nodes: { B0: {id:'B0', parentId:null, label:'root', depth:0, step:0, status:'active'} }
+    round: 1,
+    phase: 'branching',
+    rebranchCount: 0,
+    statusMessage: 'Root branch active.',
+    completed: 0,
+    errors: 0,
+    activeBranchId: 'B0',
+    activeBranchIds: ['B0'],
+    queueCount: 0,
+    nodes: { B0: {id:'B0', parentId:null, label:'root', depth:0, step:0, status:'active', kind:'root', retry:null} }
   };
 
   /* Build the live round DOM element */

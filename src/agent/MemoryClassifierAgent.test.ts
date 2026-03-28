@@ -108,3 +108,32 @@ test('MemoryClassifierAgent.persist writes preferences, skills, atomic memory, a
   assert.ok(phases.includes('memory_atomic_saved'));
   assert.ok(phases.includes('memory_episodic_saved'));
 });
+
+test('MemoryClassifierAgent.extractMemoryPayload stays empty when LLM extraction fails', async () => {
+  const agent = new MemoryClassifierAgent({
+    chatClient: {} as any,
+    codeCliRoot: process.cwd(),
+    extractionMaxChars: 4000,
+    memoryExtractTimeoutMs: 1000,
+    memoryActionTimeoutMs: 1000,
+    autoLinkEnabled: false,
+    autoLinkMaxNodes: 0,
+    autoLinkLimit: 0,
+  });
+
+  (agent as any).generateJsonPromptText = async () => {
+    throw new Error('synthetic extraction failure');
+  };
+
+  const extracted = await (agent as any).extractMemoryPayload(
+    '用户说他喜欢简洁回答，而且这里有步骤说明。',
+    [],
+    '这里本来可能会被旧的关键词 fallback 误判为 preference 或 skill。',
+  );
+
+  assert.deepEqual(extracted, {
+    user_preferences: [],
+    agent_skills: [],
+    atomic_knowledge: [],
+  });
+});

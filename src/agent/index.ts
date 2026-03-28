@@ -20,7 +20,14 @@ import { resolveCodeCliRoot } from '../config/projectPaths.js';
 import { AgentRuntime, createRuntime, CallbackApprovalEngine } from '../runtime/index.js';
 import type { ApprovalCallback } from '../runtime/index.js';
 import type { AgentBranchState, BranchSynthesisInput } from '../runtime/agent/AgentRuntime.js';
-import type { BranchOutcome, SynthesisResult } from '../runtime/agent/types.js';
+import type {
+  BranchDisposition,
+  BranchHandoff,
+  BranchOutcome,
+  PlannedBranch,
+  SynthesisResult,
+  SynthesisSharedHandoff,
+} from '../runtime/agent/types.js';
 import { TOOLS, TOOL_NAMES } from '../tools/definitions.js';
 import { installWorkspaceSkillFromLibraryViaCli } from '../mempedia/cli.js';
 import { MemoryClassifierAgent } from './MemoryClassifierAgent.js';
@@ -65,9 +72,16 @@ const PlannerBranchSchema = z.object({
   goal: z.string().trim().min(1).max(240),
   why: z.string().trim().min(1).max(240).optional(),
   priority: z.number().min(0).max(1).optional(),
+  execution_group: z.number().int().min(1).max(8).optional(),
+  depends_on: z.array(z.string().trim().min(1).max(80)).min(1).max(7).optional(),
 });
 
 const PlannerThoughtSchema = z.string().trim().min(1);
+
+const ExecutionDisciplineDecisionSchema = z.object({
+  mode: z.enum(['branching', 'sequential']),
+  reason: z.string().trim().min(1).max(240).optional(),
+});
 
 const PlannerToolDecisionSchema = z.object({
   kind: z.literal('tool'),
@@ -75,10 +89,97 @@ const PlannerToolDecisionSchema = z.object({
   tool_calls: z.array(PlannerToolCallSchema).min(1).max(5),
 });
 
-const PlannerBranchDecisionSchema = z.object({
+const PlannerBranchDecisionBaseSchema = z.object({
   kind: z.literal('branch'),
   thought: PlannerThoughtSchema,
   branches: z.array(PlannerBranchSchema).min(1).max(8),
+});
+
+const PlannerBranchDecisionSchema = PlannerBranchDecisionBaseSchema.superRefine((decision, ctx) => {
+  const labelToIndex = new Map<string, number>();
+  const normalizedGroups = decision.branches.map((branch) => (
+    typeof branch.execution_group === 'number' && Number.isFinite(branch.execution_group)
+      ? Math.max(1, Math.floor(branch.execution_group))
+      : 1
+  ));
+
+  decision.branches.forEach((branch, index) => {
+    if (labelToIndex.has(branch.label)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['branches', index, 'label'],
+        message: 'Branch labels must be unique within one planner_branch decision.',
+      });
+      return;
+    }
+    labelToIndex.set(branch.label, index);
+  });
+
+  const outgoing = Array.from({ length: decision.branches.length }, () => [] as number[]);
+  const indegree = Array.from({ length: decision.branches.length }, () => 0);
+
+  decision.branches.forEach((branch, index) => {
+    const dependencies = [...new Set((branch.depends_on || []).map((label) => label.trim()).filter(Boolean))];
+    dependencies.forEach((dependencyLabel, dependencyIndex) => {
+      if (dependencyLabel === branch.label) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['branches', index, 'depends_on', dependencyIndex],
+          message: 'A branch cannot depend on itself.',
+        });
+        return;
+      }
+
+      const dependencyBranchIndex = labelToIndex.get(dependencyLabel);
+      if (dependencyBranchIndex === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['branches', index, 'depends_on', dependencyIndex],
+          message: 'depends_on must reference labels from the same planner_branch call.',
+        });
+        return;
+      }
+
+      if (normalizedGroups[dependencyBranchIndex] > normalizedGroups[index]) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['branches', index, 'depends_on', dependencyIndex],
+          message: 'depends_on cannot point to a sibling in a later execution_group.',
+        });
+        return;
+      }
+
+      outgoing[dependencyBranchIndex].push(index);
+      indegree[index] += 1;
+    });
+  });
+
+  const ready: number[] = [];
+  indegree.forEach((count, index) => {
+    if (count === 0) {
+      ready.push(index);
+    }
+  });
+
+  let processed = 0;
+  while (ready.length > 0) {
+    const current = ready.shift()!;
+    processed += 1;
+    for (const target of outgoing[current]) {
+      indegree[target] -= 1;
+      if (indegree[target] === 0) {
+        ready.push(target);
+      }
+    }
+  }
+
+  if (processed < decision.branches.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['branches'],
+      message: 'depends_on must form an acyclic dependency graph among sibling branch labels.',
+    });
+  }
 });
 
 const PlannerFinalDecisionSchema = z.object({
@@ -88,6 +189,16 @@ const PlannerFinalDecisionSchema = z.object({
   completion_summary: z.string().trim().min(1).max(280).optional(),
   outcome: z.enum(['success', 'partial', 'failed']).optional(),
   outcome_reason: z.string().trim().max(300).optional(),
+  disposition: z.enum([
+    'resolved',
+    'missing_evidence',
+    'blocked_external',
+    'exhausted_search',
+    'planner_error',
+    'superseded',
+    'unknown',
+  ]).optional(),
+  finalization_mode: z.enum(['natural', 'planner_fallback']).optional(),
 });
 
 const PlannerSkillsDecisionSchema = z.object({
@@ -98,7 +209,7 @@ const PlannerSkillsDecisionSchema = z.object({
 
 const PlannerDecisionSchema = z.discriminatedUnion('kind', [
   PlannerToolDecisionSchema,
-  PlannerBranchDecisionSchema,
+  PlannerBranchDecisionBaseSchema,
   PlannerFinalDecisionSchema,
   PlannerSkillsDecisionSchema,
 ]);
@@ -130,6 +241,7 @@ const PLANNER_BRANCH_JSON_SCHEMA = {
       type: 'string',
       minLength: 1,
       maxLength: 240,
+      description: 'A short executable branch goal. Keep it concise and comfortably under 240 characters; do not paste long plans, prose, or multi-step paragraphs here.',
     },
     why: {
       type: 'string',
@@ -140,6 +252,24 @@ const PLANNER_BRANCH_JSON_SCHEMA = {
       type: 'number',
       minimum: 0,
       maximum: 1,
+    },
+    execution_group: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 8,
+      description: 'Branches in the same execution_group may run in parallel. Higher execution_group values wait until all lower groups under the same parent finish.',
+    },
+    depends_on: {
+      type: 'array',
+      items: {
+        type: 'string',
+        minLength: 1,
+        maxLength: 80,
+      },
+      minItems: 1,
+      maxItems: 7,
+      uniqueItems: true,
+      description: 'Optional sibling branch labels from this same planner_branch call that must finish before this branch may start.',
     },
   },
   required: ['label', 'goal'],
@@ -188,6 +318,12 @@ interface BranchState {
   finalAnswer?: string;
   outcome?: BranchOutcome;
   outcomeReason?: string;
+  disposition?: BranchDisposition;
+  finalizationMode?: 'natural' | 'planner_fallback';
+  handoff?: BranchHandoff;
+  sharedHandoff?: SynthesisSharedHandoff;
+  ancestorBranchIds?: string[];
+  ancestorBranchLabels?: string[];
 }
 
 export interface TraceEvent {
@@ -223,6 +359,7 @@ export interface AgentConfig {
 }
 
 export type AgentMode = 'branching' | 'react';
+type AgentRunPhase = 'plan' | 'execute';
 
 export interface AgentRunOptions {
   conversationId?: string;
@@ -232,6 +369,8 @@ export interface AgentRunOptions {
   onApproval?: ApprovalCallback;
   /** Agent execution mode. Defaults to 'branching'. */
   agentMode?: AgentMode;
+  /** Internal plan-and-execute stage marker. */
+  runPhase?: AgentRunPhase;
 }
 
 interface PerfEntry {
@@ -334,6 +473,7 @@ export class Agent {
   private readonly memoryActionTimeoutMs: number;
   private readonly memoryLogPath: string;
   private readonly conversationLogDir: string;
+  private readonly memoryJobLogDir: string;
   private readonly nodeConversationMapPath: string;
   private readonly persistedConversationStateDir: string;
   private readonly turnSummaryLogPath: string;
@@ -343,6 +483,7 @@ export class Agent {
   private readonly branchMaxWidth: number;
   private readonly branchMaxCompleted: number;
   private readonly branchConcurrency: number;
+  private readonly rebranchEnabled: boolean;
   private readonly llmRpmLimiter: RpmLimiter;
   private readonly agentLlmTimeoutMs: number;
   private readonly plannerTemperature: number;
@@ -431,6 +572,8 @@ export class Agent {
     this.branchMaxCompleted = Number.isFinite(rawBranchMaxCompleted) ? Math.max(1, Math.min(8, Math.floor(rawBranchMaxCompleted))) : 4;
     const rawBranchConcurrency = Number(process.env.REACT_BRANCH_CONCURRENCY ?? 0);
     this.branchConcurrency = Number.isFinite(rawBranchConcurrency) ? Math.max(0, Math.min(64, Math.floor(rawBranchConcurrency))) : 0;
+    const rawRebranchEnabled = String(process.env.REACT_REBRANCH_ENABLED ?? '1').toLowerCase();
+    this.rebranchEnabled = rawRebranchEnabled !== '0' && rawRebranchEnabled !== 'false' && rawRebranchEnabled !== 'off';
     const rawLlmRpm = Number(process.env.LLM_RPM_LIMIT ?? 0);
     this.llmRpmLimiter = new RpmLimiter(Number.isFinite(rawLlmRpm) ? Math.max(0, Math.floor(rawLlmRpm)) : 0);
     const rawAgentLlmTimeoutMs = Number(process.env.AGENT_LLM_TIMEOUT_MS ?? 120000);
@@ -441,6 +584,7 @@ export class Agent {
     this.responseTemperature = Number.isFinite(rawResponseTemperature) ? Math.max(0, Math.min(1, rawResponseTemperature)) : 0.3;
     this.memoryLogPath = path.join(projectRoot, '.mitosis', 'logs', 'mitosis_save.log');
     this.conversationLogDir = path.join(projectRoot, '.mitosis', 'conversations');
+    this.memoryJobLogDir = path.join(projectRoot, '.mitosis', 'memory_jobs');
     this.nodeConversationMapPath = path.join(projectRoot, '.mitosis', 'logs', 'node_conversations.jsonl');
     this.persistedConversationStateDir = path.join(projectRoot, '.mitosis', 'conversation_state');
     this.turnSummaryLogPath = path.join(projectRoot, '.mitosis', 'logs', 'thread_turn_summaries.jsonl');
@@ -577,6 +721,8 @@ export class Agent {
             final_answer: {
               type: 'string',
               minLength: 1,
+              maxLength: 5000,
+              description: 'User-facing markdown answer. Reference created file paths instead of repeating full code listings.',
             },
             completion_summary: {
               type: 'string',
@@ -592,6 +738,11 @@ export class Agent {
               type: 'string',
               maxLength: 300,
               description: 'Brief explanation when outcome is partial or failed (e.g. test error message).',
+            },
+            disposition: {
+              type: 'string',
+              enum: ['resolved', 'missing_evidence', 'blocked_external', 'exhausted_search', 'planner_error', 'superseded', 'unknown'],
+              description: 'Retry-oriented disposition. Use missing_evidence when a focused retry could plausibly close the gap; blocked_external for paywalls/403/dynamic pages; exhausted_search when the current search strategy is played out; planner_error for schema/timeout/tool-planning failures.',
             },
           },
           required: ['thought', 'final_answer'],
@@ -634,7 +785,7 @@ export class Agent {
     if (allowBranching) {
       tools.push({
         name: 'planner_branch',
-        description: 'Split the work into distinct independent child loops that should be explored in parallel.',
+        description: 'Split the work into distinct child loops. Keep each branch goal short and concrete, comfortably under 240 characters. Use execution_group for broad waves and depends_on for precise sibling prerequisites within the same planner_branch call.',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -676,7 +827,7 @@ export class Agent {
         messages: options.messages,
         tools: this.buildPlannerDecisionTools(options.allowBranching),
         temperature: options.temperature,
-        maxTokens: 2400,
+        maxTokens: 6000,
       }),
       options.timeoutMs,
       options.timeoutLabel,
@@ -728,7 +879,7 @@ export class Agent {
           model: options.model,
           messages,
           temperature: options.temperature ?? this.plannerTemperature,
-          maxTokens: 2400,
+          maxTokens: 6000,
           ...(useJsonObject
             ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
             : {}),
@@ -1120,6 +1271,15 @@ export class Agent {
       current = extracted;
     }
 
+    // Strip leaked XML tool call blocks that some models (MiniMax, Qwen, etc.)
+    // emit even in text-only mode.
+    current = current
+      .replace(/<[a-z_][a-z0-9_-]*:tool_call>[\s\S]*?<\/[a-z_][a-z0-9_-]*:tool_call>/gi, '')
+      .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+      .replace(/<invoke\s+name=[\s\S]*?<\/invoke>/gi, '')
+      .replace(/<\|tool_call\|>[\s\S]*?<\|\/tool_call\|>/gi, '')
+      .trim();
+
     return current;
   }
 
@@ -1133,7 +1293,21 @@ export class Agent {
       || /\[TOOL_CALL\]/i.test(trimmed)
       || /\[\/TOOL_CALL\]/i.test(trimmed)
       || /```tool_call/i.test(trimmed)
-      || /^tool_call\s*$/im.test(trimmed);
+      || /^tool_call\s*$/im.test(trimmed)
+      // MiniMax XML tool call format
+      || /<minimax:tool_call>/i.test(trimmed)
+      || /<\/minimax:tool_call>/i.test(trimmed)
+      // Generic vendor-prefixed XML tool call (e.g. <vendor:tool_call>)
+      || /<[a-z_][a-z0-9_-]*:tool_call[\s>]/i.test(trimmed)
+      // Generic <invoke name="..."> / </invoke> (Anthropic-compat XML)
+      || /<invoke\s+name=/i.test(trimmed)
+      || /<\/invoke>/i.test(trimmed)
+      // Qwen / GLM special-token style
+      || /<\|tool_call\|>/i.test(trimmed)
+      || /<\|\/tool_call\|>/i.test(trimmed)
+      // <tool_call> without vendor prefix
+      || /<tool_call>/i.test(trimmed)
+      || /<\/tool_call>/i.test(trimmed);
   }
 
   private sanitizeUserFacingAnswer(answer: string, fallback = ''): string {
@@ -1182,7 +1356,11 @@ export class Agent {
     if (/^PLANNER (?:TOOL|BRANCH|FINAL|SKILLS)\b/im.test(trimmed)) {
       return true;
     }
-    return /(^|\n)\s*(find|ls|cat|grep|rg|echo|printf|cd|pwd|npm|pnpm|yarn|cargo|python|python3|node|git|curl|BIN=|\[\[)\b/m.test(trimmed);
+    // Strip code-fence blocks before checking for bare shell commands so that
+    // legitimate markdown answers containing ```bash ... ``` sections are not
+    // incorrectly classified as internal planner output.
+    const withoutCodeFences = trimmed.replace(/```[\s\S]*?```/g, '');
+    return /(^|\n)\s*(find|ls|cat|grep|rg|echo|printf|cd|pwd|npm|pnpm|yarn|cargo|python|python3|node|git|curl|BIN=|\[\[)\b/m.test(withoutCodeFences);
   }
 
   private extractFinalAnswerFromJsonPayload(raw: string): string | null {
@@ -2059,113 +2237,136 @@ export class Agent {
     return lines.join('\n');
   }
 
-  private isTrivialMemoryCandidate(text: string): boolean {
-    const compact = text.replace(/\s+/g, ' ').trim().toLowerCase();
-    if (!compact) {
-      return true;
-    }
-    // Single-word ultra-short inputs (e.g. "edit", "hi", "ok") carry no extractable knowledge.
-    if (compact.length < 8 && !compact.includes(' ')) {
-      return true;
-    }
-    if (compact.length <= 24 && compact.split(/\s+/).length <= 5) {
-      return /^(hi|hello|hey|thanks|thank you|yo|sup|你好|嗨|哈喽|谢谢|在吗|早上好|下午好|晚上好)\b/.test(compact);
-    }
-    return /^(hi|hello|hey|yo|sup|你好|嗨|哈喽)\b/.test(compact);
-  }
-
-  private shouldAutoSaveAtomicKnowledge(input: string, traces: TraceEvent[], answer: string): boolean {
-    const request = this.extractOriginalUserRequest(input);
-    const normalizedAnswer = answer.replace(/\s+/g, ' ').trim();
-    if (normalizedAnswer.length < 140) {
-      return false;
-    }
-    if (this.isTrivialMemoryCandidate(request) || this.isTrivialMemoryCandidate(normalizedAnswer)) {
-      return false;
-    }
-    // Don't save atomic knowledge when the answer is an error/failure message.
-    if (/\b(no such file or directory|binary not found|inaccessible or invalid|failed to fetch|connection refused|permission denied|requested wikipedia url)\b/i.test(normalizedAnswer)) {
-      return false;
-    }
-    // Don't save when the answer is a negative-result / "no info found" response.
-    if (/\b(no information about|contain no information|no results? (?:found|about|for)|nothing (?:found|about|related)|not found in (?:the|this)|does not contain|had no results?|web search (?:attempt )?failed)\b/i.test(normalizedAnswer)) {
-      return false;
-    }
-    if (normalizedAnswer.length < 300 && /^(error|an error|the system encountered|failed to|could not|unable to|sorry,|unfortunately)\b/i.test(normalizedAnswer)) {
-      return false;
+  private async decideExecutionDiscipline(input: string, requestedMode: AgentMode, conversationId = 'default'): Promise<{
+    mode: 'branching' | 'sequential';
+    reason: string;
+  }> {
+    if (requestedMode !== 'branching') {
+      return {
+        mode: 'branching',
+        reason: 'Requested agent mode is already non-branching.',
+      };
     }
 
-    const groundedInProjectFiles = traces.some((trace) => {
-      const toolName = String(trace.metadata?.toolName || '');
-      if (toolName === 'read') {
-        const args = trace.metadata?.args as Record<string, unknown> | undefined;
-        const target = typeof args?.target === 'string' ? args.target.toLowerCase() : '';
-        const filePath = typeof args?.path === 'string' ? args.path.toLowerCase() : '';
-        if (target === 'memory' || target === 'preferences' || target === 'skills') {
-          return true;
+    const override = String(process.env.REACT_ALLOW_MUTATING_BRANCHES ?? '').trim().toLowerCase();
+    if (override === '1' || override === 'true' || override === 'on') {
+      return {
+        mode: 'branching',
+        reason: 'REACT_ALLOW_MUTATING_BRANCHES override is enabled.',
+      };
+    }
+
+    const request = this.extractOriginalUserRequest(input).replace(/\s+/g, ' ').trim();
+    if (!request) {
+      return {
+        mode: 'branching',
+        reason: 'No request text available for execution-discipline selection.',
+      };
+    }
+
+    const persistedState = this.ensureConversationTurnsLoaded(conversationId);
+    const recentUserTurns = this.getConversationTurns(conversationId)
+      .slice(-3)
+      .map((turn) => turn.user);
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content: `You decide execution discipline for a branching agent.
+Return exactly one JSON object with this shape:
+{"mode":"branching"|"sequential","reason":"short reason"}
+
+Use first-principles task reasoning, not keyword matching.
+Choose "sequential" when successful execution likely requires coordinated writes to shared workspace files/directories, non-isolated shell side effects, or one executor integrating ordered changes that sibling branches would contend on.
+Choose "branching" when the work can proceed as genuinely independent research, evaluation, or isolated workstreams with low coordination risk.
+Keep the reason short and concrete.`,
+      },
+      {
+        role: 'user',
+        content: `Current request:
+${request}
+
+Persisted thread state:
+${this.renderPersistedConversationState(persistedState) || '(none)'}
+
+Recent user turns:
+${recentUserTurns.length > 0 ? recentUserTurns.map((turn) => `- ${turn}`).join('\n') : '(none)'}
+
+Decide the safer execution discipline for this turn.`,
+      },
+    ];
+
+    try {
+      await this.llmRpmLimiter.acquire();
+      const run = async (useJsonObject: boolean) => this.withTimeout(
+        generateText({
+          model: this.openai,
+          messages,
+          temperature: 0,
+          maxTokens: 220,
+          ...(useJsonObject
+            ? { providerOptions: { openai: { responseFormat: { type: 'json_object' as const } } } }
+            : {}),
+        }),
+        Math.min(this.agentLlmTimeoutMs, 20000),
+        'execution_discipline_gate llm',
+      );
+
+      let raw = '';
+      try {
+        const result = await run(this.jsonObjectResponseFormatSupported);
+        raw = typeof result.text === 'string' ? result.text : String(result.text || '');
+        if (!raw.trim() && this.jsonObjectResponseFormatSupported) {
+          this.jsonObjectResponseFormatSupported = false;
+          const retry = await run(false);
+          raw = typeof retry.text === 'string' ? retry.text : String(retry.text || '');
         }
-        // Any non-empty local file path (not a URL) counts as workspace-grounded.
-        return filePath.length > 0 && !filePath.startsWith('http');
+      } catch (error) {
+        if (this.jsonObjectResponseFormatSupported && this.isJsonResponseFormatUnsupported(error)) {
+          this.jsonObjectResponseFormatSupported = false;
+          const retry = await run(false);
+          raw = typeof retry.text === 'string' ? retry.text : String(retry.text || '');
+        } else {
+          throw error;
+        }
       }
-      if (toolName === 'search') {
-        const args = trace.metadata?.args as Record<string, unknown> | undefined;
-        const target = typeof args?.target === 'string' ? args.target.toLowerCase() : '';
-        return target === 'memory' || target === 'workspace' || target === 'skills' || target === 'preferences';
+
+      for (const candidate of extractJsonishCandidates(raw)) {
+        try {
+          const parsed = ExecutionDisciplineDecisionSchema.safeParse(parseJsonish(candidate));
+          if (parsed.success) {
+            return {
+              mode: parsed.data.mode,
+              reason: this.clipText(parsed.data.reason || `Model selected ${parsed.data.mode}.`, 180),
+            };
+          }
+        } catch {
+          continue;
+        }
       }
-      return false;
-    });
-    if (!groundedInProjectFiles) {
-      return false;
-    }
+    } catch {}
 
-    const requestLooksLikeProjectDiscovery = /(check|inspect|summari[sz]e|what(?:'s| is)? in|readme|repo|repository|project|codebase|architecture|structure|features|documentation|analy[sz]e|查看|总结|项目|仓库|代码库|结构|功能|文档)/i.test(request);
-    const answerLooksReusable = /(implements|architecture|storage structure|key features|knowledge system|api|layer|module|repository|project|rust|typescript|markdown|jsonl|目录|结构|功能|实现|支持|接口|存储|分层)/i.test(normalizedAnswer)
-      || /(^|\n)\d+\./.test(answer)
-      || answer.includes('- ');
-
-    return requestLooksLikeProjectDiscovery && answerLooksReusable;
-  }
-
-  private shouldAutoSaveEpisodic(input: string, answer: string): boolean {
-    const request = this.extractOriginalUserRequest(input);
-    const normalizedAnswer = answer.replace(/\s+/g, ' ').trim();
-    if (normalizedAnswer.length < 20) {
-      return false;
-    }
-    if (this.isTrivialMemoryCandidate(request)) {
-      return false;
-    }
-    if (this.looksLikeNonUserFacingPlannerOutput(answer)) {
-      return false;
-    }
-    // Don't record episodic entries for error/failure answers — they have no useful knowledge.
-    if (/\b(no such file or directory|binary not found|inaccessible or invalid|failed to fetch|connection refused|permission denied|requested wikipedia url)\b/i.test(normalizedAnswer)) {
-      return false;
-    }
-    // Don't record episodic entries for negative-result responses.
-    if (/\b(no information about|contain no information|no results? (?:found|about|for)|nothing (?:found|about|related)|not found in (?:the|this)|does not contain|had no results?|web search (?:attempt )?failed)\b/i.test(normalizedAnswer)) {
-      return false;
-    }
-    if (normalizedAnswer.length < 400 && /^(error|an error|the system encountered|failed to|could not|unable to|sorry,|unfortunately)\b/i.test(normalizedAnswer)) {
-      return false;
-    }
-    return true;
+    return {
+      mode: 'branching',
+      reason: 'Execution-discipline gate did not reach a confident sequential-only conclusion.',
+    };
   }
 
   private isLikelyFollowUp(input: string): boolean {
-    const text = input.trim().toLowerCase();
+    const text = input.trim();
     if (!text) {
       return false;
     }
-    const explicitMarkers = [
-      '继续', '接着', '刚才', '上一个', '上个问题', '上述', '前面', '这个', '那个', '它', '他们', '这些',
-      'that', 'those', 'it', 'them', 'previous', 'earlier', 'continue', 'follow up', 'same topic', 'also', 'then'
-    ];
-    if (explicitMarkers.some((marker) => text.includes(marker))) {
+    const compactLength = Array.from(text.replace(/\s+/g, '')).length;
+    if (compactLength <= 6) {
       return true;
     }
-    const compactTokens = this.normalizeTextForSimilarity(text);
-    return compactTokens.length <= 4;
+    const compactTokens = this.normalizeTextForSimilarity(text.toLowerCase());
+    // Treat very short, context-dependent turns as follow-ups without relying on
+    // any language-specific trigger-word lists.
+    if (compactTokens.length <= 4) {
+      return compactLength <= 24;
+    }
+    return compactTokens.length <= 8 && compactLength <= 12;
   }
 
   private getConversationTurns(conversationId = 'default'): ConversationTurn[] {
@@ -2391,10 +2592,16 @@ export class Agent {
     } catch {}
   }
 
-  private appendConversationLog(runId: string, input: string, traces: TraceEvent[], answer: string): string {
+  private writeConversationPayload(
+    logDir: string,
+    runId: string,
+    input: string,
+    traces: TraceEvent[],
+    answer: string,
+  ): string {
     const conversationId = `conv_${runId}`;
     try {
-      fs.mkdirSync(this.conversationLogDir, { recursive: true });
+      fs.mkdirSync(logDir, { recursive: true });
       const payload = {
         id: conversationId,
         timestamp: new Date().toISOString(),
@@ -2402,10 +2609,29 @@ export class Agent {
         answer,
         traces
       };
-      const filePath = path.join(this.conversationLogDir, `${conversationId}.json`);
+      const filePath = path.join(logDir, `${conversationId}.json`);
       fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8');
     } catch {}
     return conversationId;
+  }
+
+  private appendConversationLog(runId: string, input: string, traces: TraceEvent[], answer: string): string {
+    return this.writeConversationPayload(this.conversationLogDir, runId, input, traces, answer);
+  }
+
+  private appendMemoryJobSnapshot(runId: string, input: string, traces: TraceEvent[], answer: string): string {
+    return this.writeConversationPayload(this.memoryJobLogDir, runId, input, traces, answer);
+  }
+
+  private findConversationPayloadPath(conversationId: string): string | null {
+    const candidateDirs = [this.conversationLogDir, this.memoryJobLogDir];
+    for (const dir of candidateDirs) {
+      const filePath = path.join(dir, `${conversationId}.json`);
+      if (fs.existsSync(filePath)) {
+        return filePath;
+      }
+    }
+    return null;
   }
 
   private appendNodeConversationMap(nodeId: string, conversationId: string, reason: string) {
@@ -2469,8 +2695,8 @@ export class Agent {
       }
     }
     return picked.map((row) => {
-      const filePath = path.join(this.conversationLogDir, `${row.conversation_id}.json`);
-      if (!fs.existsSync(filePath)) {
+      const filePath = this.findConversationPayloadPath(row.conversation_id);
+      if (!filePath) {
         return row;
       }
       try {
@@ -2606,43 +2832,12 @@ export class Agent {
         atomic_knowledge: atomic.slice(0, 20) as Array<{ keyword: string; summary: string; description: string; evolution: string; relations: string[] }>
       };
   } catch (_) {
-    return this.fallbackExtractMemory(input, answer);
-  }
-  }
-
-  private fallbackExtractMemory(input: string, answer: string): MemoryExtraction {
-    const text = `${input}\n${answer}`;
-    const preferences: Array<{ topic: string; preference: string; evidence: string }> = [];
-    const skills: Array<{ skill_id: string; title: string; content: string; tags: string[] }> = [];
-
-    const habitRegex = /(偏好|喜欢|习惯|不喜欢|讨厌|避免)[^。\\n]{0,120}/;
-    const habitMatch = text.match(habitRegex);
-    if (habitMatch) {
-      const phrase = habitMatch[0].trim();
-      const topic = phrase.slice(0, 32);
-      preferences.push({
-        topic,
-        preference: this.normalizeSummary(phrase, topic),
-        evidence: this.normalizeDetails(phrase, topic)
-      });
-    }
-
-    const hasSteps = /步骤|流程|最佳实践|注意事项|操作方法|建议/.test(text) || /\\n\\s*\\d+\\./.test(text);
-    if (hasSteps) {
-      const key = this.toSlug(answer.slice(0, 64) || 'general_skill').slice(0, 56) || 'general_skill';
-      skills.push({
-        skill_id: `skill_${key}`,
-        title: this.normalizeSummary(answer.slice(0, 120), key),
-        content: this.normalizeDetails(answer.slice(0, 600), key),
-        tags: ['auto'],
-      });
-    }
-
     return {
-      user_preferences: preferences.slice(0, 8),
-      agent_skills: skills.slice(0, 8),
-      atomic_knowledge: this.fallbackExtractAtomic(input, answer)
+      user_preferences: [],
+      agent_skills: [],
+      atomic_knowledge: [],
     };
+  }
   }
 
   private async persistInteractionMemory(
@@ -2655,7 +2850,7 @@ export class Agent {
     this.notifyBackgroundTask('Saving memory...', 'started');
     const runId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const startedAt = Date.now();
-    const conversationId = this.appendConversationLog(runId, input, traces, answer);
+    const conversationId = this.appendMemoryJobSnapshot(runId, input, traces, answer);
     this.appendMemoryLog(runId, 'memory_save_started', {
       reason: job.reason,
       focus: job.focus || '',
@@ -2767,13 +2962,48 @@ export class Agent {
   }
 
   async run(input: string, onTrace: (event: TraceEvent) => void, options: AgentRunOptions = {}): Promise<string> {
+    const requestedAgentMode: AgentMode = options.agentMode || 'branching';
+    const runPhase = options.runPhase;
+    const conversationId = options.conversationId || 'default';
+    const baseSessionId = options.sessionId || `agent-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const executionDiscipline = !runPhase
+      ? await this.decideExecutionDiscipline(input, requestedAgentMode, conversationId)
+      : { mode: 'branching' as const, reason: 'Execution discipline is already fixed by the current run phase.' };
+
+    if (!runPhase && requestedAgentMode === 'branching' && executionDiscipline.mode === 'sequential') {
+      onTrace({
+        type: 'thought',
+        content: `Using strict plan-and-execute mode. ${executionDiscipline.reason}`,
+      });
+
+      const planningInput = `Original user request:\n${input}\n\nPLAN STAGE ONLY.\nBuild the best executable plan before changing any files.\nWhen the plan is ready, call planner_final with a concise execution plan for a single sequential executor.`;
+      const executionPlan = await this.run(planningInput, onTrace, {
+        ...options,
+        agentMode: 'branching',
+        runPhase: 'plan',
+        sessionId: `${baseSessionId}-plan`,
+      });
+
+      onTrace({
+        type: 'observation',
+        content: 'Planning stage completed. Switching to the sequential execute stage.',
+      });
+
+      const executionInput = `Original user request:\n${input}\n\nAPPROVED EXECUTION PLAN:\n${executionPlan}\n\nEXECUTE STAGE ONLY.\nFollow the approved plan sequentially.\nUse one direct work tool at a time.\nIf a tool observation disproves part of the plan, revise the plan narrowly and continue; do not branch.`;
+      return this.run(executionInput, onTrace, {
+        ...options,
+        agentMode: 'react',
+        runPhase: 'execute',
+        sessionId: `${baseSessionId}-execute`,
+      });
+    }
+
     const perfEnabled = process.env.AGENT_PERF !== '0';
     const perfEntries: PerfEntry[] | null = perfEnabled ? [] : null;
     const traceBuffer: TraceEvent[] = [];
-    const conversationId = options.conversationId || 'default';
     const runAgentId = options.agentId || 'agent-main';
-    const agentMode: AgentMode = options.agentMode || 'branching';
-    const runSessionId = options.sessionId || `agent-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const agentMode: AgentMode = requestedAgentMode;
+    const runSessionId = baseSessionId;
     const runRuntimeHandle = createRuntime({
       projectRoot: this.projectRoot,
       agentId: runAgentId,
@@ -2789,7 +3019,16 @@ export class Agent {
       traceBuffer.push(event);
       onTrace(event);
     };
-    emitTrace({ type: 'thought', content: 'Initializing branching ReAct context...' });
+    emitTrace({
+      type: 'thought',
+      content: runPhase === 'plan'
+        ? 'Initializing plan stage (branching)...'
+        : runPhase === 'execute'
+          ? 'Initializing execute stage (classic ReAct, sequential)...'
+          : agentMode === 'branching'
+            ? 'Initializing branching ReAct context...'
+            : 'Initializing classic ReAct context...',
+    });
 
     const persistedConversationState = this.ensureConversationTurnsLoaded(conversationId);
     if (persistedConversationState?.recent_turns?.length) {
@@ -2892,10 +3131,18 @@ export class Agent {
       : '';
 
     const isBranchingMode = agentMode === 'branching';
+    const isPlanStage = runPhase === 'plan';
+    const isExecuteStage = runPhase === 'execute';
 
     const systemPrompt = isBranchingMode
       ? `You are a branching ReAct agent.
 Treat ReAct as a functional loop. A branch is an independent child loop with its own thought -> action -> observation state.
+
+${isPlanStage ? `PLAN-AND-EXECUTE CONTRACT:
+You are in the PLAN stage.
+Prioritize producing one coherent execution plan for a single sequential executor.
+You may inspect, compare options, and use tools when needed, but finish by returning an execution plan via planner_final.
+` : ''}
 
 BRANCHING PHILOSOPHY:
 Before deciding on any action, first ask: "Can this goal be decomposed into independent sub-goals that are worth exploring in parallel?"
@@ -2936,8 +3183,10 @@ Rules:
 1. DECOMPOSE FIRST: Before executing any single tool call, ask "can this goal be split into independent sub-goals?" If yes, call planner_branch instead of direct work tools. Only fall back to direct work-tool calls when the next action is atomic and cannot be meaningfully parallelised.
 2. DEFAULT TO BRANCHING: In branch mode, start with planner_branch whenever the task can be split into independent sub-problems or there are multiple plausible independent approaches, hypotheses, evidence sources, or workstreams worth exploring. If the next action is obviously atomic, direct work tools are fine.
 3. Use planner_branch liberally for: (a) independent sub-tasks within a goal, (b) parallel information gathering from different sources, (c) alternative strategies or hypotheses to evaluate concurrently, (d) different files/modules/topics that can be researched simultaneously, (e) multi-part user requests where parts do not depend on each other.
-4. Each branch must have a genuinely distinct purpose and a different goal string. Do NOT branch when: both branches would issue the same tool call, one branch is a strict prerequisite of the other, or the task is a single atomic read/write/search. Redundant or near-duplicate branches waste budget and degrade quality.
+4. Each branch must have a genuinely distinct purpose, a unique label, and a different goal string. Write branch goals as short executable instructions, not mini-paragraphs. Keep every \`goal\` concise and comfortably under the 240-character schema limit. Do NOT branch when: both branches would issue the same tool call, one branch is a strict prerequisite of the other, or the task is a single atomic read/write/search. Redundant or near-duplicate branches waste budget and degrade quality.
 4a. Inside an existing child branch, if the child goal can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing batches of direct work tools.
+4b. When some sibling branches may run together while later siblings must wait, set \`execution_group\`. Branches in the same \`execution_group\` may run in parallel; higher groups wait for all lower groups under the same parent to finish. For example, two evidence branches can both use \`execution_group=1\`, and a synthesis or follow-up branch can use \`execution_group=2\`.
+4c. When a branch must wait for specific sibling labels, even inside the same \`execution_group\`, set \`depends_on\` to those sibling labels. Only reference labels from the same planner_branch call. Never depend on yourself. Do not create cycles.
 5. Never create more than ${this.branchMaxWidth} child branches in one step. Aim for 2–${this.branchMaxWidth} well-scoped branches rather than one monolithic sequential thread.
 6. Prefer search before edit when the correct answer may already exist in repository files.
 7. For repository discovery, prefer read and search on workspace evidence before using web.
@@ -2948,13 +3197,14 @@ Rules:
 12. Use web for questions about external topics, current events, APIs, libraries, or anything not answerable from workspace files. Prefer workspace evidence only for project-specific questions. When web search returns results, read the snippet field first — only fetch a page if the snippet is insufficient.
 12a. web mode=search returns {title, url, snippet} — use snippets to decide which results are relevant before fetching full pages.
 12b. When you need current/external information, use web proactively — do not guess or rely on training data when a quick search would give a definitive answer.
-12bb. If you issue multiple web/search calls in one response, each one must target a genuinely different evidence stream or hypothesis. Do not emit paraphrased or near-duplicate queries that chase the same evidence.
+12bb. If you issue multiple web/search calls in one response, each one must target a genuinely different evidence stream or hypothesis. Do not emit paraphrased or near-duplicate queries that chase the same evidence. Vary the actual query terms and change at least two of: keywords, aliases, domains, dates, language, or source type.
 12c. When a web search is weak, noisy, or repetitive, change strategy materially before searching again. Vary keywords, aliases, dates, source types, domains, languages, jurisdictions, or fetch a promising result instead of issuing another broad near-duplicate search.
 12d. Avoid near-duplicate web searches. After 2-3 consecutive web/search rounds without clear new information, you MUST either call planner_final using the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy. Do not continue the same-category search loop.
 13. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
 14. When you finish, call planner_final with a direct user-facing answer.
-14a. OUTCOME REPORTING: When calling planner_final, always set \`outcome\` to 'success', 'partial', or 'failed'. If the branch ran a test or validation that failed, set outcome='failed' and include the key error message in \`outcome_reason\`. If the goal was only partially achieved (e.g. code written but tests not run), set outcome='partial'. This enables the system to automatically retry failed branches.
+14a. OUTCOME REPORTING: When calling planner_final, always set \`outcome\` to 'success', 'partial', or 'failed'. If the branch ran a test or validation that failed, set outcome='failed' and include the key error message in \`outcome_reason\`. If the goal was only partially achieved (e.g. code written but tests not run), set outcome='partial'. Also set \`disposition\` when possible: use \`missing_evidence\` if a focused retry could plausibly close the gap, \`blocked_external\` for paywalls/403/dynamic pages, \`exhausted_search\` when the current search strategy is played out, and \`planner_error\` for timeout/schema/planner failures. This enables the system to retry only the right branches.
 14b. CODING TASKS: When a branch writes code and runs tests, include the first few lines of any test failure output in \`outcome_reason\` so sibling or retry branches can use the error to fix the issue.
+14c. ${isPlanStage ? 'Because this is the PLAN stage, planner_final must return an execution plan, not a claim that the code has already been changed.' : 'When operating in normal branching mode, use execution_group and depends_on whenever sibling work needs ordered coordination.'}
 15. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via planner_skills. For other skills in the catalog whose description overlaps with the task, call planner_skills to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to read/search/edit/bash/web or planner_branch.
 16. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
 17. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
@@ -2980,6 +3230,14 @@ ${soulsGuidance}
 ` : ''}`
       : `You are a classic ReAct agent. Follow a strict sequential loop: Think → Act → Observe → Think → … → Final Answer.
 Do NOT branch. Execute one tool call at a time, observe the result, and decide the next step.
+
+${isExecuteStage ? `PLAN-AND-EXECUTE CONTRACT:
+You are in the EXECUTE stage.
+An approved plan already exists.
+Follow it sequentially and keep exactly one active line of execution.
+Only revise the plan when a direct tool observation proves the current step is wrong or incomplete.
+Do not restart exploration from scratch and do not fork parallel workstreams.
+` : ''}
 
 You only use five top-level tools:
   read   -> read semantic targets such as workspace files, memory nodes, preferences, or skills
@@ -3024,7 +3282,8 @@ Rules:
 9d. Avoid near-duplicate web searches. After 2-3 consecutive web/search rounds without clear new information, you MUST either call planner_final using the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy. Do not continue the same-category search loop.
 10. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
 11. When you finish, call planner_final with a direct user-facing answer.
-11a. OUTCOME REPORTING: When calling planner_final, always set \`outcome\` to 'success', 'partial', or 'failed'. If a test or validation failed, set outcome='failed' and include the key error in \`outcome_reason\`.
+11a. OUTCOME REPORTING: When calling planner_final, always set \`outcome\` to 'success', 'partial', or 'failed'. If a test or validation failed, set outcome='failed' and include the key error in \`outcome_reason\`. Also set \`disposition\` when possible: \`missing_evidence\`, \`blocked_external\`, \`exhausted_search\`, or \`planner_error\`.
+11b. ${isExecuteStage ? 'Treat the approved plan as binding. Execute it step by step instead of improvising parallel alternatives.' : 'Stay sequential and do not branch.'}
 12. NEVER use \`edit target=workspace\` to write directly into raw \`.mempedia\` storage. Use semantic targets instead: \`target=memory\`, \`target=preferences\`, or \`target=skills\`.
 13. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via planner_skills. For other skills in the catalog whose description overlaps with the task, call planner_skills to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to read/search/edit/bash/web.
 14. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
@@ -3195,7 +3454,9 @@ ${soulsGuidance}
 
     const summarizePlannerDecision = (decision: PlannerDecision): string => {
       if (decision.kind === 'tool') {
-        const names = decision.tool_calls.map((toolCall) => toolCall.name).join(',');
+        const names = decision.tool_calls
+          .map((toolCall: z.infer<typeof PlannerToolCallSchema>) => toolCall.name)
+          .join(',');
         return `[planner] kind=tool tools=${names}`;
       }
       if (decision.kind === 'branch') {
@@ -3207,21 +3468,64 @@ ${soulsGuidance}
       return '[planner] kind=final';
     };
 
+    const isPlannerTimeoutDetail = (detail: string): boolean =>
+      /\bllm timeout after \d+ms\b/i.test(detail)
+      || /\btimed out\b/i.test(detail)
+      || /\btimeout\b/i.test(detail);
+
+    const normalizePlannerResult = (
+      value: PlannerDecisionResult | PlannerDecision,
+    ): PlannerDecisionResult => {
+      if (value && typeof value === 'object' && 'decision' in value && (value as PlannerDecisionResult).decision) {
+        return value as PlannerDecisionResult;
+      }
+      return { decision: value as PlannerDecision };
+    };
+
+    const normalizePlannerBranches = (
+      branches: Array<z.infer<typeof PlannerBranchSchema>>,
+    ): PlannedBranch[] => branches.map((branch) => ({
+      label: branch.label,
+      goal: branch.goal,
+      why: branch.why,
+      priority: branch.priority,
+      executionGroup: branch.execution_group,
+      dependsOn: branch.depends_on,
+    }));
+
     const planWithSkillRouting = async (
       initialTranscript: ChatMessage[],
-      invoke: (transcript: ChatMessage[]) => Promise<PlannerDecisionResult>,
+      invoke: (transcript: ChatMessage[]) => Promise<PlannerDecisionResult | PlannerDecision>,
     ): Promise<ExecutablePlannerDecisionResult> => {
       let workingTranscript = initialTranscript;
       for (let attempt = 0; attempt < 3; attempt += 1) {
         let plannerResult: PlannerDecisionResult;
         try {
-          plannerResult = await invoke(workingTranscript);
+          plannerResult = normalizePlannerResult(await invoke(workingTranscript));
         } catch (error) {
           const detail = this.clipText(String((error as any)?.message || error || 'unknown planner error'), 400);
           emitTrace({
             type: 'error',
             content: `Planner decision generation failed: ${detail}`,
           });
+          if (isPlannerTimeoutDetail(detail)) {
+            emitTrace({
+              type: 'observation',
+              content: 'Planner timed out while choosing the next step; forcing branch finalization from gathered evidence.',
+            });
+            return {
+              decision: {
+                kind: 'final',
+                thought: 'Planner timed out before selecting the next step.',
+                final_answer: 'Planner timed out; finalize from gathered evidence.',
+                completion_summary: 'Planner timed out; finalizing from gathered evidence.',
+                outcome: 'partial',
+                outcome_reason: detail,
+                disposition: 'planner_error',
+                finalization_mode: 'planner_fallback',
+              },
+            };
+          }
           const evidenceFirstDecision = buildEvidenceFirstFallbackDecision();
           if (evidenceFirstDecision) {
             emitTrace({
@@ -3343,8 +3647,41 @@ ${soulsGuidance}
       };
     };
 
-    const buildMessages = (branch: BranchState) => {
-      let branchTranscript = branch.transcript;
+    const buildMessages = (branch: BranchState, transcriptOverride?: ChatMessage[]) => {
+      const renderStructuredBranchHandoff = (handoff?: BranchHandoff) => {
+        if (!handoff) {
+          return '(none)';
+        }
+        const fields = [
+          `canonical_task=${handoff.canonicalTaskId}`,
+          handoff.retryOfBranchId ? `retry_of=${handoff.retryOfBranchId}` : '',
+          handoff.disposition ? `disposition=${handoff.disposition}` : '',
+          handoff.missingFields?.length ? `missing_fields=${handoff.missingFields.join(' | ')}` : '',
+          handoff.blockedBy?.length ? `blocked_by=${handoff.blockedBy.join(' | ')}` : '',
+          handoff.mustNotRepeat?.length ? `must_not_repeat=${handoff.mustNotRepeat.join(' | ')}` : '',
+          handoff.priorResultSnippet ? `prior_result=${handoff.priorResultSnippet}` : '',
+        ].filter(Boolean);
+        return fields.join('\n');
+      };
+
+      const renderSharedRetryContext = (sharedHandoff?: SynthesisSharedHandoff) => {
+        if (!sharedHandoff) {
+          return '(none)';
+        }
+        const successful = (sharedHandoff.successfulAttempts || [])
+          .map((attempt) => `[${attempt.branchId}] ${attempt.label}: ${attempt.summary}`)
+          .join('\n');
+        const unresolved = (sharedHandoff.unresolvedAttempts || [])
+          .map((attempt) => `[${attempt.retryOfBranchId || 'unknown'}] ${attempt.canonicalTaskId} (${attempt.disposition || 'unknown'})`)
+          .join('\n');
+        return [
+          `retry_round=${sharedHandoff.retryIndex}`,
+          successful ? `successful_attempts:\n${successful}` : '',
+          unresolved ? `unresolved_attempts:\n${unresolved}` : '',
+        ].filter(Boolean).join('\n');
+      };
+
+      let branchTranscript = (transcriptOverride as typeof branch.transcript | undefined) ?? branch.transcript;
       const inheritedCount = Math.max(0, Math.min(branch.inheritedMessageCount, branchTranscript.length));
       const inheritedTranscript = branchTranscript.slice(0, inheritedCount);
       let localTranscript = branchTranscript.slice(inheritedCount);
@@ -3369,7 +3706,9 @@ ${soulsGuidance}
         ...inheritedTranscript,
         ...localTranscript,
       ];
-      branch.transcript = branchTranscript;
+      if (!transcriptOverride) {
+        branch.transcript = branchTranscript;
+      }
 
       const branchTranscriptTokens = estimateTranscriptTokens(branchTranscript);
       const branchResidualBudget = Math.max(
@@ -3383,7 +3722,7 @@ ${soulsGuidance}
         ...branchTranscript,
         {
           role: 'user' as const,
-          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- steps_so_far: ${branch.steps}\n- branch_inherited_messages: ${inheritedCount}\n- branch_local_messages: ${Math.max(0, branchTranscript.length - inheritedCount)}\n- branch_transcript_tokens: ${branchTranscriptTokens}\n- branch_context_budget_residual: ${branchResidualBudget} tokens\n\nLoop guard:\n- Prefer materially diverse search strategies over paraphrased near-duplicate queries.\n- If this branch can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing batches of direct work tools.\n- If you issue multiple web/search calls in one response, each must target a genuinely different evidence stream or hypothesis. Do not batch paraphrased versions of the same search.\n- If recent web/search rounds have been weak, noisy, or repetitive, change keywords, aliases, dates, domains, languages, source types, or switch from search to fetch.\n- After 2-3 consecutive web/search rounds without clear new information, do not continue the same-category search loop. Call planner_final with the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy.\n\nRespond by calling tool(s), not plain text. Call read/search/edit/bash/web directly for work. Use planner_branch/planner_final/planner_skills only for control flow, and never mix control tools with direct work-tool calls in the same response.`,
+          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- steps_so_far: ${branch.steps}\n- branch_inherited_messages: ${inheritedCount}\n- branch_local_messages: ${Math.max(0, branchTranscript.length - inheritedCount)}\n- branch_transcript_tokens: ${branchTranscriptTokens}\n- branch_context_budget_residual: ${branchResidualBudget} tokens\n- branch_disposition: ${branch.disposition || 'unknown'}\n- branch_handoff:\n${renderStructuredBranchHandoff(branch.handoff)}\n- shared_retry_context:\n${renderSharedRetryContext(branch.sharedHandoff)}\n- run_phase: ${runPhase || 'normal'}\n\nLoop guard:\n- Prefer materially diverse search strategies over paraphrased near-duplicate queries.\n- If this branch can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing batches of direct work tools.\n- If you issue multiple web/search calls in one response, each must target a genuinely different evidence stream or hypothesis. Do not batch paraphrased versions of the same search. Vary the actual query terms and change at least two of: keywords, aliases, domains, dates, language, or source type.\n- If recent web/search rounds have been weak, noisy, or repetitive, change keywords, aliases, dates, domains, languages, source types, or switch from search to fetch.\n- Treat structured handoff fields as binding: preserve known good facts, focus on missing fields, and obey must_not_repeat unless you have a materially new strategy.\n- If sibling branches need staged execution, use planner_branch.execution_group. If a branch must wait for specific sibling labels, use planner_branch.depends_on.\n- After 2-3 consecutive web/search rounds without clear new information, do not continue the same-category search loop. Call planner_final with the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy.\n- ${isPlanStage ? 'PLAN stage rule: finish by returning an executable plan through planner_final.' : isExecuteStage ? 'EXECUTE stage rule: follow the approved plan sequentially. Use exactly one direct work tool at a time and revise the plan only when direct evidence forces you to.' : 'Normal mode rule: use execution_group and depends_on when sibling work needs ordered coordination.'}\n\nRespond by calling tool(s), not plain text. Call read/search/edit/bash/web directly for work. Use planner_branch/planner_final/planner_skills only for control flow, and never mix control tools with direct work-tool calls in the same response.`,
         },
       ] as ChatMessage[];
     };
@@ -3449,7 +3788,7 @@ ${soulsGuidance}
             temperature: this.responseTemperature,
             maxTokens: 1600,
             messages: ([
-              { role: 'system', content: `${systemPrompt}\nYou must now finish. Do not branch. Do not call tools. Return plain text only.` },
+              { role: 'system', content: `${systemPrompt}\nYou must now finish. Do not branch. Do not call tools. Do not output any XML tags such as <tool_call>, <invoke>, <minimax:tool_call>, or similar markup. Return ONLY plain natural-language text for the user.` },
               ...recentConversationMessages,
               ...compressedTranscript,
               { role: 'user', content: `Finalize branch ${branch.id}. User request:\n${input}\n\nReason: ${reason}` },
@@ -3485,98 +3824,513 @@ ${soulsGuidance}
       return `以下是各已完成分支的整理结果：\n\n${sections.join('\n\n')}`;
     };
 
+    const canonicalizeRemediationLabel = (label: string): string => {
+      let current = String(label || '').replace(/\s+/g, ' ').trim();
+      while (/^fix:\s*/i.test(current)) {
+        current = current.replace(/^fix:\s*/i, '').trim();
+      }
+      return current || 'unnamed branch';
+    };
+
+    type SynthesisAttemptRecord = {
+      index: number;
+      branch: BranchState;
+      canonicalLabel: string;
+      disposition: BranchDisposition;
+      ancestorCanonicalLabels: string[];
+    };
+
+    const normalizeSynthesisText = (value: string): string => String(value || '').replace(/\s+/g, ' ').trim();
+
+    const splitSynthesisFragments = (value: string): string[] =>
+      normalizeSynthesisText(value)
+        .split(/(?<=[。！？.!?])\s+|[\n\r]+|(?<=;)\s+/u)
+        .map((fragment) => fragment.trim().replace(/^[\-\d.)\s]+/, '').trim())
+        .filter(Boolean);
+
+    const uniqueFragments = (values: string[]): string[] => {
+      const seen = new Set<string>();
+      return values.filter((value) => {
+        const normalized = normalizeSynthesisText(value);
+        if (!normalized || seen.has(normalized)) {
+          return false;
+        }
+        seen.add(normalized);
+        return true;
+      });
+    };
+
+    const pickFragments = (value: string, patterns: RegExp[], limit = 3): string[] =>
+      uniqueFragments(
+        splitSynthesisFragments(value).filter((fragment) => patterns.some((pattern) => pattern.test(fragment))),
+      ).slice(0, limit);
+
+    const extractPriorResultSnippet = (branch: BranchState): string =>
+      this.clipText(
+        this.sanitizeUserFacingAnswer(branch.finalAnswer || '', branch.completionSummary || '') || '(none)',
+        260,
+      );
+
+    const hasNegativeSynthesisSignal = (branch: BranchState): boolean => {
+      const signalText = normalizeSynthesisText([
+        branch.outcomeReason || '',
+        branch.completionSummary || '',
+        branch.finalAnswer || '',
+      ].join('\n'));
+      if (!signalText) {
+        return false;
+      }
+      return /planner decision generation failed|planner format fallback|schema repair|timeout|timed out|provider timeout|内部规划步骤失败|403|404|forbidden|fetch failed|access denied|访问限制|被屏蔽|无法访问|paywall|需要登录|动态js|js动态|blocked|已尝试\d+轮|历经\d+轮|多次搜索尝试均未能|连续多轮|用尽|搜索持续被.+淹没|no further .* likely|exhausted|all attempts|已用尽搜索策略|未获取到|未能获取|缺少|仍缺|remaining gap|still missing|not directly captured|无法确认|uncertainty|不确定性|未抓取到/i.test(signalText);
+    };
+
+    const isSuccessfulSynthesisBranch = (branch: BranchState): boolean => {
+      if (branch.outcome === 'success') {
+        return true;
+      }
+      if (branch.outcome === 'failed' || branch.outcome === 'partial') {
+        return false;
+      }
+      if (!branch.finalAnswer || branch.finalAnswer.length === 0) {
+        return false;
+      }
+      return !hasNegativeSynthesisSignal(branch);
+    };
+
+    const inferBranchDisposition = (branch: BranchState): BranchDisposition => {
+      if (branch.disposition && branch.disposition !== 'unknown') {
+        return branch.disposition;
+      }
+      if (isSuccessfulSynthesisBranch(branch)) {
+        return 'resolved';
+      }
+
+      const signalText = normalizeSynthesisText([
+        branch.outcomeReason || '',
+        branch.completionSummary || '',
+        branch.finalAnswer || '',
+      ].join('\n'));
+
+      if (!signalText) {
+        return branch.outcome === 'failed' || branch.outcome === 'partial'
+          ? 'missing_evidence'
+          : 'unknown';
+      }
+
+      if (/planner decision generation failed|planner format fallback|schema repair|timeout|timed out|provider timeout|内部规划步骤失败/i.test(signalText)) {
+        return 'planner_error';
+      }
+      if (/403|404|forbidden|fetch failed|access denied|访问限制|被屏蔽|无法访问|paywall|需要登录|动态js|js动态|blocked/i.test(signalText)) {
+        return 'blocked_external';
+      }
+      if (/已尝试\d+轮|历经\d+轮|多次搜索尝试均未能|连续多轮|用尽|搜索持续被.+淹没|no further .* likely|exhausted|all attempts|已用尽搜索策略/i.test(signalText)) {
+        return 'exhausted_search';
+      }
+      if (/未获取到|未能获取|缺少|仍缺|remaining gap|still missing|not directly captured|无法确认|uncertainty|不确定性|未抓取到/i.test(signalText)) {
+        return 'missing_evidence';
+      }
+
+      if (branch.outcome === 'failed' || branch.outcome === 'partial') {
+        return 'missing_evidence';
+      }
+      return 'unknown';
+    };
+
+    const isAncestorBranchId = (ancestorId: string, branchId: string): boolean =>
+      ancestorId.length > 0 && branchId.startsWith(`${ancestorId}.`);
+
+    const extractMissingFields = (branch: BranchState): string[] => pickFragments(
+      [branch.outcomeReason, branch.completionSummary, branch.finalAnswer].filter(Boolean).join('\n'),
+      [
+        /未获取到/i,
+        /未能获取/i,
+        /缺少/i,
+        /仍缺/i,
+        /remaining gap/i,
+        /still missing/i,
+        /not directly captured/i,
+        /未抓取到/i,
+        /无法确认/i,
+      ],
+    );
+
+    const extractBlockedBy = (branch: BranchState): string[] => pickFragments(
+      [branch.outcomeReason, branch.completionSummary, branch.finalAnswer].filter(Boolean).join('\n'),
+      [
+        /403/i,
+        /404/i,
+        /forbidden/i,
+        /fetch failed/i,
+        /访问限制/i,
+        /被屏蔽/i,
+        /无法访问/i,
+        /需要登录/i,
+        /动态js/i,
+        /js动态/i,
+        /timeout/i,
+      ],
+    );
+
+    const extractExhaustedStrategies = (branch: BranchState): string[] => pickFragments(
+      [branch.outcomeReason, branch.completionSummary, branch.finalAnswer].filter(Boolean).join('\n'),
+      [
+        /已尝试/i,
+        /历经/i,
+        /多次搜索/i,
+        /连续多轮/i,
+        /用尽/i,
+        /搜索持续被.+淹没/i,
+        /no further .* likely/i,
+        /exhausted/i,
+        /all attempts/i,
+      ],
+    );
+
+    const extractKnownGoodFacts = (branch: BranchState): string[] => {
+      const priorResult = extractPriorResultSnippet(branch);
+      if (!priorResult || priorResult === '(none)') {
+        return [];
+      }
+      const positiveFragments = pickFragments(
+        priorResult,
+        [
+          /成功/i,
+          /已获取/i,
+          /confirmed/i,
+          /captured/i,
+          /获取到了/i,
+          /数据/i,
+          /\d/,
+        ],
+        3,
+      );
+      return positiveFragments.length > 0 ? positiveFragments : [priorResult];
+    };
+
+    const buildMustNotRepeat = (disposition: BranchDisposition, branch: BranchState): string[] => {
+      const instructions = [
+        'Do not restart the same investigation from scratch.',
+        'Reuse the previous evidence before planning fresh searches or fetches.',
+      ];
+
+      if (disposition === 'blocked_external') {
+        instructions.push('Do not revisit the same blocked/paywalled/dynamic pages unless you have a genuinely new access path, API, or mirror.');
+      }
+      if (disposition === 'exhausted_search') {
+        instructions.push('Do not issue more generic searches in the same source family without a materially new hypothesis, domain, language, or source type.');
+      }
+      if (disposition === 'planner_error') {
+        instructions.push('Do not discard already collected evidence just because the previous planner step failed or timed out.');
+      }
+      if (branch.goal) {
+        instructions.push(`Stay focused on the unresolved gap inside: ${this.clipText(branch.goal, 120)}`);
+      }
+      return uniqueFragments(instructions).slice(0, 4);
+    };
+
+    type GoalAssessment = {
+      goalAchieved: boolean;
+      achievedWork: string[];
+      remainingWork: string[];
+      unresolvedAttempts: Array<{ record: SynthesisAttemptRecord; handoff: BranchHandoff }>;
+      summaryText: string;
+    };
+
+    const describeSuccessfulWork = (record: SynthesisAttemptRecord): string => this.clipText(
+      `[${record.branch.id}/${record.branch.label}] ${record.branch.completionSummary || record.branch.finalAnswer || record.branch.goal || 'completed work'}`,
+      260,
+    );
+
+    const describeRemainingWork = (record: SynthesisAttemptRecord, handoff: BranchHandoff): string => {
+      const fragments = [
+        `[${record.branch.id}/${record.branch.label}] ${record.canonicalLabel}`,
+        `status=${record.disposition}`,
+      ];
+      if (handoff.knownGoodFacts?.length) {
+        fragments.push(`verified progress: ${handoff.knownGoodFacts.join(' | ')}`);
+      }
+      if (handoff.missingFields?.length) {
+        fragments.push(`still needed: ${handoff.missingFields.join(' | ')}`);
+      } else if (handoff.priorIssue) {
+        fragments.push(`remaining gap: ${handoff.priorIssue}`);
+      }
+      if (handoff.blockedBy?.length) {
+        fragments.push(`blockers: ${handoff.blockedBy.join(' | ')}`);
+      }
+      return this.clipText(fragments.join(' | '), 320);
+    };
+
+    const buildGoalAssessment = (
+      successfulAttempts: SynthesisAttemptRecord[],
+      unresolvedAttempts: SynthesisAttemptRecord[],
+      attemptsByCanonical: Map<string, SynthesisAttemptRecord[]>,
+    ): GoalAssessment => {
+      const unresolvedWithHandoff = unresolvedAttempts.map((record) => ({
+        record,
+        handoff: buildBranchHandoff(record, attemptsByCanonical),
+      }));
+      const achievedWork = uniqueFragments(successfulAttempts.map((record) => describeSuccessfulWork(record)));
+      const remainingWork = uniqueFragments(
+        unresolvedWithHandoff.map(({ record, handoff }) => describeRemainingWork(record, handoff)),
+      );
+      const goalAchieved = unresolvedWithHandoff.length === 0;
+      return {
+        goalAchieved,
+        achievedWork,
+        remainingWork,
+        unresolvedAttempts: unresolvedWithHandoff,
+        summaryText: [
+          `goal_achieved=${goalAchieved ? 'yes' : 'no'}`,
+          `achieved_work:\n${achievedWork.length ? achievedWork.join('\n') : '(none yet)'}`,
+          `remaining_work:\n${remainingWork.length ? remainingWork.join('\n') : '(none)'}`,
+        ].join('\n'),
+      };
+    };
+
+    const resolveLatestSynthesisAttempts = (branches: BranchState[]) => {
+      const latestByCanonical = new Map<string, SynthesisAttemptRecord>();
+      const attemptsByCanonical = new Map<string, SynthesisAttemptRecord[]>();
+
+      branches.forEach((branch, index) => {
+        const canonicalLabel = canonicalizeRemediationLabel(branch.label);
+        const record: SynthesisAttemptRecord = {
+          index,
+          branch,
+          canonicalLabel,
+          disposition: inferBranchDisposition(branch),
+          ancestorCanonicalLabels: uniqueFragments(
+            (branch.ancestorBranchLabels || []).map((label) => canonicalizeRemediationLabel(label)),
+          ),
+        };
+        latestByCanonical.set(canonicalLabel, record);
+        const existing = attemptsByCanonical.get(canonicalLabel) || [];
+        existing.push(record);
+        attemptsByCanonical.set(canonicalLabel, existing);
+      });
+
+      const latestAttempts = [...latestByCanonical.values()]
+        .sort((left, right) => left.index - right.index);
+
+      const frontierAttempts = latestAttempts.filter((record) =>
+        !latestAttempts.some((other) =>
+          other !== record
+          && (
+            isAncestorBranchId(record.branch.id, other.branch.id)
+            || other.ancestorCanonicalLabels.includes(record.canonicalLabel)
+          ),
+        ),
+      );
+
+      const supersededAttempts = latestAttempts
+        .filter((record) => !frontierAttempts.includes(record))
+        .map((record) => ({ ...record, disposition: 'superseded' as BranchDisposition }));
+
+      const successfulAttempts = frontierAttempts.filter((record) => record.disposition === 'resolved');
+      const unresolvedAttempts = frontierAttempts.filter((record) => record.disposition !== 'resolved');
+
+      return {
+        latestAttempts,
+        frontierAttempts,
+        successfulAttempts,
+        unresolvedAttempts,
+        attemptsByCanonical,
+        supersededAttempts,
+      };
+    };
+
+    const buildBranchHandoff = (
+      record: SynthesisAttemptRecord,
+      attemptsByCanonical: Map<string, SynthesisAttemptRecord[]>,
+    ): BranchHandoff => {
+      const branch = record.branch;
+      const priorAttempts = (attemptsByCanonical.get(record.canonicalLabel) || [record])
+        .sort((left, right) => left.index - right.index)
+        .map((attempt) => attempt.branch.id);
+
+      return {
+        canonicalTaskId: record.canonicalLabel,
+        retryOfBranchId: branch.id,
+        priorAttemptIds: priorAttempts,
+        disposition: record.disposition,
+        priorIssue: this.clipText(branch.outcomeReason || branch.completionSummary || 'unknown reason', 180),
+        priorResultSnippet: extractPriorResultSnippet(branch),
+        knownGoodFacts: extractKnownGoodFacts(branch),
+        missingFields: extractMissingFields(branch),
+        exhaustedStrategies: extractExhaustedStrategies(branch),
+        blockedBy: extractBlockedBy(branch),
+        mustNotRepeat: buildMustNotRepeat(record.disposition, branch),
+      };
+    };
+
     const synthesizeCompletedBranches = async (
       branches: BranchState[],
       synthesisRetry = 0,
       maxSynthesisRetries = 2,
     ): Promise<string | SynthesisResult> => {
-      // ── Re-branch check: if some branches failed/partial and retries remain ──
-      const failedBranches = branches.filter(
-        (b) => b.outcome === 'failed' || b.outcome === 'partial',
-      );
-      const successBranches = branches.filter(
-        (b) => b.outcome === 'success' || (!b.outcome && b.finalAnswer && b.finalAnswer.length > 0),
+      const {
+        frontierAttempts,
+        successfulAttempts,
+        unresolvedAttempts,
+        attemptsByCanonical,
+        supersededAttempts,
+      } = resolveLatestSynthesisAttempts(branches);
+      const goalAssessment = buildGoalAssessment(successfulAttempts, unresolvedAttempts, attemptsByCanonical);
+      const rebranchCandidates = goalAssessment.unresolvedAttempts.filter(({ record }) =>
+        record.branch.finalizationMode !== 'planner_fallback',
       );
 
-      if (failedBranches.length > 0 && synthesisRetry < maxSynthesisRetries) {
+      emitTrace({
+        type: 'observation',
+        content: `Goal assessment before synthesis:\n${goalAssessment.summaryText}`,
+      });
+
+      if (!goalAssessment.goalAchieved && !this.rebranchEnabled) {
+        emitTrace({
+          type: 'observation',
+          content: `Rebranch disabled by REACT_REBRANCH_ENABLED; synthesizing current frontier with ${goalAssessment.unresolvedAttempts.length} unmet workstream(s) left as-is.`,
+        });
+      }
+
+      if (!goalAssessment.goalAchieved && this.rebranchEnabled && rebranchCandidates.length === 0) {
+        emitTrace({
+          type: 'observation',
+          content: 'Skipping auto re-branch because the remaining unmet work only comes from planner fallback finalizations in this run.',
+        });
+      }
+
+      if (!goalAssessment.goalAchieved && this.rebranchEnabled && synthesisRetry < maxSynthesisRetries && rebranchCandidates.length > 0) {
         emitTrace({
           type: 'thought',
-          content: `${failedBranches.length} branch(es) failed/partial, ${successBranches.length} succeeded. Requesting remediation re-branch (retry ${synthesisRetry + 1}/${maxSynthesisRetries}).`,
+          content: `Current work does not yet satisfy the user goal: ${goalAssessment.unresolvedAttempts.length} unmet workstream(s), ${successfulAttempts.length} resolved workstream(s), ${supersededAttempts.length} superseded ancestor attempt(s). Requesting remediation re-branch for ${rebranchCandidates.length} workstream(s) (retry ${synthesisRetry + 1}/${maxSynthesisRetries}).`,
         });
 
-        // Build context summary from successful branches.
-        const successContext = successBranches
-          .map((b) => `[${b.id}/${b.label}] (success): ${this.clipText(b.finalAnswer || b.completionSummary || '', 800)}`)
+        const successContext = successfulAttempts
+          .map((record) => `[${record.branch.id}/${record.branch.label}] (success): ${this.clipText(record.branch.finalAnswer || record.branch.completionSummary || '', 800)}`)
           .join('\n\n');
 
-        // Build remediation branches for each failed branch.
-        const remediationBranches = failedBranches.map((b) => ({
-          label: `fix: ${b.label}`,
-          goal: `Retry the failed task "${b.goal}". Previous attempt failed: ${b.outcomeReason || b.completionSummary || 'unknown reason'}. Use the error information to fix the issue. The following sibling branches succeeded and their results are available as context.`,
-          why: `Previous branch ${b.id} outcome=${b.outcome}: ${b.outcomeReason || 'no reason given'}`,
-          priority: 0.9,
-        }));
+        const remediationBranches = rebranchCandidates.map(({ record, handoff }) => {
+          const branch = record.branch;
+          const knownGoodText = handoff.knownGoodFacts?.length ? ` Verified progress to preserve: ${handoff.knownGoodFacts.join(' | ')}` : '';
+          const missingFieldsText = handoff.missingFields?.length ? ` Missing fields: ${handoff.missingFields.join(' | ')}` : '';
+          const blockedByText = handoff.blockedBy?.length ? ` Blockers: ${handoff.blockedBy.join(' | ')}` : '';
+          return {
+            label: `fix: ${record.canonicalLabel}`,
+            goal: this.clipText(
+              `Judge whether "${record.canonicalLabel}" already satisfies the user goal from current results. If not, preserve reusable prior results and evidence, identify the remaining work, and complete only that gap.${knownGoodText}${missingFieldsText}${blockedByText}`,
+              240,
+            ),
+            why: this.clipText(
+              `Latest attempt ${branch.id} disposition=${record.disposition}. Re-plan from existing progress instead of restarting from scratch.`,
+              220,
+            ),
+            priority: 0.9,
+            handoff,
+          };
+        });
+
+        const remediationHandoff: SynthesisSharedHandoff = {
+          retryIndex: synthesisRetry + 1,
+          successfulAttempts: successfulAttempts.map((record) => ({
+            branchId: record.branch.id,
+            label: record.branch.label,
+            canonicalTaskId: record.canonicalLabel,
+            summary: this.clipText(record.branch.finalAnswer || record.branch.completionSummary || '', 220),
+          })),
+          unresolvedAttempts: rebranchCandidates.map(({ handoff }) => handoff),
+        };
 
         return {
           done: false,
           branches: remediationBranches,
-          context: `Successful branches:\n${successContext || '(none)'}\n\nFailed branches:\n${failedBranches.map((b) => `[${b.id}/${b.label}] outcome=${b.outcome}: ${b.outcomeReason || '(no reason)'}\nanswer: ${this.clipText(b.finalAnswer || '', 400)}`).join('\n\n')}`,
+          context: `Current goal assessment:\n${goalAssessment.summaryText}\n\nSuccessful frontier attempts:\n${successContext || '(none)'}\n\nUnmet workstreams:\n${goalAssessment.unresolvedAttempts.map(({ record, handoff }) => {
+            const branch = record.branch;
+            return [
+              `[${branch.id}/${branch.label}] canonical=${record.canonicalLabel}`,
+              `disposition=${record.disposition}`,
+              `goal: ${branch.goal}`,
+              `outcome=${branch.outcome}: ${branch.outcomeReason || '(no reason)'}`,
+              `previous_answer: ${this.clipText(branch.finalAnswer || branch.completionSummary || '(none)', 500)}`,
+              `known_good: ${(handoff.knownGoodFacts || []).join(' | ') || '(none)'}`,
+              `missing_fields: ${(handoff.missingFields || []).join(' | ') || '(none)'}`,
+              `blocked_by: ${(handoff.blockedBy || []).join(' | ') || '(none)'}`,
+              `must_not_repeat: ${(handoff.mustNotRepeat || []).join(' | ') || '(none)'}`,
+            ].join('\n');
+          }).join('\n\n')}`,
+          handoff: remediationHandoff,
         };
       }
 
       // ── Normal synthesis (all success, or retries exhausted) ──
-      if (branches.length === 1 && branches[0].finalAnswer) {
-        const fallback = buildSafeBranchDisplayFallback(branches[0]);
+      if (
+        frontierAttempts.length === 1
+        && frontierAttempts[0].branch.finalAnswer
+        && (goalAssessment.goalAchieved || rebranchCandidates.length === 0)
+      ) {
+        const fallback = buildSafeBranchDisplayFallback(frontierAttempts[0].branch);
         return this.sanitizeUserFacingAnswer(
-          branches[0].finalAnswer,
+          frontierAttempts[0].branch.finalAnswer,
           fallback,
         ) || fallback;
       }
-      emitTrace({ type: 'thought', content: `Synthesizing ${branches.length} completed branches into one final answer...` });
-      const branchSummary = branches
-        .map((branch) => [
-          `Branch ${branch.id}`,
-          `label: ${branch.label}`,
-          `goal: ${branch.goal}`,
-          `saved_nodes: ${branch.savedNodeIds.length ? branch.savedNodeIds.join(', ') : '(none)'}`,
-          `summary: ${branch.completionSummary || '(none)'}`,
-          `answer:\n${branch.finalAnswer || ''}`,
+      emitTrace({ type: 'thought', content: `Synthesizing ${frontierAttempts.length} frontier completed branch attempt(s) into one final answer...` });
+      const branchSummary = frontierAttempts
+        .map((record) => [
+          `Branch ${record.branch.id}`,
+          `label: ${record.branch.label}`,
+          `canonical_label: ${record.canonicalLabel}`,
+          `disposition: ${record.disposition}`,
+          `goal: ${record.branch.goal}`,
+          `saved_nodes: ${record.branch.savedNodeIds.length ? record.branch.savedNodeIds.join(', ') : '(none)'}`,
+          `outcome: ${record.branch.outcome || 'unknown'}`,
+          `outcome_reason: ${record.branch.outcomeReason || '(none)'}`,
+          `summary: ${record.branch.completionSummary || '(none)'}`,
+          `answer:\n${record.branch.finalAnswer || ''}`,
         ].join('\n'))
         .join('\n\n---\n\n');
 
-      const { text: _synthesisText } = await this.measure(perfEntries, 'branch_synthesis', async () => {
-        await this.llmRpmLimiter.acquire();
-        return this.withTimeout(
-          generateText({
-            model: this.openai,
-            temperature: this.responseTemperature,
-            maxTokens: 1800,
-            messages: [
-              {
-                role: 'system',
-                content: `You are the synthesis stage for a branching ReAct agent. Merge completed branches into the best possible final answer. Prefer correctness and directness. Mention uncertainty only when branches genuinely disagree. If you mention saved node ids, use only ids explicitly listed in saved_nodes. Do not invent node ids.${soulsGuidance ? `\n\n${soulsGuidance}` : ''}`,
-              },
-              {
-                role: 'user',
-                content: `User request:\n${input}\n\nShared context:\n${this.clipText(context || '(no shared context)', 4000)}\n\nCompleted branches:\n${branchSummary}`,
-              },
-            ],
-          }),
-          this.agentLlmTimeoutMs,
-          'branch_synthesis llm'
-        );
-      });
+      emitTrace({ type: 'observation', content: `Synthesis model call started for ${frontierAttempts.length} frontier branch attempt(s).` });
+      let _synthesisText: string;
+      try {
+        ({ text: _synthesisText } = await this.measure(perfEntries, 'branch_synthesis', async () => {
+          await this.llmRpmLimiter.acquire();
+          return this.withTimeout(
+            generateText({
+              model: this.openai,
+              temperature: this.responseTemperature,
+              maxTokens: 1800,
+              messages: [
+                {
+                  role: 'system',
+                  content: `You are the synthesis stage for a branching ReAct agent. Merge completed branches into the best possible final answer. Prefer correctness and directness. Mention uncertainty only when branches genuinely disagree. If you mention saved node ids, use only ids explicitly listed in saved_nodes. Do not invent node ids. Do not output tool calls, XML tags such as <tool_call>, <invoke>, or any structured markup — return plain natural-language text only.${soulsGuidance ? `\n\n${soulsGuidance}` : ''}`,
+                },
+                {
+                  role: 'user',
+                  content: `User request:\n${input}\n\nShared context:\n${this.clipText(context || '(no shared context)', 4000)}\n\nGoal assessment:\n${goalAssessment.summaryText}\n\nCompleted branches:\n${branchSummary}`,
+                },
+              ],
+            }),
+            this.agentLlmTimeoutMs,
+            'branch_synthesis llm'
+          );
+        }));
+      } catch (error: any) {
+        emitTrace({
+          type: 'error',
+          content: `Synthesis model call failed: ${error?.message || String(error)}. Falling back to deterministic branch merge.`,
+        });
+        return buildDeterministicSynthesisFallback(frontierAttempts.map((record) => record.branch));
+      }
 
       const synthesized = extractText(_synthesisText).trim();
       const sanitized = this.sanitizeUserFacingAnswer(synthesized);
       if (sanitized) {
+        emitTrace({ type: 'observation', content: 'Synthesis model call completed successfully.' });
         return sanitized;
       }
       emitTrace({
         type: 'observation',
         content: 'Synthesis returned internal tool/planner markup; falling back to deterministic branch merge.',
       });
-      return buildDeterministicSynthesisFallback(branches);
+      return buildDeterministicSynthesisFallback(frontierAttempts.map((record) => record.branch));
     };
     let completedBranchesForRun: Array<BranchSynthesisInput['branches'][number]> = [];
     let finalAnswer: string;
@@ -3599,9 +4353,9 @@ ${soulsGuidance}
         transcriptBudgetChars: effectiveTranscriptBudgetChars,
         modelLimit: ctxBudget.modelLimit,
         committedTokens: ctxBudget.committedTokens,
-        planBranch: async ({ branch }) => {
+        planBranch: async ({ branch, planningTranscript }) => {
           const plannerResult = await planWithSkillRouting(
-            buildMessages(branch as BranchState),
+            buildMessages(branch as BranchState, planningTranscript as ChatMessage[] | undefined),
             async (workingTranscript) => {
               return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
                 this.generatePlannerDecision({
@@ -3637,6 +4391,8 @@ ${soulsGuidance}
             completionSummary: decision.completion_summary,
             outcome: (decision as any).outcome,
             outcomeReason: (decision as any).outcome_reason,
+            disposition: (decision as any).disposition,
+            finalizationMode: (decision as any).finalization_mode,
           };
         },
         buildToolTranscript: ({ branch, observations }) => buildAnthropicToolTranscript(branch as BranchState, observations),
@@ -3669,9 +4425,9 @@ ${soulsGuidance}
       transcriptBudgetChars: effectiveTranscriptBudgetChars,
       modelLimit: ctxBudget.modelLimit,
       committedTokens: ctxBudget.committedTokens,
-      planBranch: async ({ branch }) => {
+      planBranch: async ({ branch, planningTranscript }) => {
         const plannerResult = await planWithSkillRouting(
-          buildMessages(branch as BranchState),
+          buildMessages(branch as BranchState, planningTranscript as ChatMessage[] | undefined),
           async (workingTranscript) => {
             return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
               this.generatePlannerDecision({
@@ -3690,7 +4446,11 @@ ${soulsGuidance}
           return { kind: 'tool' as const, thought: decision.thought, toolCalls: decision.tool_calls };
         }
         if (decision.kind === 'branch') {
-          return { kind: 'branch' as const, thought: decision.thought, branches: decision.branches };
+          return {
+            kind: 'branch' as const,
+            thought: decision.thought,
+            branches: normalizePlannerBranches(decision.branches),
+          };
         }
         return {
           kind: 'final' as const,
@@ -3699,6 +4459,8 @@ ${soulsGuidance}
           completionSummary: decision.completion_summary,
           outcome: (decision as any).outcome,
           outcomeReason: (decision as any).outcome_reason,
+          disposition: (decision as any).disposition,
+          finalizationMode: (decision as any).finalization_mode,
         };
       },
       buildToolTranscript: ({ branch, observations }) => buildAnthropicToolTranscript(branch as BranchState, observations),
@@ -3728,6 +4490,10 @@ ${soulsGuidance}
           finalAnswer: branch.finalAnswer,
           outcome: branch.outcome,
           outcomeReason: branch.outcomeReason,
+          disposition: branch.disposition,
+          finalizationMode: branch.finalizationMode,
+          ancestorBranchIds: branch.ancestorBranchIds,
+          ancestorBranchLabels: branch.ancestorBranchLabels,
         })) as BranchState[];
         return synthesizeCompletedBranches(
           branches,
@@ -3770,6 +4536,23 @@ ${soulsGuidance}
         )
         : '抱歉，我暂时没能生成可展示的回答，请重试一次。',
     ) || '抱歉，我暂时没能生成可展示的回答，请重试一次。';
+    finalAnswer = this.normalizeUserFacingAnswer(finalAnswer);
+
+    if (runPhase === 'plan') {
+      if (perfEntries && perfEntries.length > 0) {
+        const totalMs = perfEntries.reduce((sum, item) => sum + item.ms, 0);
+        const top = [...perfEntries]
+          .sort((a, b) => b.ms - a.ms)
+          .slice(0, 8)
+          .map((item) => `${item.label}:${item.ms}ms`)
+          .join(' | ');
+        emitTrace({
+          type: 'observation',
+          content: `Perf total=${totalMs}ms; top=${top}`
+        });
+      }
+      return finalAnswer;
+    }
 
     // ── Session carry-over: detect exhaustion and record/clear ──────────
     if (isRunExhausted(traceBuffer, finalAnswer)) {
@@ -3834,8 +4617,8 @@ ${soulsGuidance}
         {
           savePreferences: true,
           saveSkills: true,
-          saveAtomic: this.shouldAutoSaveAtomicKnowledge(input, traceBuffer, finalAnswer),
-          saveEpisodic: this.shouldAutoSaveEpisodic(input, finalAnswer),
+          saveAtomic: true,
+          saveEpisodic: true,
         }
       );
       this.scheduleMemorySave(autoJob);
@@ -3845,7 +4628,6 @@ ${soulsGuidance}
         content: `Auto-queued independent four-layer memory classification from branch ${(bestBranch?.id) || 'B0'}.`,
       });
     }
-    finalAnswer = this.normalizeUserFacingAnswer(finalAnswer);
     // Persist conversation state synchronously (fast, small writes).
     this.appendConversationTurn(conversationId, { user: input, assistant: finalAnswer });
     const persistedTurns = this.getConversationTurns(conversationId);

@@ -1,4 +1,18 @@
-import { AgentTraceEvent, BranchOutcome, PlannedBranch, PlannedToolCall, SynthesisResult, ToolObservation, TranscriptMessage } from './types.js';
+import {
+  AgentTraceEvent,
+  BranchKanbanCard,
+  BranchKanbanSnapshot,
+  BranchKanbanStatus,
+  BranchDisposition,
+  BranchHandoff,
+  BranchOutcome,
+  PlannedBranch,
+  PlannedToolCall,
+  SynthesisResult,
+  SynthesisSharedHandoff,
+  ToolObservation,
+  TranscriptMessage,
+} from './types.js';
 import { Planner } from './SimplePlanner.js';
 import { ToolExecutionResult } from '../tools/types.js';
 import {
@@ -19,6 +33,8 @@ export interface AgentBranchState {
   depth: number;
   label: string;
   goal: string;
+  executionGroup: number;
+  dependsOn: string[];
   priority: number;
   steps: number;
   inheritedMessageCount: number;
@@ -30,10 +46,24 @@ export interface AgentBranchState {
   outcome?: BranchOutcome;
   /** Human-readable explanation when outcome is 'partial' or 'failed'. */
   outcomeReason?: string;
+  /** Retry-oriented disposition used during synthesis/remediation selection. */
+  disposition?: BranchDisposition;
+  /** Whether the branch ended naturally or via planner fallback finalization. */
+  finalizationMode?: 'natural' | 'planner_fallback';
+  /** Structured per-branch remediation handoff, when this branch is a retry child. */
+  handoff?: BranchHandoff;
+  /** Structured shared retry context for a remediation round. */
+  sharedHandoff?: SynthesisSharedHandoff;
+  /** Full branch ancestry ids, excluding this branch id. */
+  ancestorBranchIds?: string[];
+  /** Full branch ancestry labels, excluding this branch label. */
+  ancestorBranchLabels?: string[];
 }
 
 export interface BranchPlanInput {
   branch: AgentBranchState;
+  planningTranscript?: TranscriptMessage[];
+  kanbanSnapshot?: BranchKanbanSnapshot;
 }
 
 export interface BranchToolExecutionInput {
@@ -58,6 +88,10 @@ export interface BranchSynthesisInput {
     finalAnswer: string;
     outcome?: BranchOutcome;
     outcomeReason?: string;
+    disposition?: BranchDisposition;
+    finalizationMode?: 'natural' | 'planner_fallback';
+    ancestorBranchIds?: string[];
+    ancestorBranchLabels?: string[];
   }>;
   /** How many synthesis-retry rounds have already occurred (0 on first call). */
   synthesisRetry: number;
@@ -123,13 +157,163 @@ function formatPlannerToolDecisionMessage(toolCalls: PlannedToolCall[]): string 
   return ['PLANNER TOOL DECISION:', ...lines].join('\n');
 }
 
+function formatToolObservationHeader(toolCall: PlannedToolCall, fallbackToolName: string): string {
+  if (toolCall.name === 'web') {
+    const mode = String(toolCall.arguments?.mode || '').trim();
+    if (mode === 'search') {
+      const query = String(toolCall.arguments?.query || '').trim();
+      if (query) {
+        return `TOOL OBSERVATION for web search query=${JSON.stringify(query)}:`;
+      }
+    }
+    if (mode === 'fetch') {
+      const url = String(toolCall.arguments?.url || '').trim();
+      if (url) {
+        return `TOOL OBSERVATION for web fetch url=${JSON.stringify(url)}:`;
+      }
+    }
+  }
+
+  return `TOOL OBSERVATION for ${fallbackToolName}:`;
+}
+
 function formatPlannerBranchDecisionMessage(branches: PlannedBranch[]): string {
   const lines = branches.map((branch) => {
     const why = branch.why?.trim() ? ` | why: ${branch.why.trim()}` : '';
     const priority = typeof branch.priority === 'number' ? ` | priority: ${branch.priority}` : '';
-    return `- ${branch.label}: ${branch.goal}${why}${priority}`;
+    const executionGroup = typeof branch.executionGroup === 'number' ? ` | execution_group: ${branch.executionGroup}` : '';
+    const dependsOn = branch.dependsOn?.length ? ` | depends_on: ${branch.dependsOn.join(', ')}` : '';
+    return `- ${branch.label}: ${branch.goal}${why}${priority}${executionGroup}${dependsOn}`;
   });
   return ['PLANNER BRANCH DECISION:', ...lines].join('\n');
+}
+
+function normalizeExecutionGroup(value: unknown, fallback = 1): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(1, Math.floor(numeric));
+}
+
+function normalizeDependencyLabels(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return dedupeNonEmpty(value.map((entry) => String(entry || '').trim()));
+}
+
+function renderBranchHandoffMessage(handoff?: BranchHandoff): string {
+  if (!handoff) {
+    return '';
+  }
+
+  const sections: string[] = [
+    `canonical_task: ${handoff.canonicalTaskId}`,
+  ];
+  if (handoff.retryOfBranchId) {
+    sections.push(`retry_of_branch: ${handoff.retryOfBranchId}`);
+  }
+  if (handoff.disposition) {
+    sections.push(`disposition: ${handoff.disposition}`);
+  }
+  if (handoff.priorAttemptIds?.length) {
+    sections.push(`prior_attempt_ids: ${handoff.priorAttemptIds.join(', ')}`);
+  }
+  if (handoff.priorIssue) {
+    sections.push(`prior_issue: ${handoff.priorIssue}`);
+  }
+  if (handoff.priorResultSnippet) {
+    sections.push(`prior_result: ${handoff.priorResultSnippet}`);
+  }
+  if (handoff.knownGoodFacts?.length) {
+    sections.push(`known_good_facts:\n- ${handoff.knownGoodFacts.join('\n- ')}`);
+  }
+  if (handoff.missingFields?.length) {
+    sections.push(`missing_fields:\n- ${handoff.missingFields.join('\n- ')}`);
+  }
+  if (handoff.blockedBy?.length) {
+    sections.push(`blocked_by:\n- ${handoff.blockedBy.join('\n- ')}`);
+  }
+  if (handoff.exhaustedStrategies?.length) {
+    sections.push(`exhausted_strategies:\n- ${handoff.exhaustedStrategies.join('\n- ')}`);
+  }
+  if (handoff.mustNotRepeat?.length) {
+    sections.push(`must_not_repeat:\n- ${handoff.mustNotRepeat.join('\n- ')}`);
+  }
+  return sections.join('\n');
+}
+
+function renderSharedHandoffMessage(sharedHandoff?: SynthesisSharedHandoff): string {
+  if (!sharedHandoff) {
+    return '';
+  }
+
+  const lines: string[] = [`retry_round: ${sharedHandoff.retryIndex}`];
+  if (sharedHandoff.successfulAttempts?.length) {
+    lines.push('successful_attempts:');
+    for (const attempt of sharedHandoff.successfulAttempts) {
+      lines.push(`- [${attempt.branchId}] ${attempt.label} (canonical=${attempt.canonicalTaskId}): ${attempt.summary}`);
+    }
+  }
+  if (sharedHandoff.unresolvedAttempts?.length) {
+    lines.push('unresolved_attempts:');
+    for (const attempt of sharedHandoff.unresolvedAttempts) {
+      lines.push(`- [${attempt.retryOfBranchId || 'unknown'}] ${attempt.canonicalTaskId} (${attempt.disposition || 'unknown'})`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function previewText(value: string | undefined, maxLength = 160): string {
+  const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return '';
+  }
+  return normalized.length > maxLength
+    ? `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`
+    : normalized;
+}
+
+function dedupeNonEmpty(values: Array<string | undefined | null>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = previewText(String(value || ''), 240);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function extractArtifactPaths(toolCalls: PlannedToolCall[]): string[] {
+  const collected: string[] = [];
+  for (const toolCall of toolCalls) {
+    const args = toolCall.arguments || {};
+    const candidates = [
+      args.path,
+      args.filePath,
+      args.outputPath,
+      args.targetPath,
+      args.cwd,
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate.trim()) {
+        collected.push(candidate.trim());
+      }
+    }
+    if (Array.isArray(args.paths)) {
+      for (const candidate of args.paths) {
+        if (typeof candidate === 'string' && candidate.trim()) {
+          collected.push(candidate.trim());
+        }
+      }
+    }
+  }
+  return dedupeNonEmpty(collected);
 }
 
 /**
@@ -207,10 +391,14 @@ export class AgentRuntime {
       depth: 0,
       label: 'root',
       goal: 'Solve the user request end-to-end.',
+      executionGroup: 1,
+      dependsOn: [],
       priority: 1,
       steps: 0,
       inheritedMessageCount: 0,
       savedNodeIds: [],
+      ancestorBranchIds: [],
+      ancestorBranchLabels: [],
       transcript: [
         ...priorTranscript,
         { role: 'user', content: userMessage },
@@ -219,10 +407,122 @@ export class AgentRuntime {
 
     const queue: AgentBranchState[] = [rootBranch];
     const completed: AgentBranchState[] = [];
+    const siblingFamilies = new Map<string, { rootId: string; executionGroup: number }>();
     let lastTouchedBranch: AgentBranchState | null = rootBranch;
     let totalLoopSteps = 0;
     const totalLoopBudget = this.maxTotalSteps
       ?? Math.max(this.maxSteps, this.maxSteps * this.maxBranchWidth * (this.maxBranchDepth + 1));
+    const kanbanCards = new Map<string, BranchKanbanCard>();
+
+    const cloneKanbanCard = (card: BranchKanbanCard): BranchKanbanCard => ({
+      ...card,
+      dependsOn: [...(card.dependsOn || [])],
+      blockers: [...(card.blockers || [])],
+      artifacts: [...(card.artifacts || [])],
+    });
+
+    const summarizeKanban = () => {
+      const cards = [...kanbanCards.values()];
+      const summary = {
+        total: cards.length,
+        queued: cards.filter((card) => card.status === 'queued').length,
+        active: cards.filter((card) => card.status === 'active').length,
+        finalizing: cards.filter((card) => card.status === 'finalizing').length,
+        completed: cards.filter((card) => card.status === 'completed').length,
+        error: cards.filter((card) => card.status === 'error').length,
+      };
+      return summary;
+    };
+
+    const buildKanbanSnapshot = (): BranchKanbanSnapshot => ({
+      updatedAt: Date.now(),
+      summary: summarizeKanban(),
+      cards: [...kanbanCards.values()]
+        .map((card) => cloneKanbanCard(card))
+        .sort((a, b) => (b.updatedAt - a.updatedAt) || (a.depth - b.depth) || a.branchId.localeCompare(b.branchId)),
+    });
+
+    const upsertKanbanCard = (
+      branch: AgentBranchState,
+      patch: Partial<BranchKanbanCard> & { status?: BranchKanbanStatus },
+    ): BranchKanbanCard => {
+      const current = kanbanCards.get(branch.id);
+      const next: BranchKanbanCard = {
+        branchId: branch.id,
+        parentBranchId: branch.parentId,
+        label: patch.label ?? branch.label,
+        goal: patch.goal ?? branch.goal,
+        executionGroup: patch.executionGroup ?? branch.executionGroup ?? current?.executionGroup,
+        dependsOn: patch.dependsOn !== undefined
+          ? dedupeNonEmpty(patch.dependsOn)
+          : [...(branch.dependsOn || current?.dependsOn || [])],
+        depth: patch.depth ?? branch.depth,
+        step: patch.step ?? branch.steps,
+        status: patch.status ?? current?.status ?? 'queued',
+        outcome: patch.outcome ?? branch.outcome ?? current?.outcome,
+        disposition: patch.disposition ?? branch.disposition ?? current?.disposition,
+        summary: patch.summary ?? current?.summary,
+        blockers: patch.blockers !== undefined
+          ? dedupeNonEmpty(patch.blockers)
+          : [...(current?.blockers || [])],
+        artifacts: patch.artifacts !== undefined
+          ? dedupeNonEmpty([...(current?.artifacts || []), ...patch.artifacts])
+          : [...(current?.artifacts || [])],
+        updatedAt: Date.now(),
+      };
+      kanbanCards.set(branch.id, next);
+      return next;
+    };
+
+    const renderKanbanSyncMessage = (branch: AgentBranchState): string => {
+      const snapshot = buildKanbanSnapshot();
+      const visibleCards = snapshot.cards
+        .filter((card) => card.branchId !== branch.id)
+        .slice(0, 6);
+      if (visibleCards.length === 0) {
+        return '';
+      }
+
+      const lines = [
+        'Shared branch kanban snapshot:',
+        `- summary: total=${snapshot.summary.total}, active=${snapshot.summary.active}, queued=${snapshot.summary.queued}, finalizing=${snapshot.summary.finalizing}, completed=${snapshot.summary.completed}, error=${snapshot.summary.error}`,
+        '- Use this to avoid duplicate work and reuse sibling results when possible.',
+      ];
+      for (const card of visibleCards) {
+        const details = [
+          `status=${card.status}`,
+          `goal=${previewText(card.goal, 80)}`,
+          typeof card.executionGroup === 'number' ? `execution_group=${card.executionGroup}` : '',
+          card.dependsOn?.length ? `depends_on=${card.dependsOn.join(', ')}` : '',
+          card.summary ? `result=${previewText(card.summary, 120)}` : '',
+          card.artifacts?.length ? `artifacts=${card.artifacts.slice(0, 3).join(', ')}` : '',
+          card.blockers?.length ? `blockers=${card.blockers.slice(0, 2).join(' | ')}` : '',
+        ].filter(Boolean);
+        lines.push(`- [${card.branchId}] ${card.label}: ${details.join(' ; ')}`);
+      }
+      return lines.join('\n');
+    };
+
+    const buildPlanningTranscript = (branch: AgentBranchState): TranscriptMessage[] => {
+      const syncMessage = renderKanbanSyncMessage(branch);
+      if (!syncMessage) {
+        return branch.transcript;
+      }
+      const tail = branch.transcript.at(-1);
+      if (!tail) {
+        return [{ role: 'system', content: syncMessage }];
+      }
+      return [
+        ...branch.transcript.slice(0, -1),
+        { role: 'system', content: syncMessage },
+        tail,
+      ];
+    };
+
+    upsertKanbanCard(rootBranch, {
+      status: 'queued',
+      summary: 'Root branch created and waiting for scheduler.',
+    });
 
     const traceMeta = (branch: AgentBranchState, extra: Record<string, unknown> = {}) => ({
       branchId: branch.id,
@@ -230,6 +530,8 @@ export class AgentRuntime {
       branchLabel: branch.label,
       depth: branch.depth,
       step: branch.steps,
+      kanbanCard: kanbanCards.has(branch.id) ? cloneKanbanCard(kanbanCards.get(branch.id)!) : undefined,
+      kanbanSummary: summarizeKanban(),
       ...extra,
     });
 
@@ -240,6 +542,92 @@ export class AgentRuntime {
       extra: Record<string, unknown> = {},
     ) => {
       this.emit({ type, content, metadata: traceMeta(branch, extra) });
+    };
+
+    const siblingKey = (parentId: string | null, label: string) => `${parentId || '__root__'}::${label}`;
+
+    const addCompletedBranch = (branch: AgentBranchState) => {
+      if (!completed.includes(branch)) {
+        completed.push(branch);
+      }
+    };
+
+    const buildDefaultSynthesisAnswer = (branches: AgentBranchState[]): string => {
+      if (branches.length === 0) {
+        return 'Maximum steps reached without a final answer.';
+      }
+      if (branches.length === 1) {
+        return branches[0].finalAnswer ?? 'Maximum steps reached without a final answer.';
+      }
+      return [...branches]
+        .map((branch) => branch.finalAnswer || '')
+        .find((answer) => answer.length > 0)
+        ?? 'Maximum steps reached without a final answer.';
+    };
+
+    const finalizeBranchSafely = async (
+      branch: AgentBranchState,
+      reason: string,
+      fallbackAnswer: string,
+    ): Promise<string> => {
+      upsertKanbanCard(branch, {
+        status: 'finalizing',
+        summary: previewText(reason, 160) || 'Finalizing branch output.',
+      });
+      if (!this.finalizeBranch) {
+        return fallbackAnswer;
+      }
+      try {
+        const finalized = await this.finalizeBranch({ branch, reason });
+        return finalized?.trim() || fallbackAnswer;
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        emitBranchTrace('error', branch, `Finalize failed for ${branch.id}: ${message}`, { reason });
+        branch.outcome = branch.outcome ?? 'failed';
+        branch.outcomeReason = branch.outcomeReason ?? `finalize failed: ${message}`;
+        branch.disposition = branch.disposition ?? 'planner_error';
+        return fallbackAnswer;
+      }
+    };
+
+    const completeErroredBranch = (branch: AgentBranchState, error: unknown, stage: string) => {
+      const message = error instanceof Error ? error.message : String(error);
+      upsertKanbanCard(branch, {
+        status: 'error',
+        summary: previewText(`${stage}: ${message}`, 160),
+        blockers: [`${stage}: ${message}`],
+      });
+      emitBranchTrace('error', branch, `${stage}: ${message}`);
+      branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} failed: ${message}`;
+      branch.outcome = branch.outcome ?? 'failed';
+      branch.outcomeReason = branch.outcomeReason ?? `${stage}: ${message}`;
+      branch.disposition = branch.disposition ?? 'planner_error';
+      addCompletedBranch(branch);
+      emitBranchTrace('observation', branch, 'Branch completed with error.');
+    };
+
+    const markBranchCompleted = (
+      branch: AgentBranchState,
+      summaryFallback: string,
+      blockers?: string[],
+    ) => {
+      upsertKanbanCard(branch, {
+        status: 'completed',
+        outcome: branch.outcome,
+        disposition: branch.disposition,
+        summary: previewText(
+          branch.completionSummary
+          || branch.finalAnswer
+          || branch.outcomeReason
+          || summaryFallback,
+          180,
+        ) || summaryFallback,
+        blockers: blockers ?? (
+          branch.outcome === 'failed' || branch.outcome === 'partial'
+            ? dedupeNonEmpty([branch.outcomeReason])
+            : []
+        ),
+      });
     };
 
     const renderObservation = (toolCall: PlannedToolCall, execResult: ToolExecutionResult): ToolObservation => ({
@@ -308,17 +696,11 @@ export class AgentRuntime {
         observations = await Promise.all(
           toolCalls.map((toolCall) => executeSingleToolCall(branch, toolCall)),
         );
-        if (shouldRuntimeTraceTool()) {
-          observations.forEach((observation) => emitObservationTrace(branch, observation));
-        }
       } else {
         observations = [];
         for (const toolCall of toolCalls) {
           const observation = await executeSingleToolCall(branch, toolCall);
           observations.push(observation);
-          if (shouldRuntimeTraceTool()) {
-            emitObservationTrace(branch, observation);
-          }
         }
       }
 
@@ -333,9 +715,29 @@ export class AgentRuntime {
         branch.transcript.push({
           role: 'user',
           content: observations
-            .map((o) => `TOOL OBSERVATION for ${o.toolName}:\n${o.result}`)
+            .map((o, index) =>
+              `${formatToolObservationHeader(toolCalls[index] || { name: o.toolName, arguments: {} }, o.toolName)}\n${o.result}`)
             .join('\n\n'),
         });
+      }
+
+      const observationSummary = previewText(
+        observations
+          .map((observation) => `${observation.toolName}: ${previewText(observation.result, 80)}`)
+          .join(' | '),
+        180,
+      );
+      upsertKanbanCard(branch, {
+        status: 'active',
+        summary: observationSummary || 'Tool observations recorded.',
+        blockers: observations
+          .filter((observation) => !observation.success)
+          .map((observation) => `${observation.toolName}: ${previewText(observation.result, 120)}`),
+        artifacts: extractArtifactPaths(toolCalls),
+      });
+
+      if (shouldRuntimeTraceTool()) {
+        observations.forEach((observation) => emitObservationTrace(branch, observation));
       }
     };
 
@@ -349,8 +751,18 @@ export class AgentRuntime {
         tailKeep: 4,
         maxSummaryChars: 1500,
       }) as TranscriptMessage[];
+      const siblingLabels = new Set(branches.map((candidate) => candidate.label));
 
       return branches.map((child, index) => {
+        const executionGroup = normalizeExecutionGroup(child.executionGroup, 1);
+        const dependsOn = normalizeDependencyLabels(child.dependsOn)
+          .filter((label) => label !== child.label && siblingLabels.has(label));
+        const sharedHandoffMessage = renderSharedHandoffMessage(branch.sharedHandoff);
+        const branchHandoffMessage = renderBranchHandoffMessage(child.handoff);
+        const kanbanSyncMessage = renderKanbanSyncMessage(branch);
+        const structuredHandoffBlock = [sharedHandoffMessage, branchHandoffMessage]
+          .filter((section) => section.length > 0)
+          .join('\n\n');
         const transcript: TranscriptMessage[] = [
           ...compressedParentTranscript,
           {
@@ -359,22 +771,40 @@ export class AgentRuntime {
           },
           {
             role: 'user',
-            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nIf this child goal can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing direct work tools.\nDo not use multiple near-duplicate web searches as a substitute for branching.\nYou may use tool calls, branch further if the goal benefits from parallel exploration, or return a final answer. Avoid repeating sibling work.`,
+            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nExecution group: ${executionGroup}\nDepends on sibling labels: ${dependsOn.length ? dependsOn.join(', ') : 'none'}\nSibling branches in the same execution group may run in parallel. Higher execution groups wait until all lower groups under the same parent finish.\nIf depends_on is set, this branch should not start until those sibling labels have already finished.\nChild branches are for evidence gathering, option comparison, and focused sub-problem solving.\nUse execution_group and depends_on as the coordination contract when sibling work must be ordered.\nIf this child goal can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing direct work tools.\nDo not use multiple near-duplicate web searches as a substitute for branching.\nIf you emit multiple web searches in one response, vary the actual query terms and search dimensions, not just punctuation or word order. Change at least two of: keywords, aliases, domains, dates, language, or source type.\nYou may use tool calls, branch further if the goal benefits from parallel exploration, or return a final answer. Avoid repeating sibling work.${structuredHandoffBlock ? `\n\nStructured remediation handoff:\n${structuredHandoffBlock}` : ''}${kanbanSyncMessage ? `\n\n${kanbanSyncMessage}` : ''}`,
           },
         ];
 
-        return {
+        const childBranch: AgentBranchState = {
           id: `${branch.id}.${index + 1}`,
           parentId: branch.id,
           depth: branch.depth + 1,
           label: child.label,
           goal: child.goal,
+          executionGroup,
+          dependsOn,
           priority: Math.max(0.05, branch.priority * (child.priority ?? Math.max(0.2, 1 - index * 0.2))),
           steps: 0,
           inheritedMessageCount: transcript.length,
           savedNodeIds: branch.savedNodeIds.slice(),
           transcript,
+          handoff: child.handoff,
+          sharedHandoff: branch.sharedHandoff,
+          ancestorBranchIds: [...(branch.ancestorBranchIds || []), branch.id],
+          ancestorBranchLabels: [...(branch.ancestorBranchLabels || []), branch.label],
         };
+        siblingFamilies.set(siblingKey(branch.id, child.label), {
+          rootId: childBranch.id,
+          executionGroup,
+        });
+
+        upsertKanbanCard(childBranch, {
+          status: 'queued',
+          executionGroup,
+          dependsOn,
+          summary: previewText(child.why || `Waiting for execution group ${executionGroup}.`, 140) || `Waiting for execution group ${executionGroup}.`,
+        });
+        return childBranch;
       });
     };
 
@@ -399,13 +829,16 @@ export class AgentRuntime {
           }
           if (!check.canContinue) {
             const reason = 'context window exhausted after maximum compression';
-            if (this.finalizeBranch) {
-              branch.finalAnswer = await this.finalizeBranch({ branch, reason });
-            }
-            branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped: context window full.`;
+            branch.finalAnswer = await finalizeBranchSafely(
+              branch,
+              reason,
+              `Branch ${branch.id} stopped: context window full.`,
+            );
             branch.outcome = branch.outcome ?? 'partial';
             branch.outcomeReason = branch.outcomeReason ?? reason;
-            completed.push(branch);
+            branch.disposition = branch.disposition ?? 'missing_evidence';
+            markBranchCompleted(branch, reason, [reason]);
+            addCompletedBranch(branch);
             emitBranchTrace('observation', branch,
               `Branch completed: context exhausted (${(check.usageRatio * 100).toFixed(1)}%).`);
             return [];
@@ -414,13 +847,16 @@ export class AgentRuntime {
           // Legacy mode (no model limit known): use transcript budget compression.
           if (branch.steps >= this.maxSteps || totalLoopSteps >= totalLoopBudget) {
             const reason = totalLoopSteps >= totalLoopBudget ? 'total budget reached' : 'step budget reached';
-            if (this.finalizeBranch) {
-              branch.finalAnswer = await this.finalizeBranch({ branch, reason });
-            }
-            branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped because ${reason}.`;
+            branch.finalAnswer = await finalizeBranchSafely(
+              branch,
+              reason,
+              `Branch ${branch.id} stopped because ${reason}.`,
+            );
             branch.outcome = branch.outcome ?? 'partial';
             branch.outcomeReason = branch.outcomeReason ?? reason;
-            completed.push(branch);
+            branch.disposition = branch.disposition ?? 'missing_evidence';
+            markBranchCompleted(branch, reason, [reason]);
+            addCompletedBranch(branch);
             emitBranchTrace('observation', branch, `Branch completed after hitting ${reason}.`);
             return [];
           }
@@ -429,10 +865,17 @@ export class AgentRuntime {
         branch.steps += 1;
         totalLoopSteps += 1;
         lastTouchedBranch = branch;
+        upsertKanbanCard(branch, {
+          status: 'active',
+          step: branch.steps,
+          summary: previewText(branch.goal, 140) || 'Branch is running.',
+        });
 
+        const planningTranscript = buildPlanningTranscript(branch);
+        const kanbanSnapshot = buildKanbanSnapshot();
         const agentStep = this.planBranch
-          ? await this.planBranch({ branch })
-          : await this.planner.plan(branch.transcript);
+          ? await this.planBranch({ branch, planningTranscript, kanbanSnapshot })
+          : await this.planner.plan(planningTranscript);
         if (agentStep.thought) {
           emitBranchTrace('thought', branch, agentStep.thought);
         }
@@ -441,22 +884,28 @@ export class AgentRuntime {
           const needsExplicitFinalize = agentStep.finalizationMode === 'planner_fallback';
           if (needsExplicitFinalize) {
             emitBranchTrace('thought', branch, `Planner fallback reply is not treated as a real final step; explicitly finalizing ${branch.id}.`);
-            if (this.finalizeBranch) {
-              branch.finalAnswer = await this.finalizeBranch({
-                branch,
-                reason: 'planner format fallback after schema repair retries',
-              });
-            }
-            branch.finalAnswer = branch.finalAnswer || agentStep.content;
+            branch.finalAnswer = await finalizeBranchSafely(
+              branch,
+              'planner format fallback after schema repair retries',
+              agentStep.content,
+            );
             branch.outcome = branch.outcome ?? 'partial';
             branch.outcomeReason = branch.outcomeReason ?? 'planner format fallback';
+            branch.disposition = branch.disposition ?? 'planner_error';
+            branch.finalizationMode = 'planner_fallback';
           } else {
             branch.finalAnswer = agentStep.content;
             branch.outcome = agentStep.outcome ?? branch.outcome ?? 'unknown';
             branch.outcomeReason = agentStep.outcomeReason ?? branch.outcomeReason;
+            branch.disposition = agentStep.disposition ?? branch.disposition;
+            branch.finalizationMode = agentStep.finalizationMode ?? branch.finalizationMode ?? 'natural';
           }
           branch.completionSummary = agentStep.completionSummary ?? branch.completionSummary;
-          completed.push(branch);
+          markBranchCompleted(
+            branch,
+            needsExplicitFinalize ? 'Planner fallback branch finalized.' : 'Branch completed.',
+          );
+          addCompletedBranch(branch);
           emitBranchTrace('observation', branch, needsExplicitFinalize ? 'Branch finalized after planner fallback.' : 'Branch completed.');
           return [];
         }
@@ -489,13 +938,16 @@ export class AgentRuntime {
 
         if (branch.depth >= this.maxBranchDepth) {
           const reason = `maximum branch depth ${this.maxBranchDepth} reached`;
-          if (this.finalizeBranch) {
-            branch.finalAnswer = await this.finalizeBranch({ branch, reason });
-          }
-          branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} stopped because ${reason}.`;
+          branch.finalAnswer = await finalizeBranchSafely(
+            branch,
+            reason,
+            `Branch ${branch.id} stopped because ${reason}.`,
+          );
           branch.outcome = branch.outcome ?? 'partial';
           branch.outcomeReason = branch.outcomeReason ?? reason;
-          completed.push(branch);
+          branch.disposition = branch.disposition ?? 'missing_evidence';
+          markBranchCompleted(branch, reason, [reason]);
+          addCompletedBranch(branch);
           emitBranchTrace('observation', branch, `Branch completed after hitting ${reason}.`);
           return [];
         }
@@ -509,8 +961,13 @@ export class AgentRuntime {
           continue;
         }
 
-        emitBranchTrace('action', branch, `Spawning ${childPlans.length} child branches.`, { childCount: childPlans.length });
         const childBranches = buildChildBranches(branch, childPlans);
+        upsertKanbanCard(branch, {
+          status: 'completed',
+          summary: `Delegated to ${childPlans.length} child branch${childPlans.length === 1 ? '' : 'es'}.`,
+          blockers: [],
+        });
+        emitBranchTrace('action', branch, `Spawning ${childPlans.length} child branches.`, { childCount: childPlans.length });
         for (const childBranch of childBranches) {
           this.emit({
             type: 'observation',
@@ -525,18 +982,120 @@ export class AgentRuntime {
     const prioritySort = (a: AgentBranchState, b: AgentBranchState) =>
       (b.priority - a.priority) || (a.depth - b.depth) || (a.steps - b.steps);
     const active = new Set<Promise<void>>();
+    const activeBranches = new Map<string, AgentBranchState>();
     const canLaunchMoreBranches = () =>
       (this.branchConcurrency <= 0 || active.size < this.branchConcurrency)
       && (this.modelLimit > 0 ? true : totalLoopSteps < totalLoopBudget);
+    const branchBelongsToFamily = (candidate: AgentBranchState, familyRootId: string) =>
+      candidate.id === familyRootId || candidate.ancestorBranchIds?.includes(familyRootId) === true;
+
+    const isSiblingFamilyPending = (
+      parentId: string | null,
+      label: string,
+      blockedBranches: AgentBranchState[] = [],
+    ): boolean => {
+      if (!parentId) {
+        return false;
+      }
+      const family = siblingFamilies.get(siblingKey(parentId, label));
+      if (!family) {
+        return false;
+      }
+      if (queue.some((candidate) => branchBelongsToFamily(candidate, family.rootId))) {
+        return true;
+      }
+      if (blockedBranches.some((candidate) => branchBelongsToFamily(candidate, family.rootId))) {
+        return true;
+      }
+      return [...activeBranches.values()].some((candidate) => branchBelongsToFamily(candidate, family.rootId));
+    };
+
+    const hasEarlierSiblingExecutionGroupPending = (
+      branch: AgentBranchState,
+      blockedBranches: AgentBranchState[] = [],
+    ): boolean => {
+      if (!branch.parentId || branch.executionGroup <= 1) {
+        return false;
+      }
+
+      for (const [familyKey, family] of siblingFamilies.entries()) {
+        if (!familyKey.startsWith(`${branch.parentId}::`) || family.executionGroup >= branch.executionGroup) {
+          continue;
+        }
+        const siblingLabel = familyKey.slice(branch.parentId.length + 2);
+        if (isSiblingFamilyPending(branch.parentId, siblingLabel, blockedBranches)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const getUnmetSiblingDependencies = (
+      branch: AgentBranchState,
+      blockedBranches: AgentBranchState[] = [],
+    ): string[] => {
+      if (!branch.parentId || branch.dependsOn.length === 0) {
+        return [];
+      }
+      return branch.dependsOn.filter((label) => isSiblingFamilyPending(branch.parentId, label, blockedBranches));
+    };
+
+    const hasUnmetSiblingDependencies = (branch: AgentBranchState): boolean =>
+      getUnmetSiblingDependencies(branch).length > 0;
+
+    const deadlockQueuedBranches = (blockedBranches: AgentBranchState[]) => {
+      for (const branch of blockedBranches) {
+        const blockers = [
+          hasEarlierSiblingExecutionGroupPending(branch, blockedBranches)
+            ? `waiting for lower execution_group siblings under ${branch.parentId}`
+            : '',
+          ...getUnmetSiblingDependencies(branch, blockedBranches).map((label) => `depends_on: ${label}`),
+        ].filter(Boolean);
+        const reason = blockers.length > 0
+          ? `Scheduler deadlock: ${blockers.join('; ')}`
+          : 'Scheduler deadlock: no runnable branch remained.';
+        upsertKanbanCard(branch, {
+          status: 'error',
+          executionGroup: branch.executionGroup,
+          dependsOn: branch.dependsOn,
+          summary: previewText(reason, 160),
+          blockers,
+        });
+        emitBranchTrace('error', branch, reason, { blockers });
+        branch.finalAnswer = branch.finalAnswer || `Branch ${branch.id} was blocked: ${reason}`;
+        branch.outcome = branch.outcome ?? 'failed';
+        branch.outcomeReason = branch.outcomeReason ?? reason;
+        branch.disposition = branch.disposition ?? 'planner_error';
+        addCompletedBranch(branch);
+      }
+    };
 
     const launchQueuedBranches = () => {
       queue.sort(prioritySort);
       while (queue.length > 0 && canLaunchMoreBranches()) {
-        const branch = queue.shift()!;
+        const runnableIndex = queue.findIndex((branch) =>
+          !hasEarlierSiblingExecutionGroupPending(branch)
+          && !hasUnmetSiblingDependencies(branch));
+        if (runnableIndex < 0) {
+          if (active.size === 0) {
+            const blockedBranches = queue.splice(0, queue.length);
+            deadlockQueuedBranches(blockedBranches);
+          }
+          break;
+        }
+        const [branch] = queue.splice(runnableIndex, 1);
+        upsertKanbanCard(branch, {
+          status: 'active',
+          executionGroup: branch.executionGroup,
+          dependsOn: branch.dependsOn,
+          summary: previewText(branch.goal, 140) || 'Branch picked up by scheduler.',
+        });
         let task: Promise<void>;
+        activeBranches.set(branch.id, branch);
         task = runBranch(branch)
           .then((childBranches) => {
             active.delete(task);
+            activeBranches.delete(branch.id);
             if (canLaunchMoreBranches()) {
               childBranches.forEach((child) => queue.push(child));
             }
@@ -544,11 +1103,13 @@ export class AgentRuntime {
           })
           .catch((error: unknown) => {
             active.delete(task);
-            emitBranchTrace('error', branch, error instanceof Error ? error.message : String(error));
+            activeBranches.delete(branch.id);
+            completeErroredBranch(branch, error, 'Branch execution failed');
             launchQueuedBranches();
           });
         active.add(task);
-        emitBranchTrace('thought', branch, `[scheduler] Branch ${branch.id} started (RPM-governed queue, active=${active.size}).`);
+        const dependencySuffix = branch.dependsOn.length > 0 ? `, depends_on=${branch.dependsOn.join(',')}` : '';
+        emitBranchTrace('thought', branch, `[scheduler] Branch ${branch.id} started (execution_group=${branch.executionGroup}${dependencySuffix}, active=${active.size}).`);
       }
     };
 
@@ -558,18 +1119,18 @@ export class AgentRuntime {
     }
 
     if (completed.length === 0 && lastTouchedBranch) {
-      if (this.finalizeBranch) {
-        emitBranchTrace('thought', lastTouchedBranch, `No branch reached a natural final answer; explicitly finalizing ${lastTouchedBranch.id}.`);
-        lastTouchedBranch.finalAnswer = await this.finalizeBranch({
-          branch: lastTouchedBranch,
-          reason: 'no branch reached a natural final answer',
-        });
-        emitBranchTrace('observation', lastTouchedBranch, 'Branch finalized because no branch reached a natural final answer.');
-      }
-      lastTouchedBranch.finalAnswer = lastTouchedBranch.finalAnswer || 'No branch produced a final answer.';
+      emitBranchTrace('thought', lastTouchedBranch, `No branch reached a natural final answer; explicitly finalizing ${lastTouchedBranch.id}.`);
+      lastTouchedBranch.finalAnswer = await finalizeBranchSafely(
+        lastTouchedBranch,
+        'no branch reached a natural final answer',
+        'No branch produced a final answer.',
+      );
+      emitBranchTrace('observation', lastTouchedBranch, 'Branch finalized because no branch reached a natural final answer.');
       lastTouchedBranch.outcome = lastTouchedBranch.outcome ?? 'partial';
       lastTouchedBranch.outcomeReason = lastTouchedBranch.outcomeReason ?? 'no branch reached a natural final answer';
-      completed.push(lastTouchedBranch);
+      lastTouchedBranch.disposition = lastTouchedBranch.disposition ?? 'missing_evidence';
+      markBranchCompleted(lastTouchedBranch, 'No branch reached a natural final answer.', ['no branch reached a natural final answer']);
+      addCompletedBranch(lastTouchedBranch);
     }
 
     // ── Post-synthesis re-branch loop ──────────────────────────────────
@@ -580,13 +1141,38 @@ export class AgentRuntime {
     while (true) {
       const finalBranches = completed
         .filter((branch) => typeof branch.finalAnswer === 'string' && branch.finalAnswer.length > 0);
-      const synthesisResult = await this.synthesize(
-        userMessage, priorTranscript, finalBranches, synthesisRetry,
-      );
+      this.emit({
+        type: 'thought',
+        content: `Starting synthesis attempt ${synthesisRetry + 1}/${this.maxSynthesisRetries + 1} with ${finalBranches.length} completed branch(es).`,
+      });
+      let synthesisResult: SynthesisResult;
+      try {
+        synthesisResult = await this.synthesize(
+          userMessage, priorTranscript, finalBranches, synthesisRetry,
+        );
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        const fallbackAnswer = buildDefaultSynthesisAnswer(finalBranches);
+        this.emit({ type: 'error', content: `Synthesis failed: ${message}` });
+        this.emit({ type: 'observation', content: 'Falling back to default synthesis answer after synthesis failure.' });
+        this.emit({ type: 'final', content: fallbackAnswer });
+        return fallbackAnswer;
+      }
 
       if (synthesisResult.done) {
+        this.emit({ type: 'observation', content: 'Synthesis completed.' });
         this.emit({ type: 'final', content: synthesisResult.answer });
         return synthesisResult.answer;
+      }
+
+      if (synthesisResult.branches.length === 0 || synthesisRetry >= this.maxSynthesisRetries) {
+        const reason = synthesisResult.branches.length === 0
+          ? 'Synthesis requested remediation but returned zero branches; forcing completion with fallback synthesis answer.'
+          : `Synthesis requested remediation beyond retry limit (${this.maxSynthesisRetries}); forcing completion with fallback synthesis answer.`;
+        const fallbackAnswer = buildDefaultSynthesisAnswer(finalBranches);
+        this.emit({ type: 'error', content: reason });
+        this.emit({ type: 'final', content: fallbackAnswer });
+        return fallbackAnswer;
       }
 
       // Re-branch: synthesis requested remediation branches.
@@ -604,10 +1190,14 @@ export class AgentRuntime {
         depth: 0,
         label: `synthesis-retry-${synthesisRetry}`,
         goal: 'Remediate failed branches from previous round.',
+        executionGroup: 1,
+        dependsOn: [],
         priority: 1,
         steps: 0,
         inheritedMessageCount: 0,
         savedNodeIds: completed.flatMap((b) => b.savedNodeIds),
+        ancestorBranchIds: [],
+        ancestorBranchLabels: [],
         transcript: [
           ...priorTranscript,
           { role: 'user', content: userMessage },
@@ -616,6 +1206,7 @@ export class AgentRuntime {
             content: `Previous round summary:\n${contextSummary}`,
           },
         ],
+        sharedHandoff: synthesisResult.handoff,
       };
 
       const remedyChildren = buildChildBranches(remedyParent, synthesisResult.branches);
@@ -658,6 +1249,10 @@ export class AgentRuntime {
           finalAnswer: branch.finalAnswer ?? '',
           outcome: branch.outcome,
           outcomeReason: branch.outcomeReason,
+          disposition: branch.disposition,
+          finalizationMode: branch.finalizationMode,
+          ancestorBranchIds: branch.ancestorBranchIds,
+          ancestorBranchLabels: branch.ancestorBranchLabels,
         })),
         synthesisRetry,
         maxSynthesisRetries: this.maxSynthesisRetries,

@@ -76,6 +76,7 @@ export class SimplePlanner implements Planner {
         kind: 'final',
         content: String(parsed.final_answer ?? parsed.thought ?? ''),
         completionSummary: typeof parsed.completion_summary === 'string' ? parsed.completion_summary : undefined,
+        disposition: typeof parsed.disposition === 'string' ? parsed.disposition as any : undefined,
         thought,
       };
     }
@@ -111,7 +112,18 @@ export class SimplePlanner implements Planner {
       const branches: PlannedBranch[] = rawBranches
         .slice(0, this.maxBranches)
         .filter(
-          (branch): branch is { label: string; goal: string; why?: string; priority?: number } =>
+          (
+            branch,
+          ): branch is {
+            label: string;
+            goal: string;
+            why?: string;
+            priority?: number;
+            executionGroup?: number;
+            execution_group?: number;
+            dependsOn?: string[];
+            depends_on?: string[];
+          } =>
             Boolean(
               branch
               && typeof branch === 'object'
@@ -124,6 +136,22 @@ export class SimplePlanner implements Planner {
           goal: branch.goal.trim(),
           why: typeof branch.why === 'string' ? branch.why.trim() : undefined,
           priority: typeof branch.priority === 'number' ? branch.priority : undefined,
+          executionGroup: typeof branch.executionGroup === 'number'
+            ? branch.executionGroup
+            : typeof branch.execution_group === 'number'
+              ? branch.execution_group
+              : undefined,
+          dependsOn: Array.isArray(branch.dependsOn)
+            ? branch.dependsOn
+              .filter((entry): entry is string => typeof entry === 'string')
+              .map((entry) => entry.trim())
+              .filter(Boolean)
+            : Array.isArray(branch.depends_on)
+              ? branch.depends_on
+              .filter((entry): entry is string => typeof entry === 'string')
+              .map((entry) => entry.trim())
+              .filter(Boolean)
+              : undefined,
         }))
         .filter((branch) => branch.label.length > 0 && branch.goal.length > 0);
 

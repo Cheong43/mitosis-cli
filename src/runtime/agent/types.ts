@@ -8,6 +8,85 @@ export type AgentStepKind = 'tool' | 'branch' | 'final';
 /** Structured outcome of a completed branch. */
 export type BranchOutcome = 'success' | 'partial' | 'failed' | 'unknown';
 
+/**
+ * Retry-oriented interpretation of a branch result.
+ *
+ * This is intentionally finer-grained than `BranchOutcome`, so synthesis can
+ * distinguish between:
+ * - missing evidence that is worth one more focused remediation attempt
+ * - external blocking conditions that should not trigger repeated retries
+ * - exhausted search loops that should only continue if a genuinely new
+ *   strategy is available
+ */
+export type BranchDisposition =
+  | 'resolved'
+  | 'missing_evidence'
+  | 'blocked_external'
+  | 'exhausted_search'
+  | 'planner_error'
+  | 'superseded'
+  | 'unknown';
+
+/** Structured remediation context attached to a retry branch. */
+export interface BranchHandoff {
+  canonicalTaskId: string;
+  retryOfBranchId?: string;
+  priorAttemptIds?: string[];
+  disposition?: BranchDisposition;
+  priorIssue?: string;
+  priorResultSnippet?: string;
+  knownGoodFacts?: string[];
+  missingFields?: string[];
+  exhaustedStrategies?: string[];
+  blockedBy?: string[];
+  mustNotRepeat?: string[];
+}
+
+/** Structured round-level context shared by every remediation child branch. */
+export interface SynthesisSharedHandoff {
+  retryIndex: number;
+  successfulAttempts?: Array<{
+    branchId: string;
+    label: string;
+    canonicalTaskId: string;
+    summary: string;
+  }>;
+  unresolvedAttempts?: BranchHandoff[];
+}
+
+export type BranchKanbanStatus = 'queued' | 'active' | 'finalizing' | 'completed' | 'error';
+
+export interface BranchKanbanCard {
+  branchId: string;
+  parentBranchId: string | null;
+  label: string;
+  goal: string;
+  executionGroup?: number;
+  dependsOn?: string[];
+  depth: number;
+  step: number;
+  status: BranchKanbanStatus;
+  outcome?: BranchOutcome;
+  disposition?: BranchDisposition;
+  summary?: string;
+  blockers?: string[];
+  artifacts?: string[];
+  updatedAt: number;
+}
+
+export interface BranchKanbanSnapshot {
+  updatedAt: number;
+  summary: {
+    total: number;
+    queued: number;
+    active: number;
+    finalizing: number;
+    completed: number;
+    error: number;
+  };
+  cards: BranchKanbanCard[];
+}
+
 interface AgentStepBase {
   /** Optional planner thought for tracing/debugging. */
   thought?: string;
@@ -27,6 +106,18 @@ export interface PlannedBranch {
   goal: string;
   why?: string;
   priority?: number;
+  /**
+   * Sibling branches in the same execution group may run in parallel.
+   * Higher-numbered groups wait until all lower groups under the same parent
+   * complete before they are eligible to start.
+   */
+  executionGroup?: number;
+  /**
+   * Optional sibling branch labels that must finish before this branch may
+   * start. Labels must come from the same planner_branch call.
+   */
+  dependsOn?: string[];
+  handoff?: BranchHandoff;
 }
 
 /** A finalized answer produced by the agent. */
@@ -41,6 +132,8 @@ export interface FinalAnswer extends AgentStepBase {
   outcome?: BranchOutcome;
   /** Human-readable explanation when outcome is 'partial' or 'failed'. */
   outcomeReason?: string;
+  /** Retry-oriented disposition for synthesis/remediation. */
+  disposition?: BranchDisposition;
   /**
    * `planner_fallback` means the planner never produced a usable branch-final
    * step, so the runtime should explicitly finalize the branch instead of
@@ -72,7 +165,7 @@ export type AgentStep = ToolStep | BranchStep | FinalAnswer;
  */
 export type SynthesisResult =
   | { done: true; answer: string }
-  | { done: false; branches: PlannedBranch[]; context: string };
+  | { done: false; branches: PlannedBranch[]; context: string; handoff?: SynthesisSharedHandoff };
 
 /** Observation returned after executing a tool call. */
 export interface ToolObservation {

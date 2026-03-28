@@ -91,22 +91,34 @@ interface WebConversationItem {
 }
 
 type BranchVisualStatus = 'queued' | 'active' | 'completed' | 'finalizing' | 'error';
+type BranchVisualKind = 'root' | 'branch' | 'rebranch';
+type BranchLoopPhase = 'branching' | 'synthesizing' | 'rebranching' | 'complete';
 
 interface BranchVisualNode {
   id: string;
   parentId: string | null;
   label: string;
+  goal: string;
   depth: number;
   step: number;
   status: BranchVisualStatus;
+  kind: BranchVisualKind;
+  retry: number | null;
+  outcome?: string;
+  disposition?: string;
+  summary?: string;
+  blockers: string[];
+  artifacts: string[];
+  updatedAt?: number;
 }
 
 interface BranchLoopVisualState {
   round: number;
-  totalSteps: number;
-  totalBudget: number;
+  phase: BranchLoopPhase;
+  rebranchCount: number;
+  statusMessage: string | null;
   completed: number;
-  maxCompleted: number;
+  errors: number;
   /** Last branch to emit a non-completed event — used for single-node highlight. */
   activeBranchId: string | null;
   /** All branches currently running steps concurrently. */
@@ -198,7 +210,6 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   const uiBusyRef = useRef(false);
   const activeThreadRunsRef = useRef<Set<string>>(new Set());
   const webConversationRef = useRef<WebConversationItem[]>([]);
-  const branchStepSeenRef = useRef<Set<string>>(new Set());
 
   // ── Governance approval prompt state ──────────────────────────────────────
   const [pendingApproval, setPendingApproval] = useState<{
@@ -215,16 +226,6 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   // ── Web UI governance approval pending map ────────────────────────────────
   // Key: unique approval ID, Value: resolver function
   const webApprovalPendingRef = useRef<Map<string, (answer: 'allow' | 'deny') => void>>(new Map());
-
-  const envBranchMaxDepth = Number(process.env.REACT_BRANCH_MAX_DEPTH ?? 2);
-  const branchMaxDepth = Number.isFinite(envBranchMaxDepth) ? Math.max(0, Math.min(4, Math.floor(envBranchMaxDepth))) : 2;
-  const envBranchMaxWidth = Number(process.env.REACT_BRANCH_MAX_WIDTH ?? 3);
-  const branchMaxWidth = Number.isFinite(envBranchMaxWidth) ? Math.max(1, Math.min(5, Math.floor(envBranchMaxWidth))) : 3;
-  const envBranchMaxSteps = Number(process.env.REACT_BRANCH_MAX_STEPS ?? 8);
-  const branchMaxSteps = Number.isFinite(envBranchMaxSteps) ? Math.max(2, Math.min(24, Math.floor(envBranchMaxSteps))) : 8;
-  const envBranchMaxCompleted = Number(process.env.REACT_BRANCH_MAX_COMPLETED ?? 4);
-  const branchMaxCompleted = Number.isFinite(envBranchMaxCompleted) ? Math.max(1, Math.min(8, Math.floor(envBranchMaxCompleted))) : 4;
-  const branchTotalBudget = Math.max(branchMaxSteps, branchMaxSteps * branchMaxWidth * (branchMaxDepth + 1));
 
   const refreshMempediaStatus = useCallback(async (writeHistory = false) => {
     try {
@@ -570,42 +571,198 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
     return `Internal skill guidance for this turn:\nThese skills are internal behavioral guidance only. They are not part of the user's request, not evidence to analyze, not files to verify, and not content to summarize back to the user unless the user explicitly asks about skills. Do not inspect the skills directory just to confirm they exist. Do not emit a skill name in tool_calls.name. Use only actual tool names from the system tool catalog.\n\n${rendered}\n\nActual User Request:\n${query}`;
   };
 
+  const detectBranchKind = (
+    branchId: string,
+    label?: string | null,
+    parentId?: string | null,
+    depth?: number,
+  ): BranchVisualKind => {
+    if (branchId === 'B0' && (depth ?? 0) === 0) {
+      return 'root';
+    }
+    if (/^R\d+(?:\.|$)/i.test(branchId) || /^fix:/i.test(label || '') || /^R\d+(?:\.|$)/i.test(parentId || '')) {
+      return 'rebranch';
+    }
+    return 'branch';
+  };
+
+  const detectRetryIndex = (branchId: string, parentId?: string | null): number | null => {
+    const match = branchId.match(/^R(\d+)(?:\.|$)/i) || (parentId || '').match(/^R(\d+)(?:\.|$)/i);
+    return match ? Number(match[1]) : null;
+  };
+
+  const extractRebranchRetry = (content: string): number | null => {
+    const match = content.match(/retry\s+(\d+)\/\d+/i);
+    return match ? Number(match[1]) : null;
+  };
+
+  const pickBranchStatusMessage = (content: string): string | null => {
+    const trimmed = content.trim();
+    if (!trimmed) return null;
+    if (
+      trimmed.startsWith('Synthesizing ')
+      || /Requesting remediation re-branch/i.test(trimmed)
+      || /^Synthesis requested \d+ remediation branch/i.test(trimmed)
+      || trimmed.startsWith('Forcing finalization')
+      || trimmed.startsWith('Branch completed')
+      || /no branch reached a natural final answer/i.test(trimmed)
+      || /^Spawning \d+ child branches/i.test(trimmed)
+    ) {
+      return trimmed;
+    }
+    return null;
+  };
+
+  const clipBranchText = (value: unknown, maxLength = 120): string => {
+    const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    return normalized.length > maxLength
+      ? `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`
+      : normalized;
+  };
+
+  const normalizeBranchList = (value: unknown): string[] => {
+    if (!Array.isArray(value)) return [];
+    return value
+      .map((item) => clipBranchText(item, 160))
+      .filter(Boolean)
+      .filter((item, index, list) => list.indexOf(item) === index);
+  };
+
+  const readStructuredKanbanCard = (meta?: TraceEvent['metadata']) => {
+    const raw = meta?.kanbanCard;
+    if (!raw || typeof raw !== 'object') {
+      return null;
+    }
+    return raw as {
+      branchId?: string;
+      parentBranchId?: string | null;
+      label?: string;
+      goal?: string;
+      depth?: number;
+      step?: number;
+      status?: BranchVisualStatus;
+      outcome?: string;
+      disposition?: string;
+      summary?: string;
+      blockers?: string[];
+      artifacts?: string[];
+      updatedAt?: number;
+    };
+  };
+
+  const createInitialBranchLoopState = (round: number): BranchLoopVisualState => ({
+    round,
+    phase: 'branching',
+    rebranchCount: 0,
+    statusMessage: 'Root branch active.',
+    completed: 0,
+    errors: 0,
+    activeBranchId: 'B0',
+    activeBranchIds: ['B0'],
+    queueCount: 0,
+    nodes: {
+      B0: {
+        id: 'B0',
+        parentId: null,
+        label: 'root',
+        goal: 'Solve the user request end-to-end.',
+        depth: 0,
+        step: 0,
+        status: 'active',
+        kind: 'root',
+        retry: null,
+        blockers: [],
+        artifacts: [],
+      },
+    },
+  });
+
+  const finalizeBranchLoopState = (state: BranchLoopVisualState): BranchLoopVisualState => ({
+    ...state,
+    phase: 'complete',
+    activeBranchId: null,
+    activeBranchIds: [],
+    statusMessage: state.rebranchCount > 0
+      ? `Completed after ${state.rebranchCount} remediation re-branch round(s).`
+      : 'Completed.',
+  });
+
   // ── Branch state pure updater (shared by terminal UI and thread chat) ────────
   const applyBranchTraceEvent = (
     prev: BranchLoopVisualState,
     event: TraceEvent,
-    seenKeys: Set<string>
   ): BranchLoopVisualState => {
     const next: BranchLoopVisualState = { ...prev, nodes: { ...prev.nodes } };
     const meta = event.metadata;
     const content = String(event.content || '');
+    const structuredCard = readStructuredKanbanCard(meta);
 
-    if (meta?.branchId) {
-      const branchId = meta.branchId;
+    if (meta?.branchId || structuredCard?.branchId) {
+      const branchId = String(structuredCard?.branchId || meta?.branchId || '');
+      if (!branchId) {
+        return next;
+      }
       const existing = next.nodes[branchId];
       const node: BranchVisualNode = existing
         ? { ...existing }
         : {
             id: branchId,
-            parentId: typeof meta.parentBranchId === 'string' ? meta.parentBranchId : null,
-            label: meta.branchLabel || branchId,
-            depth: typeof meta.depth === 'number' ? meta.depth : 0,
-            step: typeof meta.step === 'number' ? meta.step : 0,
+            parentId: typeof structuredCard?.parentBranchId === 'string'
+              ? structuredCard.parentBranchId
+              : (typeof meta?.parentBranchId === 'string' ? meta.parentBranchId : null),
+            label: structuredCard?.label || meta?.branchLabel || branchId,
+            goal: structuredCard?.goal || '',
+            depth: typeof structuredCard?.depth === 'number'
+              ? structuredCard.depth
+              : (typeof meta?.depth === 'number' ? meta.depth : 0),
+            step: typeof structuredCard?.step === 'number'
+              ? structuredCard.step
+              : (typeof meta?.step === 'number' ? meta.step : 0),
             status: 'queued',
+            kind: detectBranchKind(
+              branchId,
+              structuredCard?.label || meta?.branchLabel,
+              typeof structuredCard?.parentBranchId === 'string'
+                ? structuredCard.parentBranchId
+                : (typeof meta?.parentBranchId === 'string' ? meta.parentBranchId : null),
+              typeof structuredCard?.depth === 'number'
+                ? structuredCard.depth
+                : (typeof meta?.depth === 'number' ? meta.depth : 0),
+            ),
+            retry: detectRetryIndex(
+              branchId,
+              typeof structuredCard?.parentBranchId === 'string'
+                ? structuredCard.parentBranchId
+                : (typeof meta?.parentBranchId === 'string' ? meta.parentBranchId : null),
+            ),
+            blockers: [],
+            artifacts: [],
           };
 
-      if (meta.branchLabel) node.label = meta.branchLabel;
-      if (typeof meta.depth === 'number') node.depth = meta.depth;
-      if (typeof meta.step === 'number') {
+      if (typeof structuredCard?.parentBranchId === 'string') node.parentId = structuredCard.parentBranchId;
+      else if (typeof meta?.parentBranchId === 'string') node.parentId = meta.parentBranchId;
+      if (structuredCard?.label || meta?.branchLabel) node.label = structuredCard?.label || meta?.branchLabel || node.label;
+      if (structuredCard?.goal) node.goal = structuredCard.goal;
+      if (typeof structuredCard?.depth === 'number') node.depth = structuredCard.depth;
+      else if (typeof meta?.depth === 'number') node.depth = meta.depth;
+      if (typeof structuredCard?.step === 'number') {
+        node.step = structuredCard.step;
+      } else if (typeof meta?.step === 'number') {
         node.step = meta.step;
-        const stepKey = `${branchId}:${meta.step}`;
-        if (!seenKeys.has(stepKey) && event.type === 'thought') {
-          seenKeys.add(stepKey);
-          next.totalSteps += 1;
-        }
       }
+      if (structuredCard?.summary) node.summary = structuredCard.summary;
+      if (structuredCard?.outcome) node.outcome = structuredCard.outcome;
+      if (structuredCard?.disposition) node.disposition = structuredCard.disposition;
+      if (structuredCard?.updatedAt) node.updatedAt = structuredCard.updatedAt;
+      if (structuredCard?.blockers) node.blockers = normalizeBranchList(structuredCard.blockers);
+      if (structuredCard?.artifacts) node.artifacts = normalizeBranchList(structuredCard.artifacts);
+      node.kind = detectBranchKind(branchId, node.label, node.parentId, node.depth);
+      node.retry = detectRetryIndex(branchId, node.parentId);
 
-      if (event.type === 'error') {
+      if (structuredCard?.status) {
+        node.status = structuredCard.status;
+      } else if (event.type === 'error') {
         node.status = 'error';
       } else if (content.startsWith('Forcing finalization')) {
         node.status = 'finalizing';
@@ -616,7 +773,10 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
       }
 
       next.nodes[branchId] = node;
-      next.activeBranchId = node.status === 'completed' ? next.activeBranchId : branchId;
+      if (node.kind === 'rebranch' && node.retry) {
+        next.phase = 'rebranching';
+        next.rebranchCount = Math.max(next.rebranchCount, node.retry);
+      }
     }
 
     if (content.startsWith('Spawned child branch')) {
@@ -625,28 +785,58 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
         const childId = spawnedMatch[1].trim();
         const childLabel = spawnedMatch[2].trim();
         const existing = next.nodes[childId];
+        const parentId = existing?.parentId || (typeof meta?.parentBranchId === 'string' ? meta.parentBranchId : null);
         next.nodes[childId] = {
           id: childId,
-          parentId: existing?.parentId || (meta?.parentBranchId ?? null),
+          parentId,
           label: childLabel || existing?.label || childId,
+          goal: existing?.goal || '',
           depth: typeof meta?.depth === 'number' ? meta.depth : (existing?.depth ?? 0),
           step: typeof meta?.step === 'number' ? meta.step : (existing?.step ?? 0),
           status: existing?.status === 'completed' ? 'completed' : 'queued',
+          kind: detectBranchKind(childId, childLabel, parentId, typeof meta?.depth === 'number' ? meta.depth : (existing?.depth ?? 0)),
+          retry: detectRetryIndex(childId, parentId),
+          outcome: existing?.outcome,
+          disposition: existing?.disposition,
+          summary: existing?.summary,
+          blockers: existing?.blockers || [],
+          artifacts: existing?.artifacts || [],
+          updatedAt: existing?.updatedAt,
         };
       }
     }
 
     const allNodes = Object.values(next.nodes);
     next.completed = allNodes.filter((n) => n.status === 'completed').length;
+    next.errors = allNodes.filter((n) => n.status === 'error').length;
     next.queueCount = allNodes.filter((n) => n.status === 'queued').length;
     // Track all concurrently active branches (for multi-highlight in the UI).
     next.activeBranchIds = allNodes
       .filter((n) => n.status === 'active' || n.status === 'finalizing')
       .map((n) => n.id);
+    next.activeBranchId = next.activeBranchIds.length > 0
+      ? next.activeBranchIds[next.activeBranchIds.length - 1]
+      : null;
 
-    if (content.startsWith('Synthesizing ') || content.startsWith('Reached total branch loop budget')) {
+    const retry = extractRebranchRetry(content);
+    const nextStatusMessage = pickBranchStatusMessage(content);
+    if (retry) {
+      next.phase = 'rebranching';
+      next.rebranchCount = Math.max(next.rebranchCount, retry);
+      next.statusMessage = nextStatusMessage || next.statusMessage;
+    } else if (content.startsWith('Synthesizing ')) {
+      next.phase = 'synthesizing';
+      next.statusMessage = nextStatusMessage || next.statusMessage;
       next.activeBranchId = null;
       next.activeBranchIds = [];
+    } else if (next.activeBranchIds.length > 0) {
+      const hasActiveRebranch = allNodes.some((node) =>
+        node.kind === 'rebranch' && (node.status === 'active' || node.status === 'finalizing' || node.status === 'queued'));
+      next.phase = hasActiveRebranch ? 'rebranching' : 'branching';
+      next.statusMessage = nextStatusMessage || next.statusMessage;
+    } else if (allNodes.length > 0 && allNodes.every((node) => node.status === 'completed' || node.status === 'error')) {
+      next.phase = 'complete';
+      next.statusMessage = nextStatusMessage || next.statusMessage;
     }
 
     return next;
@@ -1165,22 +1355,11 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             const roundId = generateThreadId();
             const roundTimestamp = Date.now();
             const roundTraces: Array<{ type: string; content: string; metadata?: TraceEvent['metadata'] }> = [];
-            const roundBranchSeen = new Set<string>();
-            let roundBranchState: BranchLoopVisualState = {
-              round: thread.rounds.length + 1,
-              totalSteps: 0,
-              totalBudget: branchTotalBudget,
-              completed: 0,
-              maxCompleted: branchMaxCompleted,
-              activeBranchId: 'B0',
-              activeBranchIds: ['B0'],
-              queueCount: 0,
-              nodes: { B0: { id: 'B0', parentId: null, label: 'root', depth: 0, step: 0, status: 'active' } },
-            };
+            let roundBranchState = createInitialBranchLoopState(thread.rounds.length + 1);
 
             const answer = await agent.run(prompt, (event: TraceEvent) => {
               roundTraces.push({ type: event.type, content: event.content, metadata: event.metadata });
-              roundBranchState = applyBranchTraceEvent(roundBranchState, event, roundBranchSeen);
+              roundBranchState = applyBranchTraceEvent(roundBranchState, event);
             }, {
               conversationId: `thread:${tId}`,
               sessionId: `thread-${tId}-${roundId}`,
@@ -1193,7 +1372,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
               user_input: query,
               agent_response: answer,
               traces: roundTraces,
-              branch_snapshot: roundBranchState,
+              branch_snapshot: finalizeBranchLoopState(roundBranchState),
             };
 
             thread.rounds.push(round);
@@ -1254,18 +1433,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
           const roundId = generateThreadId();
           const roundTimestamp = Date.now();
           const roundTraces: Array<{ type: string; content: string; metadata?: TraceEvent['metadata'] }> = [];
-          const roundBranchSeen = new Set<string>();
-          let roundBranchState: BranchLoopVisualState = {
-            round: thread.rounds.length + 1,
-            totalSteps: 0,
-            totalBudget: branchTotalBudget,
-            completed: 0,
-            maxCompleted: branchMaxCompleted,
-            activeBranchId: 'B0',
-            activeBranchIds: ['B0'],
-            queueCount: 0,
-            nodes: { B0: { id: 'B0', parentId: null, label: 'root', depth: 0, step: 0, status: 'active' } },
-          };
+          let roundBranchState = createInitialBranchLoopState(thread.rounds.length + 1);
 
           // Send initial tree state so the UI can render the root node immediately
           sendSSE({ kind: 'init', branchState: roundBranchState, query });
@@ -1273,7 +1441,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
           try {
             const answer = await agent.run(prompt, (event: TraceEvent) => {
               roundTraces.push({ type: event.type, content: event.content, metadata: event.metadata });
-              roundBranchState = applyBranchTraceEvent(roundBranchState, event, roundBranchSeen);
+              roundBranchState = applyBranchTraceEvent(roundBranchState, event);
               sendSSE({ kind: 'trace', event, branchState: roundBranchState });
             }, {
               conversationId: `thread:${tId}`,
@@ -1294,7 +1462,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
               user_input: query,
               agent_response: answer,
               traces: roundTraces,
-              branch_snapshot: roundBranchState,
+              branch_snapshot: finalizeBranchLoopState(roundBranchState),
             };
 
             thread.rounds.push(round);
@@ -1415,33 +1583,13 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   const runAgent = async (query: string, oneShotSkill?: LocalSkill) => {
     const nextRound = runRound + 1;
     setRunRound(nextRound);
-    branchStepSeenRef.current = new Set();
-    setBranchLoop({
-      round: nextRound,
-      totalSteps: 0,
-      totalBudget: branchTotalBudget,
-      completed: 0,
-      maxCompleted: branchMaxCompleted,
-      activeBranchId: 'B0',
-      activeBranchIds: ['B0'],
-      queueCount: 0,
-      nodes: {
-        B0: {
-          id: 'B0',
-          parentId: null,
-          label: 'root',
-          depth: 0,
-          step: 0,
-          status: 'active'
-        }
-      }
-    });
+    setBranchLoop(createInitialBranchLoopState(nextRound));
 
     const prompt = formatPromptWithSkill(query, oneShotSkill || null);
     const response = await agent.run(prompt, (event: TraceEvent) => {
       setBranchLoop((prev) => {
         if (!prev) return prev;
-        return applyBranchTraceEvent(prev, event, branchStepSeenRef.current);
+        return applyBranchTraceEvent(prev, event);
       });
 
       setHistory((prev: HistoryItem[]) => [...prev, {
@@ -1451,6 +1599,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
         traceMeta: event.metadata,
       }]);
     }, { conversationId: 'terminal-main', sessionId: `terminal-${Date.now()}`, agentMode: cliAgentMode, onApproval: cliApprovalCallback });
+    setBranchLoop((prev) => (prev ? finalizeBranchLoopState(prev) : prev));
     setHistory((prev: HistoryItem[]) => [...prev, { type: 'agent', content: response }]);
   };
 
@@ -1749,8 +1898,8 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   };
 
   const sortBranchIds = (left: string, right: string) => {
-    const l = left.replace(/^B/, '').split('.').map((part) => Number(part) || 0);
-    const r = right.replace(/^B/, '').split('.').map((part) => Number(part) || 0);
+    const l = left.replace(/^[A-Z]+/i, '').split('.').map((part) => Number(part) || 0);
+    const r = right.replace(/^[A-Z]+/i, '').split('.').map((part) => Number(part) || 0);
     const max = Math.max(l.length, r.length);
     for (let i = 0; i < max; i += 1) {
       const lv = l[i] ?? -1;
@@ -1784,11 +1933,32 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
     }
   };
 
-  const buildProgressBar = (value: number, total: number, width = 22) => {
-    const safeTotal = Math.max(1, total);
-    const clamped = Math.max(0, Math.min(value, safeTotal));
-    const filled = Math.round((clamped / safeTotal) * width);
-    return `${'█'.repeat(filled)}${'░'.repeat(Math.max(0, width - filled))}`;
+  const getBranchPhaseLabel = (phase: BranchLoopPhase) => {
+    switch (phase) {
+      case 'branching': return 'Branching';
+      case 'synthesizing': return 'Synthesizing';
+      case 'rebranching': return 'Rebranching';
+      case 'complete': return 'Complete';
+      default: return 'Branching';
+    }
+  };
+
+  const getBranchPhaseColor = (phase: BranchLoopPhase) => {
+    switch (phase) {
+      case 'branching': return 'cyan';
+      case 'synthesizing': return 'yellow';
+      case 'rebranching': return 'magenta';
+      case 'complete': return 'green';
+      default: return 'white';
+    }
+  };
+
+  const getBranchKindLabel = (kind: BranchVisualKind, retry: number | null) => {
+    switch (kind) {
+      case 'root': return 'root';
+      case 'rebranch': return retry ? `rebranch r${retry}` : 'rebranch';
+      default: return 'branch';
+    }
   };
 
   const buildBranchTreeRows = (state: BranchLoopVisualState): BranchTreeRow[] => {
@@ -1820,8 +1990,9 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   const renderBranchTree = (state: BranchLoopVisualState) => {
     return buildBranchTreeRows(state).slice(0, 24).map((row) => {
       const statusColor = getBranchStatusColor(row.node.status);
-      const isActive = state.activeBranchId === row.node.id;
+      const isActive = state.activeBranchIds.includes(row.node.id);
       const label = row.node.label && row.node.label !== row.node.id ? row.node.label : 'branch';
+      const kindLabel = getBranchKindLabel(row.node.kind, row.node.retry);
       return (
         <Box key={row.node.id} flexDirection="row">
           {row.ancestorHasNext.map((hasNext, index) => (
@@ -1834,6 +2005,43 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
           <Text color="dim"> · s{row.node.step} · d{row.node.depth}</Text>
           <Text> </Text>
           <Text color={statusColor}>{label}</Text>
+          <Text color="dim"> · {kindLabel}</Text>
+        </Box>
+      );
+    });
+  };
+
+  const renderBranchKanban = (state: BranchLoopVisualState) => {
+    const statuses: BranchVisualStatus[] = ['active', 'queued', 'finalizing', 'completed', 'error'];
+    return statuses.map((status) => {
+      const cards = Object.values(state.nodes)
+        .filter((node) => node.status === status)
+        .sort((left, right) =>
+          (right.updatedAt || 0) - (left.updatedAt || 0)
+          || sortBranchIds(left.id, right.id))
+        .slice(0, status === 'completed' ? 4 : 6);
+      if (cards.length === 0) {
+        return null;
+      }
+      const statusColor = getBranchStatusColor(status);
+      return (
+        <Box key={`kanban-${status}`} flexDirection="column" marginBottom={1}>
+          <Text color={statusColor} bold>
+            {getBranchStatusGlyph(status)} {status.toUpperCase()} ({Object.values(state.nodes).filter((node) => node.status === status).length})
+          </Text>
+          {cards.map((node) => (
+            <Box key={`kanban-${status}-${node.id}`} flexDirection="column" marginLeft={2}>
+              <Box flexDirection="row">
+                <Text bold color="white">{node.id}</Text>
+                <Text color="dim"> · </Text>
+                <Text color={statusColor}>{clipBranchText(node.label || 'branch', 36)}</Text>
+              </Box>
+              {node.goal ? <Text color="dim">goal: {clipBranchText(node.goal, 88)}</Text> : null}
+              {node.summary ? <Text color="white">result: {clipBranchText(node.summary, 96)}</Text> : null}
+              {node.artifacts.length > 0 ? <Text color="green">artifacts: {clipBranchText(node.artifacts.slice(0, 3).join(', '), 96)}</Text> : null}
+              {node.blockers.length > 0 ? <Text color="red">blockers: {clipBranchText(node.blockers.slice(0, 2).join(' | '), 96)}</Text> : null}
+            </Box>
+          ))}
         </Box>
       );
     });
@@ -1849,26 +2057,26 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
       <Text color="dim">Trace log: {traceLogExpanded ? 'expanded' : 'collapsed'} | /tracelog to toggle</Text>
       {branchLoop && (
         <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="cyan" paddingX={1} paddingY={0}>
-          <Text color="cyan" bold>Branch Tree</Text>
+          <Text color="cyan" bold>Branch Kanban</Text>
           <Box flexDirection="row">
             <Text color="dim">Round {branchLoop.round}</Text>
-            <Text color="dim">  Active: {branchLoop.activeBranchId || 'synthesizing'}</Text>
+            <Text color="dim">  Active: {branchLoop.activeBranchId || 'none'}</Text>
+            <Text color="dim">  Nodes: {Object.keys(branchLoop.nodes).length}</Text>
+          </Box>
+          <Box flexDirection="row">
+            <Text color={getBranchPhaseColor(branchLoop.phase)}>{getBranchPhaseLabel(branchLoop.phase)}</Text>
             <Text color="dim">  Queue: {branchLoop.queueCount}</Text>
+            <Text color="dim">  Completed: {branchLoop.completed}</Text>
+            <Text color="dim">  Errors: {branchLoop.errors}</Text>
+            {branchLoop.rebranchCount > 0 ? (
+              <Text color="dim">  Retry: {branchLoop.rebranchCount}</Text>
+            ) : null}
           </Box>
-          <Box flexDirection="row">
-            <Text color="white">Steps </Text>
-            <Text color="cyan">{buildProgressBar(branchLoop.totalSteps, branchLoop.totalBudget)}</Text>
-            <Text color="dim"> {branchLoop.totalSteps}/{branchLoop.totalBudget}</Text>
-          </Box>
-          <Box flexDirection="row">
-            <Text color="white">Done  </Text>
-            <Text color="green">{buildProgressBar(branchLoop.completed, branchLoop.maxCompleted)}</Text>
-            <Text color="dim"> {branchLoop.completed}/{branchLoop.maxCompleted}</Text>
-          </Box>
+          {branchLoop.statusMessage ? <Text color="dim">{branchLoop.statusMessage}</Text> : null}
           <Box flexDirection="row" marginBottom={0}>
             <Text color="cyan">◆ active</Text>
             <Text color="dim">  </Text>
-            <Text color="green">● done</Text>
+            <Text color="green">● completed</Text>
             <Text color="dim">  </Text>
             <Text color="yellow">◐ finalizing</Text>
             <Text color="dim">  </Text>
@@ -1876,6 +2084,10 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
             <Text color="dim">  </Text>
             <Text color="red">✖ error</Text>
           </Box>
+          <Box flexDirection="column">
+            {renderBranchKanban(branchLoop)}
+          </Box>
+          <Text color="cyan" bold>Branch Tree</Text>
           <Box flexDirection="column">
             {renderBranchTree(branchLoop)}
           </Box>
