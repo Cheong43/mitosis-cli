@@ -10,24 +10,50 @@
  */
 export class RpmLimiter {
   /** Maximum requests allowed per minute. */
-  private readonly rpm: number;
+  private rpm: number;
   /** Minimum milliseconds between consecutive requests. */
-  private readonly intervalMs: number;
+  private intervalMs: number;
   /** Timestamp (ms) of the last granted request. */
   private lastGranted = 0;
   /** FIFO queue of waiters (resolve callbacks). */
   private readonly queue: Array<() => void> = [];
   /** Timer handle for scheduled drain. */
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
+  /** FIFO dispatcher chain for queued request scheduling. */
+  private dispatchTail: Promise<void> = Promise.resolve();
 
   constructor(rpm: number) {
-    this.rpm = rpm > 0 && Number.isFinite(rpm) ? rpm : 0;
-    this.intervalMs = this.rpm > 0 ? 60_000 / this.rpm : 0;
+    this.rpm = 0;
+    this.intervalMs = 0;
+    this.configure(rpm);
   }
 
   /** Returns true when the limiter is effectively disabled. */
   get disabled(): boolean {
     return this.rpm <= 0;
+  }
+
+  /** Update the configured ceiling for an existing limiter instance. */
+  configure(rpm: number): void {
+    this.rpm = rpm > 0 && Number.isFinite(rpm) ? rpm : 0;
+    this.intervalMs = this.rpm > 0 ? 60_000 / this.rpm : 0;
+
+    if (this.drainTimer !== null) {
+      clearTimeout(this.drainTimer);
+      this.drainTimer = null;
+    }
+
+    if (this.disabled) {
+      while (this.queue.length > 0) {
+        const waiter = this.queue.shift();
+        waiter?.();
+      }
+      return;
+    }
+
+    if (this.queue.length > 0) {
+      this.scheduleDrain();
+    }
   }
 
   /**
@@ -51,6 +77,16 @@ export class RpmLimiter {
       this.queue.push(resolve);
       this.scheduleDrain();
     });
+  }
+
+  /**
+   * Enqueue a task behind the limiter so requests are dispatched in FIFO order.
+   * A task failure must not poison the queue for later tasks.
+   */
+  run<T>(task: () => Promise<T>): Promise<T> {
+    const reservation = this.dispatchTail.then(() => this.acquire());
+    this.dispatchTail = reservation.then(() => undefined, () => undefined);
+    return reservation.then(task);
   }
 
   private scheduleDrain(): void {
@@ -77,4 +113,39 @@ export class RpmLimiter {
       this.scheduleDrain();
     }
   }
+}
+
+const GLOBAL_RPM_LIMITERS_KEY = '__MITOSIS_CLI_GLOBAL_RPM_LIMITERS__';
+
+type GlobalLimiterRegistry = typeof globalThis & {
+  [GLOBAL_RPM_LIMITERS_KEY]?: Map<string, RpmLimiter>;
+};
+
+function getLimiterRegistry(): Map<string, RpmLimiter> {
+  const globalRegistry = globalThis as GlobalLimiterRegistry;
+  if (!globalRegistry[GLOBAL_RPM_LIMITERS_KEY]) {
+    globalRegistry[GLOBAL_RPM_LIMITERS_KEY] = new Map<string, RpmLimiter>();
+  }
+  return globalRegistry[GLOBAL_RPM_LIMITERS_KEY]!;
+}
+
+/**
+ * Returns a process-global limiter so concurrent agent instances share one RPM bucket.
+ */
+export function getGlobalRpmLimiter(scope: string, rpm: number): RpmLimiter {
+  const registry = getLimiterRegistry();
+  const key = String(scope || 'default').trim() || 'default';
+  const existing = registry.get(key);
+  if (existing) {
+    existing.configure(rpm);
+    return existing;
+  }
+
+  const limiter = new RpmLimiter(rpm);
+  registry.set(key, limiter);
+  return limiter;
+}
+
+export function resetGlobalRpmLimitersForTest(): void {
+  getLimiterRegistry().clear();
 }

@@ -21,12 +21,6 @@ interface WebPermissionPolicy {
   blockedDomains: string[];
 }
 
-interface WebSearchResultRecord {
-  title: string;
-  url: string;
-  snippet: string;
-}
-
 function normalizeDomain(value: string): string {
   return String(value || '')
     .trim()
@@ -67,18 +61,12 @@ export class PlannerToolAdapter {
   private readonly projectRoot: string;
   private readonly codeCliRoot: string;
   private readonly runtimeHandle: RuntimeHandle;
-  private readonly webSearchBudget: number;
   private readonly defaultWebPermissionPolicy: WebPermissionPolicy;
-  private webSearchUses = 0;
 
   constructor(options: PlannerToolAdapterOptions) {
     this.projectRoot = options.projectRoot;
     this.codeCliRoot = options.codeCliRoot;
     this.runtimeHandle = options.runtimeHandle;
-    const configuredBudget = Number(process.env.MITOSIS_WEB_SEARCH_BUDGET ?? 8);
-    this.webSearchBudget = Number.isFinite(configuredBudget)
-      ? Math.max(0, Math.floor(configuredBudget))
-      : 8;
     this.defaultWebPermissionPolicy = {
       allowedDomains: parseDomainList(process.env.MITOSIS_WEB_ALLOWED_DOMAINS),
       blockedDomains: parseDomainList(process.env.MITOSIS_WEB_BLOCKED_DOMAINS),
@@ -134,80 +122,6 @@ export class PlannerToolAdapter {
       };
     }
     return { allowed: true, host };
-  }
-
-  private filterSearchResults(
-    results: WebSearchResultRecord[],
-    policy: WebPermissionPolicy,
-  ): { results: Array<WebSearchResultRecord & { domain: string; citation: string }>; filteredOut: string[] } {
-    const filteredOut: string[] = [];
-    const accepted = results
-      .map((result) => ({ result, access: this.evaluateWebAccess(result.url, policy) }))
-      .filter(({ access }) => {
-        if (access.allowed) {
-          return true;
-        }
-        if (access.host) {
-          filteredOut.push(access.host);
-        }
-        return false;
-      })
-      .map(({ result, access }, index) => ({
-        ...result,
-        domain: access.host,
-        citation: `[${index + 1}]`,
-      }));
-    return { results: accepted, filteredOut: [...new Set(filteredOut)] };
-  }
-
-  private buildSearchBudgetPayload() {
-    return {
-      type: 'search',
-      used: this.webSearchUses,
-      limit: this.webSearchBudget,
-      remaining: Math.max(0, this.webSearchBudget - this.webSearchUses),
-    };
-  }
-
-  private buildWebSearchResponse(
-    query: string,
-    engine: string,
-    results: Array<WebSearchResultRecord & { domain: string; citation: string }>,
-    policy: WebPermissionPolicy,
-    filteredOutDomains: string[],
-  ): string {
-    const citations = results.map((result) => ({
-      citation: result.citation,
-      title: result.title,
-      url: result.url,
-      domain: result.domain,
-      snippet: result.snippet,
-    }));
-    const summaryParts = [
-      `${engine} returned ${results.length} allowed result(s) for ${JSON.stringify(query)}.`,
-      citations.length > 0
-        ? `Best citations to inspect next: ${citations.slice(0, 3).map((item) => `${item.citation} ${item.domain}`).join(', ')}.`
-        : 'No allowed citations remain after filtering.',
-      filteredOutDomains.length > 0
-        ? `Filtered out blocked/disallowed domains: ${filteredOutDomains.join(', ')}.`
-        : '',
-      `Search budget remaining: ${Math.max(0, this.webSearchBudget - this.webSearchUses)}/${this.webSearchBudget}.`,
-    ].filter(Boolean);
-
-    return JSON.stringify({
-      kind: 'web_search',
-      query,
-      engine,
-      summary: summaryParts.join(' '),
-      budget: this.buildSearchBudgetPayload(),
-      permissions: {
-        allowed_domains: policy.allowedDomains,
-        blocked_domains: policy.blockedDomains,
-      },
-      citations,
-      results,
-      recommended_fetch_urls: results.slice(0, 3).map((result) => result.url),
-    });
   }
 
   private summarizeFetchedText(text: string): {
@@ -412,214 +326,16 @@ export class PlannerToolAdapter {
       }
     }
 
-    if (mode !== 'search') {
+    if (mode === 'search') {
       return JSON.stringify({
         kind: 'error',
-        message: 'web supports mode=search|fetch',
+        message: 'web search has been removed. Use web fetch with a known URL, or use another tool/skill to obtain candidate URLs first.',
       });
     }
-
-    const query = String(args.query || '').trim();
-    if (!query) {
-      return JSON.stringify({ kind: 'error', message: 'web search requires query' });
-    }
-    if (this.webSearchUses >= this.webSearchBudget) {
-      return JSON.stringify({
-        kind: 'error',
-        message: `web search budget exhausted after ${this.webSearchUses}/${this.webSearchBudget} uses; fetch a promising URL, narrow allowed_domains, or finalize with current evidence.`,
-        budget: this.buildSearchBudgetPayload(),
-        permissions: {
-          allowed_domains: policy.allowedDomains,
-          blocked_domains: policy.blockedDomains,
-        },
-      });
-    }
-    this.webSearchUses += 1;
-    const limit = Math.max(
-      1,
-      Math.min(10, Number.isFinite(Number(args.limit)) ? Math.floor(Number(args.limit)) : 5),
-    );
-    const userAgent =
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-    const headers = {
-      'User-Agent': userAgent,
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    };
-
-    const parseDuckDuckGo = (html: string): Array<{ title: string; url: string; snippet: string }> => {
-      const results: Array<{ title: string; url: string; snippet: string }> = [];
-      const linkRegex = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-      const rawLinks: Array<{ rawUrl: string; title: string }> = [];
-      let match: RegExpExecArray | null = null;
-      while ((match = linkRegex.exec(html)) && rawLinks.length < limit) {
-        rawLinks.push({ rawUrl: match[1], title: this.stripHtml(match[2]) });
-      }
-      const snippetRegex = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
-      const snippets: string[] = [];
-      let snippetMatch: RegExpExecArray | null = null;
-      while ((snippetMatch = snippetRegex.exec(html)) && snippets.length < limit) {
-        snippets.push(this.stripHtml(snippetMatch[1]).slice(0, 300));
-      }
-      for (let index = 0; index < rawLinks.length; index += 1) {
-        const { rawUrl, title } = rawLinks[index];
-        let realUrl = rawUrl;
-        try {
-          const parsed = new URL(rawUrl, 'https://html.duckduckgo.com');
-          const uddg = parsed.searchParams.get('uddg');
-          if (uddg) realUrl = decodeURIComponent(uddg);
-        } catch {}
-        results.push({ title, url: realUrl, snippet: snippets[index] || '' });
-      }
-      return results;
-    };
-
-    const parseBing = (html: string): Array<{ title: string; url: string; snippet: string }> => {
-      const results: Array<{ title: string; url: string; snippet: string }> = [];
-      const algoRegex = /<li[^>]*class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
-      let match: RegExpExecArray | null = null;
-      while ((match = algoRegex.exec(html)) && results.length < limit) {
-        const block = match[1];
-        const hrefMatch = block.match(
-          /<h2[^>]*>[\s\S]*?<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/i,
-        );
-        if (!hrefMatch) continue;
-        const snippetMatch = block.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
-        results.push({
-          title: this.stripHtml(hrefMatch[2]),
-          url: hrefMatch[1],
-          snippet: snippetMatch ? this.stripHtml(snippetMatch[1]).slice(0, 300) : '',
-        });
-      }
-      return results;
-    };
-
-    const parseBaidu = (html: string): Array<{ title: string; url: string; snippet: string }> => {
-      const results: Array<{ title: string; url: string; snippet: string }> = [];
-      const blockRegex = /<div[^>]*class="result[^"\n]*"[^>]*>([\s\S]*?)<\/div>/gi;
-      let match: RegExpExecArray | null = null;
-      while ((match = blockRegex.exec(html)) && results.length < limit) {
-        const block = match[1];
-        const hrefMatch =
-          block.match(/<h3[^>]*>[\s\S]*?<a[^>]+href="(https?:\/\/[^"#]+)"[^>]*>([\s\S]*?)<\/a>/i) ||
-          block.match(/<a[^>]+href="(https?:\/\/[^"#]+)"[^>]*>([\s\S]*?)<\/a>/i);
-        if (!hrefMatch) continue;
-        const snippetMatch =
-          block.match(/<div[^>]*class="c-abstract"[^>]*>([\s\S]*?)<\/div>/i) ||
-          block.match(/<span[^>]*class="content-right_[^"]*"[^>]*>([\s\S]*?)<\/span>/i) ||
-          block.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
-        results.push({
-          title: this.stripHtml(hrefMatch[2]),
-          url: hrefMatch[1],
-          snippet: snippetMatch ? this.stripHtml(snippetMatch[1]).slice(0, 300) : '',
-        });
-      }
-      return results;
-    };
-
-    let ddgError: string | null = null;
-    {
-      const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), safeWebTimeout);
-      try {
-        const response = await fetch(ddgUrl, { headers, signal: ac.signal });
-        const html = await response.text();
-        if (response.ok) {
-          const rawResults = parseDuckDuckGo(html);
-          const { results, filteredOut } = this.filterSearchResults(rawResults, policy);
-          if (results.length > 0) {
-            return this.buildWebSearchResponse(query, 'duckduckgo', results, policy, filteredOut);
-          }
-          ddgError = filteredOut.length > 0 ? `filtered out all results (${filteredOut.join(', ')})` : 'empty results';
-        } else {
-          ddgError = `HTTP ${response.status}`;
-        }
-      } catch (err: any) {
-        ddgError = err?.name === 'AbortError' ? 'timed out' : String(err?.message || err);
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-
-    let bingError: string | null = null;
-    {
-      const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=${limit}`;
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), safeWebTimeout);
-      try {
-        const response = await fetch(bingUrl, { headers, signal: ac.signal });
-        const html = await response.text();
-        if (!response.ok) {
-          bingError = `HTTP ${response.status} ${response.statusText}`;
-        } else {
-          const rawResults = parseBing(html);
-          const { results, filteredOut } = this.filterSearchResults(rawResults, policy);
-          if (results.length > 0) {
-            return this.buildWebSearchResponse(query, 'bing', results, policy, filteredOut);
-          }
-          bingError = filteredOut.length > 0 ? `filtered out all results (${filteredOut.join(', ')})` : 'empty results';
-        }
-      } catch (err: any) {
-        bingError =
-          err?.name === 'AbortError'
-            ? `timed out after ${safeWebTimeout}ms`
-            : String(err?.message || err);
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-
-    {
-      const baiduUrl = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=${limit}`;
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), safeWebTimeout);
-      try {
-        const response = await fetch(baiduUrl, { headers, signal: ac.signal });
-        const html = await response.text();
-        if (!response.ok) {
-          return JSON.stringify({
-            kind: 'error',
-            message: `DDG: ${ddgError}; Bing: ${bingError}; Baidu: HTTP ${response.status} ${response.statusText}`,
-            budget: this.buildSearchBudgetPayload(),
-            permissions: {
-              allowed_domains: policy.allowedDomains,
-              blocked_domains: policy.blockedDomains,
-            },
-          });
-        }
-        const rawResults = parseBaidu(html);
-        const { results, filteredOut } = this.filterSearchResults(rawResults, policy);
-        if (results.length > 0) {
-          return this.buildWebSearchResponse(query, 'baidu', results, policy, filteredOut);
-        }
-        return JSON.stringify({
-          kind: 'error',
-          message: `DDG: ${ddgError}; Bing: ${bingError}; Baidu: empty results`,
-          budget: this.buildSearchBudgetPayload(),
-          permissions: {
-            allowed_domains: policy.allowedDomains,
-            blocked_domains: policy.blockedDomains,
-          },
-        });
-      } catch (err: any) {
-        const baiduError =
-          err?.name === 'AbortError'
-            ? `timed out after ${safeWebTimeout}ms`
-            : String(err?.message || err);
-        return JSON.stringify({
-          kind: 'error',
-          message: `DDG: ${ddgError}; Bing: ${bingError}; Baidu: ${baiduError}`,
-          budget: this.buildSearchBudgetPayload(),
-          permissions: {
-            allowed_domains: policy.allowedDomains,
-            blocked_domains: policy.blockedDomains,
-          },
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-    }
+    return JSON.stringify({
+      kind: 'error',
+      message: 'web only supports mode=fetch.',
+    });
   }
 
   private async readWorkspaceFile(filePath: string): Promise<string> {
@@ -928,6 +644,9 @@ export class PlannerToolAdapter {
       `Skill: ${skill.name}`,
       `Description: ${skill.description}`,
     ];
+    if (skill.tools?.length) {
+      lines.push(`Allowed tools: ${skill.tools.join(', ')}`);
+    }
     if (skill.location) {
       lines.push(`Location: ${skill.location}`);
     }

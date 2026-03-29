@@ -409,8 +409,7 @@ export class MemoryClassifierAgent {
 
   private async generateJsonPromptText(messages: Array<{ role: 'system' | 'user'; content: string }>): Promise<string> {
     const run = async (useJsonObject: boolean) => {
-      await this.rpmLimiter.acquire();
-      return this.withTimeout(
+      return this.rpmLimiter.run(() => this.withTimeout(
         generateText({
           model: this.chatClient,
           messages,
@@ -420,7 +419,7 @@ export class MemoryClassifierAgent {
         }),
         this.memoryExtractTimeoutMs,
         'memory extraction llm'
-      );
+      ));
     };
 
     try {

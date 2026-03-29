@@ -23,6 +23,8 @@ import { AgentRuntime, createRuntime, CallbackApprovalEngine } from '../runtime/
 import type { ApprovalCallback } from '../runtime/index.js';
 import type { AgentBranchState, BranchSynthesisInput } from '../runtime/agent/AgentRuntime.js';
 import type {
+  BranchKanbanCard,
+  BranchKanbanSnapshot,
   BranchDisposition,
   BranchHandoff,
   BranchOutcome,
@@ -54,7 +56,7 @@ import {
 } from './contextBudget.js';
 import { SessionCompressor, isRunExhausted } from './sessionCompressor.js';
 import { PlannerToolAdapter } from './PlannerToolAdapter.js';
-import { RpmLimiter } from '../utils/RpmLimiter.js';
+import { RpmLimiter, getGlobalRpmLimiter } from '../utils/RpmLimiter.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -493,6 +495,7 @@ export class Agent {
   private readonly plannerTemperature: number;
   private readonly responseTemperature: number;
   private readonly memoryClassifier: MemoryClassifierAgent;
+  private readonly llmLimiterCircuitCooldownMs: number;
   /** Per-session compressor for exhausted-run carry-over. */
   private readonly sessionCompressor: SessionCompressor;
   /** In-process caches to avoid re-reading disk on every request. */
@@ -596,9 +599,14 @@ export class Agent {
     const rawRebranchEnabled = String(process.env.REACT_REBRANCH_ENABLED ?? '1').toLowerCase();
     this.rebranchEnabled = rawRebranchEnabled !== '0' && rawRebranchEnabled !== 'false' && rawRebranchEnabled !== 'off';
     const rawLlmRpm = Number(process.env.LLM_RPM_LIMIT ?? 0);
-    this.llmRpmLimiter = new RpmLimiter(Number.isFinite(rawLlmRpm) ? Math.max(0, Math.floor(rawLlmRpm)) : 0);
+    const normalizedLlmRpm = Number.isFinite(rawLlmRpm) ? Math.max(0, Math.floor(rawLlmRpm)) : 0;
+    this.llmRpmLimiter = getGlobalRpmLimiter('llm', normalizedLlmRpm);
     const rawAgentLlmTimeoutMs = Number(process.env.AGENT_LLM_TIMEOUT_MS ?? 120000);
     this.agentLlmTimeoutMs = Number.isFinite(rawAgentLlmTimeoutMs) ? Math.max(5000, Math.floor(rawAgentLlmTimeoutMs)) : 120000;
+    const rawLlmCircuitCooldownMs = Number(process.env.LLM_LIMIT_CIRCUIT_COOLDOWN_MS ?? 120000);
+    this.llmLimiterCircuitCooldownMs = Number.isFinite(rawLlmCircuitCooldownMs)
+      ? Math.max(1000, Math.floor(rawLlmCircuitCooldownMs))
+      : 120000;
     const rawPlannerTemperature = Number(process.env.PLANNER_TEMPERATURE ?? 0.1);
     this.plannerTemperature = Number.isFinite(rawPlannerTemperature) ? Math.max(0, Math.min(1, rawPlannerTemperature)) : 0.1;
     const rawResponseTemperature = Number(process.env.RESPONSE_TEMPERATURE ?? 0.3);
@@ -854,19 +862,19 @@ export class Agent {
     timeoutLabel: string;
     temperature?: number;
     allowBranching: boolean;
+    maxTokens?: number;
   }): Promise<PlannerDecisionResult> {
-    await this.llmRpmLimiter.acquire();
-    const { calls, text, providerMessage } = await this.withTimeout(
+    const { calls, text, providerMessage } = await this.llmRpmLimiter.run(() => this.withTimeout(
       generateToolCalls({
         model: this.openai,
         messages: options.messages,
         tools: this.buildPlannerDecisionTools(options.allowBranching),
         temperature: options.temperature,
-        maxTokens: 6000,
+        maxTokens: options.maxTokens ?? 1600,
       }),
       options.timeoutMs,
       options.timeoutLabel,
-    );
+    ));
     const controlDecisions = calls
       .filter((call): call is { name: string; input: Extract<PlannerInvocation, { kind: 'control' }> } => call.input.kind === 'control')
       .map((call) => call.input.decision);
@@ -908,8 +916,7 @@ export class Agent {
     onFallback?: () => void | Promise<void>;
   }): Promise<string> {
     const run = async (messages: any, useJsonObject: boolean) => {
-      await this.llmRpmLimiter.acquire();
-      return this.withTimeout(
+      return this.llmRpmLimiter.run(() => this.withTimeout(
         generateText({
           model: options.model,
           messages,
@@ -921,7 +928,7 @@ export class Agent {
         }),
         options.timeoutMs,
         options.timeoutLabel,
-      );
+      ));
     };
 
     const maybeRepairInvalidJsonReply = async (text: string, useJsonObject: boolean): Promise<string> => {
@@ -2336,8 +2343,7 @@ Decide the safer execution discipline for this turn.`,
     ];
 
     try {
-      await this.llmRpmLimiter.acquire();
-      const run = async (useJsonObject: boolean) => this.withTimeout(
+      const run = async (useJsonObject: boolean) => this.llmRpmLimiter.run(() => this.withTimeout(
         generateText({
           model: this.openai,
           messages,
@@ -2349,7 +2355,7 @@ Decide the safer execution discipline for this turn.`,
         }),
         Math.min(this.agentLlmTimeoutMs, 20000),
         'execution_discipline_gate llm',
-      );
+      ));
 
       let raw = '';
       try {
@@ -3057,6 +3063,48 @@ Decide the safer execution discipline for this turn.`,
       traceBuffer.push(event);
       onTrace(event);
     };
+    let llmCircuitOpenedAt = 0;
+    let llmCircuitReason = '';
+    const isLlmLimitDetail = (detail: string): boolean =>
+      /\busage limit exceeded\b/i.test(detail)
+      || /\brate limit\b/i.test(detail)
+      || /\bquota\b/i.test(detail)
+      || /\btoo many requests\b/i.test(detail)
+      || /\b429\b/i.test(detail)
+      || /当前请求量较高/i.test(detail)
+      || /按量付费 api/i.test(detail)
+      || /更高级别套餐/i.test(detail);
+    const getActiveLlmCircuitReason = (): string => {
+      if (!llmCircuitReason) {
+        return '';
+      }
+      if ((Date.now() - llmCircuitOpenedAt) > this.llmLimiterCircuitCooldownMs) {
+        llmCircuitOpenedAt = 0;
+        llmCircuitReason = '';
+        return '';
+      }
+      return llmCircuitReason;
+    };
+    const openLlmCircuit = (detail: string, phase: string) => {
+      llmCircuitOpenedAt = Date.now();
+      llmCircuitReason = this.clipText(`${phase}: ${detail}`, 400);
+      emitTrace({
+        type: 'observation',
+        content: `LLM request queue entered degraded mode after provider limit error. Remaining planner/model steps will fall back to local completion. Detail: ${llmCircuitReason}`,
+      });
+    };
+    const buildLlmLimitFallbackDecision = (detail: string): ExecutablePlannerDecisionResult => ({
+      decision: {
+        kind: 'final',
+        thought: 'LLM provider limit reached before selecting the next step.',
+        final_answer: 'LLM provider limit reached; finalize from gathered evidence.',
+        completion_summary: 'LLM provider limit reached; finalizing from gathered evidence.',
+        outcome: 'partial',
+        outcome_reason: detail,
+        disposition: 'planner_error',
+        finalization_mode: 'planner_fallback',
+      },
+    });
     emitTrace({
       type: 'thought',
       content: runPhase === 'plan'
@@ -3152,6 +3200,14 @@ Decide the safer execution discipline for this turn.`,
       const fn = (tool as any).function;
       return `- ${fn.name}: ${fn.description}\n  params: ${JSON.stringify(fn.parameters)}`;
     }).join('\n');
+    const plannerToolSummary = [
+      'Planner-visible tool families:',
+      'read -> inspect workspace files, memory nodes, preferences, or skills',
+      'search -> search workspace, memory, preferences, or skills',
+      'edit -> modify workspace files or semantic memory/preferences/skills targets',
+      'bash -> run local shell commands under governance',
+      'web -> fetch a trusted URL only; do not invent URLs',
+    ].join('\n');
 
     const alwaysIncludeBlock = alwaysIncludeSkills.length > 0
       ? `\n\n--- ALWAYS-ACTIVE SKILL POLICIES (pre-loaded, binding on every turn) ---\n${renderSkillGuidance(alwaysIncludeSkills)}\n--- END ALWAYS-ACTIVE SKILLS ---`
@@ -3164,19 +3220,20 @@ Decide the safer execution discipline for this turn.`,
       sections.filter((section): section is string => typeof section === 'string' && section.trim().length > 0).join('\n\n');
     const renderPromptList = (items: string[], ordered = false): string =>
       items.map((item, index) => `${ordered ? `${index + 1}.` : '-'} ${item}`).join('\n');
+    const clampNumber = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
     const sharedToolAndTargetGuidance = `You only use five top-level tools:
   read   -> read semantic targets such as workspace files, memory nodes, preferences, or skills
   search -> search semantic targets such as workspace, memory, preferences, or skills
   edit   -> edit semantic targets such as workspace files, memory nodes, preferences, or skills
   bash   -> run sandboxed shell commands
-  web    -> search the web (returns title+url+snippet) or fetch a page; use for external/current information
+  web    -> fetch a known web page URL for external/current information
 
 Tool target guidance:
   target=workspace   -> normal repository files
   target=memory      -> Mempedia nodes and episodic memory search
   target=preferences -> project preference markdown
-  target=skills      -> local SKILL.md guidance files`;
-    const sharedSkillAndKnowledgeGuidance = `Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md and ./.github/skills/*/SKILL.md.
+  target=skills      -> local skill guidance files, including SKILL.md and Claude-compatible agent markdown`;
+    const sharedSkillAndKnowledgeGuidance = `Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md, ./.github/skills/*/SKILL.md, Claude-compatible project agents under ./.claude/agents/*.md, and user Claude agents under ~/.claude/agents/*.md.
 ${localSkillsIndex ? `${localSkillsIndex}\n` : ''}Skills are guidance documents, not tool names. Never emit skill names such as project-discovery in tool_calls.name.
 If skill guidance has been injected for the turn, treat it as internal policy only. Do not inspect the skills directory, verify skill files, or summarize skill text back to the user unless the user explicitly asked about skills.
 When you save knowledge, prefer markdown-first notes that preserve concrete facts, numbers, data points, historical changes, viewpoints, evidence, and explicit uncertainties instead of terse summaries.
@@ -3191,15 +3248,10 @@ Separate facts from opinions or viewpoints. Never fabricate facts; if something 
       'Use bash whenever shell is the practical tool, but remember dangerous shell operations are sandboxed and should require confirmation.',
     ]);
     const sharedWebRules = renderPromptList([
-      'Use web for questions about external topics, current events, APIs, libraries, or anything not answerable from workspace files. Prefer workspace evidence only for project-specific questions. When web search returns results, read the snippet field first; fetch a page only when the snippet is insufficient.',
-      'Prefer materially diverse search strategies over paraphrased near-duplicate queries.',
-      'web mode=search returns citation-oriented results with snippets, domains, budget, and permission metadata; web mode=fetch returns a citation summary with highlights and a short preview instead of dumping the whole page.',
-      'Treat web search as a budgeted tool, not an open-ended browsing loop. If budget is getting low, narrow scope with allowed_domains or switch to fetch/finalize.',
-      'When source quality matters, pass allowed_domains or blocked_domains instead of hoping the search engine ranking is good enough.',
-      'When you need current or external information, use web proactively instead of guessing from training data.',
-      'If you issue multiple web/search calls in one response, each must target a genuinely different evidence stream or hypothesis. Do not batch paraphrased near-duplicate queries. Vary at least two of: keywords, aliases, domains, dates, language, or source type.',
-      'When a web search is weak, noisy, or repetitive, change strategy materially before searching again. Vary keywords, aliases, dates, source types, domains, languages, jurisdictions, or fetch a promising result instead of issuing another broad near-duplicate search.',
-      'After 2-3 consecutive web/search rounds without clear new information, do not continue the same-category search loop. Either call planner_final with the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy.',
+      'Use web only in mode=fetch. It requires a concrete URL and returns a citation summary with highlights and a short preview instead of the full raw page.',
+      'Prefer workspace evidence first for project-specific questions. For external information, use web fetch only after the user, a local skill, or another tool has already provided a plausible URL.',
+      'When source quality matters, pass allowed_domains or blocked_domains so fetch stays within trusted sources.',
+      'If you do not have a trustworthy URL yet, do not invent one. Use local skills or other tools to obtain candidate URLs, or state that external fetching is blocked by missing links.',
     ]);
     const sharedCompletionAndStorageRules = renderPromptList([
       'When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.',
@@ -3236,10 +3288,7 @@ ${soulsGuidance}` : '',
       alwaysIncludeBlock ? `${alwaysIncludeBlock}
 
 IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool-call arguments. They are not the planner response format.` : '',
-      `Available tools:
-${toolCatalog}`,
-      soulsGuidance ? `Global souls.md guidance:
-${soulsGuidance}` : '',
+      plannerToolSummary,
     );
     const branchingModeSpecificRule = isPlanStage
       ? 'Because this is the PLAN stage, planner_final must return one ordered execution plan for a single owner, not a claim that the code has already been changed.'
@@ -3340,22 +3389,53 @@ ${sharedSkillReviewRules}`,
       ? buildBranchingModePrompt(plannerPromptFooter)
       : buildSequentialModePrompt(plannerPromptFooter);
 
-    // ── Dynamic context budget computation ──────────────────────────────
-    const systemPromptTokens = estimateTokens(systemPrompt);
-    const conversationContextTokens = estimateTranscriptTokens(recentConversationMessages);
-    const memoryContextTokens = estimateTokens(context);
-    const ctxBudget = computeContextBudget({
+    // ── Stage-aware context budget computation ──────────────────────────
+    const buildStageBudget = (
+      prompt: string,
+      conversationTokens: number,
+      memoryTokens: number,
+      safetyMargin = 4096,
+    ) => computeContextBudget({
       model: this.model,
-      systemPromptTokens,
-      conversationContextTokens,
-      memoryContextTokens,
+      systemPromptTokens: estimateTokens(prompt),
+      conversationContextTokens: conversationTokens,
+      memoryContextTokens: memoryTokens,
+      safetyMargin,
     });
+    const deriveMaxOutputTokens = (
+      budget: ContextBudgetResult,
+      floor: number,
+      ceiling: number,
+      ratio = 0.12,
+    ) => clampNumber(
+      Math.floor(Math.max(floor, budget.residualBudget * ratio)),
+      floor,
+      ceiling,
+    );
+    const planningCtxBudget = buildStageBudget(plannerSystemPrompt, 0, 0, 2048);
+    const executionCtxBudget = buildStageBudget(
+      systemPrompt,
+      estimateTranscriptTokens(recentConversationMessages),
+      0,
+      4096,
+    );
+    const finalizeCtxBudget = buildStageBudget(
+      systemPrompt,
+      estimateTranscriptTokens(recentConversationMessages),
+      0,
+      3072,
+    );
+    const synthesisBasePrompt = `You are the synthesis stage for a branching ReAct agent. Merge completed branches into the best possible final answer. Prefer correctness and directness. If branches conflict, prefer the most directly evidenced result, then the latest successful remediation branch, then the answer with the fewest unsupported assumptions. Mention uncertainty only when meaningful conflict remains unresolved. If you mention saved node ids, use only ids explicitly listed in saved_nodes. Do not invent node ids. ${plainTextOnlyRule}${soulsGuidance ? `\n\n${soulsGuidance}` : ''}`;
+    const synthesisCtxBudget = buildStageBudget(synthesisBasePrompt, 0, 0, 3072);
+    const plannerMaxTokens = deriveMaxOutputTokens(planningCtxBudget, 500, 1600, 0.08);
+    const finalizeMaxTokens = deriveMaxOutputTokens(finalizeCtxBudget, 500, 1400, 0.1);
+    const synthesisMaxTokens = deriveMaxOutputTokens(synthesisCtxBudget, 700, 1800, 0.12);
     emitTrace({
       type: 'observation',
-      content: `Context budget: model=${this.model} limit=${ctxBudget.modelLimit} committed=${ctxBudget.committedTokens} residual=${ctxBudget.residualBudget} transcriptChars=${ctxBudget.transcriptBudgetChars} agentMode=${agentMode} rpm=${this.llmRpmLimiter.disabled ? 'unlimited' : process.env.LLM_RPM_LIMIT} [per-branch context compression]`,
+      content: `Context budget: model=${this.model} limit=${planningCtxBudget.modelLimit} committed=${planningCtxBudget.committedTokens} residual=${planningCtxBudget.residualBudget} transcriptChars=${planningCtxBudget.transcriptBudgetChars} agentMode=${agentMode} rpm=${this.llmRpmLimiter.disabled ? 'unlimited' : process.env.LLM_RPM_LIMIT} [plannerCommitted=${planningCtxBudget.committedTokens} executeCommitted=${executionCtxBudget.committedTokens} finalizeCommitted=${finalizeCtxBudget.committedTokens} synthesisCommitted=${synthesisCtxBudget.committedTokens}]`,
     });
 
-    const effectiveTranscriptBudgetChars = ctxBudget.transcriptBudgetChars;
+    const effectiveTranscriptBudgetChars = planningCtxBudget.transcriptBudgetChars;
 
     const extractText = (content: any): string => {
       if (typeof content === 'string') {
@@ -3408,6 +3488,60 @@ ${sharedSkillReviewRules}`,
     };
 
     const loadedSkillMarker = 'SKILL ROUTER LOAD:';
+    const skillRouterGuidanceCharCap = 1400;
+
+    const splitSkillSections = (content: string) => {
+      const lines = content.split(/\r?\n/);
+      const sections: Array<{ heading: string; body: string }> = [];
+      let currentHeading = 'Overview';
+      let currentBody: string[] = [];
+      for (const line of lines) {
+        const headingMatch = line.match(/^#{1,3}\s+(.+)$/);
+        if (headingMatch) {
+          if (currentBody.length > 0) {
+            sections.push({ heading: currentHeading, body: currentBody.join('\n').trim() });
+          }
+          currentHeading = headingMatch[1].trim();
+          currentBody = [];
+          continue;
+        }
+        currentBody.push(line);
+      }
+      if (currentBody.length > 0) {
+        sections.push({ heading: currentHeading, body: currentBody.join('\n').trim() });
+      }
+      return sections.filter((section) => section.body.length > 0);
+    };
+
+    const renderSkillRouterGuidance = (skills: SkillRecord[], query: string): string => {
+      const queryTokens = Array.from(new Set(
+        query.toLowerCase().match(/[\p{L}\p{N}_-]+/gu) || [],
+      )).filter((token) => token.length >= 3);
+      return skills.map((skill) => {
+        const sections = splitSkillSections(skill.content);
+        const matchingSections = sections.filter((section) => {
+          const searchable = `${section.heading}\n${section.body}`.toLowerCase();
+          return queryTokens.some((token) => searchable.includes(token));
+        });
+        const selectedSections = matchingSections.length > 0
+          ? matchingSections.slice(0, 2)
+          : sections.slice(0, 1);
+        const renderedSections = selectedSections.map((section) =>
+          `Section: ${section.heading}\n${this.clipText(section.body, 420)}`,
+        ).join('\n\n');
+        const snippet = this.clipText(
+          renderedSections || this.clipText(skill.content, 420),
+          skillRouterGuidanceCharCap,
+        );
+        return [
+          `Skill: ${skill.name}`,
+          `Description: ${skill.description}`,
+          matchingSections.length > 0 ? 'Matched sections were selected because they overlap with the current request.' : 'Using the shortest summary-first guidance for this skill.',
+          'Guidance:',
+          snippet,
+        ].join('\n');
+      }).join('\n\n---\n\n');
+    };
 
     const getLoadedSkillNames = (transcript: Array<{ role: string; content: ChatMessageContent }>) => {
       // Always-active skills are pre-loaded in the system prompt; treat them as already loaded.
@@ -3446,7 +3580,7 @@ ${sharedSkillReviewRules}`,
         { role: 'assistant' as const, content: `${loadedSkillMarker} Loaded skills: ${names}` },
         {
           role: 'user' as const,
-          content: `Skill Router loaded the following full guidance because you requested it:\n\n${renderSkillGuidance(skillsToInject)}\n\nContinue the current ReAct step by calling tool(s), not plain text. Use read/search/edit/bash/web directly for work, and use planner_final or planner_branch only for control flow.`
+          content: `Skill Router loaded summary-first guidance for the requested skills.\nOnly the most relevant sections are included by default to conserve planner context.\nIf a later step truly needs the full skill text, inspect it explicitly via the semantic skills tools.\n\n${renderSkillRouterGuidance(skillsToInject, originalUserRequest)}\n\nContinue the current ReAct step by calling tool(s), not plain text. Use read/search/edit/bash/web directly for work, and use planner_final or planner_branch only for control flow.`
         },
       ];
     };
@@ -3550,8 +3684,16 @@ ${sharedSkillReviewRules}`,
       initialTranscript: ChatMessage[],
       invoke: (transcript: ChatMessage[]) => Promise<PlannerDecisionResult | PlannerDecision>,
     ): Promise<ExecutablePlannerDecisionResult> => {
+      const activeCircuitReason = getActiveLlmCircuitReason();
+      if (activeCircuitReason) {
+        emitTrace({
+          type: 'observation',
+          content: 'Planner request skipped because the LLM queue is already in degraded mode from an earlier provider limit error.',
+        });
+        return buildLlmLimitFallbackDecision(activeCircuitReason);
+      }
       let workingTranscript = initialTranscript;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
         let plannerResult: PlannerDecisionResult;
         try {
           plannerResult = normalizePlannerResult(await invoke(workingTranscript));
@@ -3578,6 +3720,14 @@ ${sharedSkillReviewRules}`,
                 finalization_mode: 'planner_fallback',
               },
             };
+          }
+          if (isLlmLimitDetail(detail)) {
+            openLlmCircuit(detail, 'planner');
+            emitTrace({
+              type: 'observation',
+              content: 'Planner hit a provider usage/rate limit; skipping further model planning and forcing branch finalization from gathered evidence.',
+            });
+            return buildLlmLimitFallbackDecision(detail);
           }
           const evidenceFirstDecision = buildEvidenceFirstFallbackDecision();
           if (evidenceFirstDecision) {
@@ -3749,7 +3899,46 @@ ${sharedSkillReviewRules}`,
       };
     };
 
-    const buildPlannerMessages = (branch: BranchState): ChatMessage[] => {
+    const buildPlannerMessages = (branch: BranchState, kanbanSnapshot?: BranchKanbanSnapshot): ChatMessage[] => {
+      const compareKanbanCards = (left: BranchKanbanCard, right: BranchKanbanCard) =>
+        left.branchId.localeCompare(right.branchId, undefined, { numeric: true, sensitivity: 'base' });
+
+      const renderPlannerKanbanCard = (card: BranchKanbanCard) => this.clipText([
+        `[${card.branchId}] ${card.label}`,
+        `status=${card.status}`,
+        card.disposition ? `disposition=${card.disposition}` : '',
+        card.outcome ? `outcome=${card.outcome}` : '',
+        `goal=${card.goal}`,
+        card.summary ? `summary=${card.summary}` : '',
+        card.blockers?.length ? `blockers=${card.blockers.join(' | ')}` : '',
+      ].filter(Boolean).join(' | '), 420);
+
+      const renderPlannerKanbanSummary = (snapshot?: BranchKanbanSnapshot) => {
+        if (!snapshot?.cards?.length) {
+          return '(none)';
+        }
+        const cards = snapshot.cards.slice();
+        const currentCard = cards.find((card) => card.branchId === branch.id);
+        const parentCard = branch.parentId
+          ? cards.find((card) => card.branchId === branch.parentId)
+          : undefined;
+        const siblingCards = cards
+          .filter((card) => card.parentBranchId === branch.parentId && card.branchId !== branch.id)
+          .sort(compareKanbanCards)
+          .slice(0, 8);
+        const childCards = cards
+          .filter((card) => card.parentBranchId === branch.id)
+          .sort(compareKanbanCards)
+          .slice(0, 8);
+        return [
+          `snapshot_summary: total=${snapshot.summary.total}, queued=${snapshot.summary.queued}, active=${snapshot.summary.active}, finalizing=${snapshot.summary.finalizing}, completed=${snapshot.summary.completed}, error=${snapshot.summary.error}`,
+          `current_card:\n${currentCard ? renderPlannerKanbanCard(currentCard) : '(none)'}`,
+          `parent_card:\n${parentCard ? renderPlannerKanbanCard(parentCard) : '(none)'}`,
+          `sibling_branch_results:\n${siblingCards.length ? siblingCards.map((card) => renderPlannerKanbanCard(card)).join('\n') : '(none)'}`,
+          `child_branch_results:\n${childCards.length ? childCards.map((card) => renderPlannerKanbanCard(card)).join('\n') : '(none)'}`,
+        ].join('\n');
+      };
+
       const renderStructuredBranchHandoff = (handoff?: BranchHandoff) => {
         if (!handoff) {
           return '(none)';
@@ -3783,6 +3972,53 @@ ${sharedSkillReviewRules}`,
         ].filter(Boolean).join('\n');
       };
 
+      const uniqueCompactLines = (values: Array<string | undefined | null>) => {
+        const seen = new Set<string>();
+        return values
+          .map((value) => this.clipText(String(value || '').replace(/\s+/g, ' ').trim(), 220))
+          .filter((value) => {
+            if (!value || seen.has(value)) {
+              return false;
+            }
+            seen.add(value);
+            return true;
+          });
+      };
+
+      const renderBranchEvidenceDigest = () => {
+        const currentCard = kanbanSnapshot?.cards?.find((card) => card.branchId === branch.id);
+        const recentMessages = branch.transcript.slice(-6);
+        const recentText = recentMessages
+          .map((message) => this.clipText(extractText(message.content).replace(/\s+/g, ' ').trim(), 220))
+          .filter(Boolean);
+        const lastObservation = [...recentText]
+          .reverse()
+          .find((line) => /TOOL OBSERVATION|blocked near-duplicate web search loop|Branch completed/i.test(line));
+        const verifiedFacts = uniqueCompactLines([
+          currentCard?.summary,
+          branch.completionSummary,
+          branch.handoff?.priorResultSnippet,
+        ]).slice(0, 3);
+        const blockers = uniqueCompactLines([
+          ...(currentCard?.blockers || []),
+          ...(branch.handoff?.blockedBy || []),
+          branch.outcomeReason,
+        ]).slice(0, 4);
+        const unresolvedQuestions = uniqueCompactLines([
+          ...(branch.handoff?.missingFields || []),
+          ...(branch.sharedHandoff?.unresolvedAttempts || []).flatMap((attempt) => attempt.missingFields || []),
+        ]).slice(0, 4);
+        const repeatedSearchLoop = recentText.find((line) => /near-duplicate web search loop/i.test(line));
+        return [
+          `last_tool_outcome: ${lastObservation || '(none)'}`,
+          `verified_facts: ${verifiedFacts.length > 0 ? verifiedFacts.join(' | ') : '(none)'}`,
+          `blockers: ${blockers.length > 0 ? blockers.join(' | ') : '(none)'}`,
+          `produced_artifacts: ${currentCard?.artifacts?.length ? currentCard.artifacts.join(', ') : (branch.savedNodeIds.length ? branch.savedNodeIds.join(', ') : '(none)')}`,
+          `unresolved_questions: ${unresolvedQuestions.length > 0 ? unresolvedQuestions.join(' | ') : '(none)'}`,
+          `repeated_search_signal: ${repeatedSearchLoop || '(none)'}`,
+        ].join('\n');
+      };
+
       return [
         { role: 'system', content: plannerSystemPrompt },
         {
@@ -3806,10 +4042,16 @@ Current branch state:
 ${renderStructuredBranchHandoff(branch.handoff)}
 - shared_retry_context:
 ${renderSharedRetryContext(branch.sharedHandoff)}
+- branch_evidence_digest:
+${renderBranchEvidenceDigest()}
+- structured_branch_results:
+${renderPlannerKanbanSummary(kanbanSnapshot)}
 - run_phase: ${runPhase || 'normal'}
 
 Loop guard:
 - Treat structured handoff fields as binding: preserve known good facts, focus on missing fields, and obey must_not_repeat unless you have a materially new strategy.
+- Treat branch_evidence_digest as the compact factual memory of this branch. Reuse it before issuing more search or fetch work.
+- Treat structured_branch_results as the only allowed branch-progress context for this planner step. Use it to reuse completed sibling work and avoid redoing covered ground.
 - Use the branch state above to decide the next step. Do not restart sibling work, re-open already-covered avenues without concrete reason, or pull downstream integration work into this branch unless this branch explicitly owns that integration.
 - ${isPlanStage ? 'PLAN stage rule: finish by returning one executable plan through planner_final.' : isExecuteStage ? 'EXECUTE stage rule: follow the approved plan sequentially. Use exactly one direct work tool at a time and revise the plan only when direct evidence forces you to.' : 'Normal mode rule: preserve the coordination graph already implied by execution_group and depends_on.'}
 
@@ -3868,16 +4110,25 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
       return `分支 ${branch.label} 已完成，但最终内容不可安全展示。`;
     };
 
-    const finalizeFromBranch = async (branch: BranchState, reason: string): Promise<string> => {
+    const finalizeFromBranch = async (branch: BranchState, reason: string, fallbackAnswer?: string): Promise<string> => {
       emitBranchTrace('thought', branch, `Forcing finalization for ${branch.id}: ${reason}`);
+      const activeCircuitReason = getActiveLlmCircuitReason();
+      if (activeCircuitReason) {
+        emitBranchTrace(
+          'observation',
+          branch,
+          `Skipping branch finalization model call because the LLM queue is in degraded mode: ${activeCircuitReason}`,
+        );
+        return this.sanitizeUserFacingAnswer(fallbackAnswer || '', buildSafeBranchDisplayFallback(branch))
+          || buildSafeBranchDisplayFallback(branch);
+      }
       const compressedTranscript = compressBranchTranscript(branch.transcript, { tailKeep: 6, maxSummaryChars: 2000 });
       const { text: _finalizeText } = await this.measure(perfEntries, `finalize_${branch.id}`, async () => {
-        await this.llmRpmLimiter.acquire();
-        return this.withTimeout(
+        return this.llmRpmLimiter.run(() => this.withTimeout(
           generateText({
             model: this.openai,
             temperature: this.responseTemperature,
-            maxTokens: 1600,
+            maxTokens: finalizeMaxTokens,
             messages: ([
               { role: 'system', content: `${systemPrompt}\nYou must now finish. Do not branch. Do not call tools. ${plainTextOnlyRule}` },
               ...recentConversationMessages,
@@ -3887,7 +4138,7 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
           }),
           this.agentLlmTimeoutMs,
           `finalize_${branch.id} llm`
-        );
+        ));
       });
       const fallback = buildSafeBranchDisplayFallback(branch);
       return this.sanitizeUserFacingAnswer(extractText(_finalizeText).trim(), fallback)
@@ -4254,6 +4505,7 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
 
     const synthesizeCompletedBranches = async (
       branches: BranchState[],
+      archivedBranchSummary = '',
       synthesisRetry = 0,
       maxSynthesisRetries = 2,
     ): Promise<string | SynthesisResult> => {
@@ -4379,29 +4631,36 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
         .join('\n\n---\n\n');
 
       emitTrace({ type: 'observation', content: `Synthesis model call started for ${frontierAttempts.length} frontier branch attempt(s).` });
+      const activeCircuitReason = getActiveLlmCircuitReason();
+      if (activeCircuitReason) {
+        emitTrace({
+          type: 'observation',
+          content: `Skipping synthesis model call because the LLM queue is in degraded mode: ${activeCircuitReason}. Falling back to deterministic branch merge.`,
+        });
+        return buildDeterministicSynthesisFallback(frontierAttempts.map((record) => record.branch));
+      }
       let _synthesisText: string;
       try {
         ({ text: _synthesisText } = await this.measure(perfEntries, 'branch_synthesis', async () => {
-          await this.llmRpmLimiter.acquire();
-          return this.withTimeout(
+          return this.llmRpmLimiter.run(() => this.withTimeout(
             generateText({
               model: this.openai,
               temperature: this.responseTemperature,
-              maxTokens: 1800,
+              maxTokens: synthesisMaxTokens,
               messages: [
                 {
                   role: 'system',
-                  content: `You are the synthesis stage for a branching ReAct agent. Merge completed branches into the best possible final answer. Prefer correctness and directness. If branches conflict, prefer the most directly evidenced result, then the latest successful remediation branch, then the answer with the fewest unsupported assumptions. Mention uncertainty only when meaningful conflict remains unresolved. If you mention saved node ids, use only ids explicitly listed in saved_nodes. Do not invent node ids. ${plainTextOnlyRule}${soulsGuidance ? `\n\n${soulsGuidance}` : ''}`,
+                  content: synthesisBasePrompt,
                 },
                 {
                   role: 'user',
-                  content: `User request:\n${input}\n\nShared context:\n${this.clipText(context || '(no shared context)', 4000)}\n\nGoal assessment:\n${goalAssessment.summaryText}\n\nCompleted branches:\n${branchSummary}`,
+                  content: `User request:\n${input}\n\nShared context:\n${this.clipText(context || '(no shared context)', 2400)}\n\nGoal assessment:\n${goalAssessment.summaryText}${archivedBranchSummary ? `\n\nArchived completed branch summaries:\n${this.clipText(archivedBranchSummary, 1800)}` : ''}\n\nCompleted branches:\n${branchSummary}`,
                 },
               ],
             }),
             this.agentLlmTimeoutMs,
             'branch_synthesis llm'
-          );
+          ));
         }));
       } catch (error: any) {
         emitTrace({
@@ -4442,11 +4701,11 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
         branchConcurrency: 1,
         maxTotalSteps: 60,
         transcriptBudgetChars: effectiveTranscriptBudgetChars,
-        modelLimit: ctxBudget.modelLimit,
-        committedTokens: ctxBudget.committedTokens,
-        planBranch: async ({ branch, planningTranscript }) => {
+        modelLimit: planningCtxBudget.modelLimit,
+        committedTokens: planningCtxBudget.committedTokens,
+        planBranch: async ({ branch, planningTranscript, kanbanSnapshot }) => {
         const plannerResult = await planWithSkillRouting(
-            buildPlannerMessages(branch as BranchState),
+            buildPlannerMessages(branch as BranchState, kanbanSnapshot),
             async (workingTranscript) => {
               return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
                 this.generatePlannerDecision({
@@ -4455,6 +4714,7 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
                   timeoutLabel: `planBranch_${branch.id} llm`,
                   temperature: this.plannerTemperature,
                   allowBranching: false,
+                  maxTokens: plannerMaxTokens,
                 })
               );
             }
@@ -4495,7 +4755,7 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
             success: !/^Error[:\s]|^ERROR:/.test(result),
           };
         },
-        finalizeBranch: async ({ branch, reason }) => finalizeFromBranch(branch as BranchState, reason),
+        finalizeBranch: async ({ branch, reason, fallbackAnswer }) => finalizeFromBranch(branch as BranchState, reason, fallbackAnswer),
         onTrace: (event) => {
           if (event.type === 'final') return;
           emitTrace({ type: event.type, content: event.content, metadata: event.metadata });
@@ -4514,11 +4774,11 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
       maxCompletedBranches: this.branchMaxCompleted,
       branchConcurrency: this.branchConcurrency,
       transcriptBudgetChars: effectiveTranscriptBudgetChars,
-      modelLimit: ctxBudget.modelLimit,
-      committedTokens: ctxBudget.committedTokens,
-      planBranch: async ({ branch, planningTranscript }) => {
+      modelLimit: planningCtxBudget.modelLimit,
+      committedTokens: planningCtxBudget.committedTokens,
+      planBranch: async ({ branch, planningTranscript, kanbanSnapshot }) => {
         const plannerResult = await planWithSkillRouting(
-          buildPlannerMessages(branch as BranchState),
+          buildPlannerMessages(branch as BranchState, kanbanSnapshot),
           async (workingTranscript) => {
             return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
               this.generatePlannerDecision({
@@ -4527,6 +4787,7 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
                 timeoutLabel: `planBranch_${branch.id} llm`,
                 temperature: this.plannerTemperature,
                 allowBranching: true,
+                maxTokens: plannerMaxTokens,
               })
             );
           }
@@ -4563,7 +4824,7 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
           success: !/^Error[:\s]|^ERROR:/.test(result),
         };
       },
-      finalizeBranch: async ({ branch, reason }) => finalizeFromBranch(branch as BranchState, reason),
+      finalizeBranch: async ({ branch, reason, fallbackAnswer }) => finalizeFromBranch(branch as BranchState, reason, fallbackAnswer),
       synthesizeFinal: async (inputData) => {
         completedBranchesForRun = inputData.branches;
         const branches = inputData.branches.map((branch) => ({
@@ -4588,6 +4849,7 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
         })) as BranchState[];
         return synthesizeCompletedBranches(
           branches,
+          inputData.archivedBranchSummary || '',
           inputData.synthesisRetry,
           inputData.maxSynthesisRetries,
         );

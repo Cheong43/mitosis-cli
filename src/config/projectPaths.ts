@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 function findNearestAncestor(startDir: string, predicate: (dir: string) => boolean): string | null {
@@ -33,7 +34,13 @@ function isCodeCliRepoRoot(dir: string): boolean {
 }
 
 export function resolveWorkspaceSkillRoots(projectRoot: string, codeCliRoot: string): string[] {
+  const userClaudeAgentsRoot = path.join(
+    process.env.HOME?.trim() || os.homedir(),
+    '.claude',
+    'agents',
+  );
   const roots = [
+    path.join(projectRoot, '.claude', 'agents'),
     path.join(projectRoot, 'skills'),
     path.join(projectRoot, '.github', 'skills'),
   ];
@@ -41,10 +48,12 @@ export function resolveWorkspaceSkillRoots(projectRoot: string, codeCliRoot: str
   const normalizedCodeCliRoot = path.resolve(codeCliRoot);
   if (normalizedCodeCliRoot !== normalizedProjectRoot) {
     roots.push(
+      path.join(codeCliRoot, '.claude', 'agents'),
       path.join(codeCliRoot, 'skills'),
       path.join(codeCliRoot, '.github', 'skills'),
     );
   }
+  roots.push(userClaudeAgentsRoot);
   return [...new Set(roots.map((root) => path.resolve(root)))];
 }
 

@@ -95,14 +95,12 @@ export const TOOLS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'web',
-      description: 'Search the web with budget/permission-aware citation results, or fetch a specific web page into a citation summary with highlights and a short preview. Use for external/current information not in the workspace.',
+      description: 'Fetch a specific web page into a citation summary with highlights and a short preview. Use for external/current information when you already have a trusted URL.',
       parameters: {
         type: 'object',
         properties: {
-          mode: { type: 'string', enum: ['search', 'fetch'], description: 'Whether to run a web search or fetch a page.' },
-          query: { type: 'string', description: 'Search query when mode=search.' },
+          mode: { type: 'string', enum: ['fetch'], description: 'Fetch a page by URL.' },
           url: { type: 'string', description: 'URL to fetch when mode=fetch.' },
-          limit: { type: 'number', description: 'Maximum number of search results.' },
           allowed_domains: {
             type: 'array',
             items: { type: 'string' },

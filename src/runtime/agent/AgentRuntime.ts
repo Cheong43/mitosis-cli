@@ -74,11 +74,13 @@ export interface BranchToolExecutionInput {
 export interface BranchFinalizeInput {
   branch: AgentBranchState;
   reason: string;
+  fallbackAnswer: string;
 }
 
 export interface BranchSynthesisInput {
   userMessage: string;
   priorTranscript: TranscriptMessage[];
+  archivedBranchSummary?: string;
   branches: Array<{
     id: string;
     label: string;
@@ -160,12 +162,6 @@ function formatPlannerToolDecisionMessage(toolCalls: PlannedToolCall[]): string 
 function formatToolObservationHeader(toolCall: PlannedToolCall, fallbackToolName: string): string {
   if (toolCall.name === 'web') {
     const mode = String(toolCall.arguments?.mode || '').trim();
-    if (mode === 'search') {
-      const query = String(toolCall.arguments?.query || '').trim();
-      if (query) {
-        return `TOOL OBSERVATION for web search query=${JSON.stringify(query)}:`;
-      }
-    }
     if (mode === 'fetch') {
       const url = String(toolCall.arguments?.url || '').trim();
       if (url) {
@@ -316,176 +312,208 @@ function extractArtifactPaths(toolCalls: PlannedToolCall[]): string[] {
   return dedupeNonEmpty(collected);
 }
 
-interface WebSearchRoundSummary {
-  step: number;
-  queries: string[];
-  explicitDomains: string[];
-  resultDomains: string[];
+interface ChildPlanValidationResult {
+  valid: boolean;
+  normalizedBranches: PlannedBranch[];
+  errors: string[];
 }
 
-function normalizeHost(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, '')
-    .replace(/^www\./, '')
-    .replace(/\/.*$/, '');
-}
-
-function extractHostFromUrl(value: string): string {
-  try {
-    return normalizeHost(new URL(value).hostname);
-  } catch {
-    return '';
-  }
-}
-
-function extractExplicitSearchDomains(query: string): string[] {
-  const matches = query.toLowerCase().matchAll(/\bsite:([a-z0-9.-]+\.[a-z]{2,})\b/g);
-  return dedupeNonEmpty(Array.from(matches, (match) => normalizeHost(match[1] || '')));
-}
-
-function tokenizeSearchQuery(query: string): string[] {
-  return dedupeNonEmpty(
-    query
-      .toLowerCase()
-      .replace(/\bsite:[^\s]+/g, ' ')
-      .match(/[a-z0-9]{2,}|[\u4e00-\u9fff]{2,}/g) || [],
-  );
-}
-
-function querySimilarity(left: string, right: string): number {
-  const normalizedLeft = previewText(left.toLowerCase(), 400);
-  const normalizedRight = previewText(right.toLowerCase(), 400);
-  if (!normalizedLeft || !normalizedRight) {
-    return 0;
-  }
-  if (normalizedLeft === normalizedRight) {
-    return 1;
-  }
-  if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) {
-    return 0.92;
+function validateChildPlanSet(branches: PlannedBranch[], maxBranchWidth: number): ChildPlanValidationResult {
+  const errors: string[] = [];
+  const trimmedBranches = branches.slice(0, maxBranchWidth);
+  if (branches.length > maxBranchWidth) {
+    errors.push(`planner returned ${branches.length} branches, exceeding maxBranchWidth=${maxBranchWidth}`);
   }
 
-  const leftTokens = new Set(tokenizeSearchQuery(normalizedLeft));
-  const rightTokens = new Set(tokenizeSearchQuery(normalizedRight));
-  if (leftTokens.size === 0 || rightTokens.size === 0) {
-    return 0;
-  }
+  const labelToIndex = new Map<string, number>();
+  const normalizedBranches = trimmedBranches.map((branch) => ({
+    ...branch,
+    executionGroup: normalizeExecutionGroup(branch.executionGroup, 1),
+    dependsOn: normalizeDependencyLabels(branch.dependsOn),
+  }));
 
-  let intersection = 0;
-  for (const token of leftTokens) {
-    if (rightTokens.has(token)) {
-      intersection += 1;
+  normalizedBranches.forEach((branch, index) => {
+    const normalizedLabel = String(branch.label || '').trim();
+    if (!normalizedLabel) {
+      errors.push(`branch[${index}] is missing a label`);
+      return;
     }
-  }
-  const union = new Set([...leftTokens, ...rightTokens]).size;
-  return union > 0 ? intersection / union : 0;
-}
-
-function summarizeWebSearchRound(toolCalls: PlannedToolCall[], step: number): WebSearchRoundSummary | null {
-  if (toolCalls.length === 0) {
-    return null;
-  }
-
-  const queries: string[] = [];
-  const explicitDomains: string[] = [];
-  for (const toolCall of toolCalls) {
-    if (toolCall.name !== 'web' || String(toolCall.arguments?.mode || '').trim() !== 'search') {
-      return null;
+    if (labelToIndex.has(normalizedLabel)) {
+      errors.push(`duplicate sibling branch label: ${normalizedLabel}`);
+      return;
     }
-    const query = String(toolCall.arguments?.query || '').trim();
-    if (!query) {
-      return null;
+    labelToIndex.set(normalizedLabel, index);
+  });
+
+  const outgoing = Array.from({ length: normalizedBranches.length }, () => [] as number[]);
+  const indegree = Array.from({ length: normalizedBranches.length }, () => 0);
+
+  normalizedBranches.forEach((branch, index) => {
+    const dependencies = normalizeDependencyLabels(branch.dependsOn);
+    dependencies.forEach((dependencyLabel) => {
+      if (dependencyLabel === branch.label) {
+        errors.push(`branch "${branch.label}" cannot depend on itself`);
+        return;
+      }
+      const dependencyIndex = labelToIndex.get(dependencyLabel);
+      if (dependencyIndex === undefined) {
+        errors.push(`branch "${branch.label}" depends_on unknown sibling "${dependencyLabel}"`);
+        return;
+      }
+      const dependencyGroup = normalizedBranches[dependencyIndex]?.executionGroup ?? 1;
+      const branchGroup = branch.executionGroup ?? 1;
+      if (dependencyGroup > branchGroup) {
+        errors.push(`branch "${branch.label}" depends_on later execution_group sibling "${dependencyLabel}"`);
+        return;
+      }
+      outgoing[dependencyIndex].push(index);
+      indegree[index] += 1;
+    });
+  });
+
+  const ready: number[] = [];
+  indegree.forEach((count, index) => {
+    if (count === 0) {
+      ready.push(index);
     }
-    queries.push(query);
-    explicitDomains.push(...extractExplicitSearchDomains(query));
+  });
+  let processed = 0;
+  while (ready.length > 0) {
+    const current = ready.shift()!;
+    processed += 1;
+    outgoing[current].forEach((target) => {
+      indegree[target] -= 1;
+      if (indegree[target] === 0) {
+        ready.push(target);
+      }
+    });
+  }
+
+  if (processed < normalizedBranches.length) {
+    errors.push('planner returned cyclic sibling depends_on graph');
   }
 
   return {
-    step,
-    queries,
-    explicitDomains: dedupeNonEmpty(explicitDomains),
-    resultDomains: [],
+    valid: errors.length === 0,
+    normalizedBranches,
+    errors: dedupeNonEmpty(errors),
   };
 }
 
-function enrichWebSearchRoundWithObservations(
-  summary: WebSearchRoundSummary | null,
-  observations: ToolObservation[],
-): WebSearchRoundSummary | null {
-  if (!summary) {
-    return null;
+function isMutatingToolCall(toolCall: PlannedToolCall): boolean {
+  return toolCall.name === 'edit' || toolCall.name === 'bash';
+}
+
+function buildArchivedBranchSummary(branches: AgentBranchState[]): string {
+  const lines = branches
+    .map((branch) => {
+      const summary = previewText(
+        branch.completionSummary
+        || branch.finalAnswer
+        || branch.outcomeReason
+        || branch.goal,
+        220,
+      );
+      return [
+        `[${branch.id}] ${branch.label}`,
+        branch.outcome ? `outcome=${branch.outcome}` : '',
+        branch.disposition ? `disposition=${branch.disposition}` : '',
+        summary ? `summary=${summary}` : '',
+      ].filter(Boolean).join(' | ');
+    })
+    .filter(Boolean);
+  return lines.join('\n');
+}
+
+function selectBranchesForSynthesis(
+  branches: AgentBranchState[],
+  maxCompletedBranches: number,
+): {
+  selectedBranches: AgentBranchState[];
+  archivedSummary: string;
+} {
+  if (branches.length <= maxCompletedBranches) {
+    return {
+      selectedBranches: branches,
+      archivedSummary: '',
+    };
   }
 
-  const resultDomains: string[] = [];
-  for (const observation of observations) {
-    if (observation.toolName !== 'web') {
-      continue;
-    }
-    try {
-      const parsed = JSON.parse(String(observation.result || ''));
-      if (parsed?.kind !== 'web_search' || !Array.isArray(parsed.results)) {
-        continue;
+  const frontier = branches.filter((branch) => !branches.some((other) =>
+    other !== branch
+    && Array.isArray(other.ancestorBranchIds)
+    && other.ancestorBranchIds.includes(branch.id),
+  ));
+
+  const selected = new Map<string, AgentBranchState>();
+  if (frontier.length >= maxCompletedBranches) {
+    const prioritizedFrontier = [...frontier].sort((left, right) => {
+      const leftHealthy = left.outcome !== 'failed'
+        && left.outcome !== 'partial'
+        && left.disposition !== 'planner_error'
+        && left.finalizationMode !== 'planner_fallback'
+        && typeof left.finalAnswer === 'string'
+        && left.finalAnswer.length > 0;
+      const rightHealthy = right.outcome !== 'failed'
+        && right.outcome !== 'partial'
+        && right.disposition !== 'planner_error'
+        && right.finalizationMode !== 'planner_fallback'
+        && typeof right.finalAnswer === 'string'
+        && right.finalAnswer.length > 0;
+      if (leftHealthy !== rightHealthy) {
+        return leftHealthy ? -1 : 1;
       }
-      for (const result of parsed.results) {
-        if (typeof result?.url === 'string') {
-          const host = extractHostFromUrl(result.url);
-          if (host) {
-            resultDomains.push(host);
-          }
-        }
-      }
-    } catch {
-      // Ignore malformed observations and keep the query-only summary.
+      return branches.indexOf(right) - branches.indexOf(left);
+    });
+    const trimmedFrontier = prioritizedFrontier.slice(0, maxCompletedBranches);
+    trimmedFrontier.forEach((branch) => {
+      selected.set(branch.id, branch);
+    });
+    const archived = branches.filter((branch) => !selected.has(branch.id));
+    return {
+      selectedBranches: branches.filter((branch) => selected.has(branch.id)),
+      archivedSummary: archived.length > 0 ? buildArchivedBranchSummary(archived) : '',
+    };
+  }
+  frontier.forEach((branch) => {
+    selected.set(branch.id, branch);
+  });
+
+  const successfulAncestors = [...branches]
+    .reverse()
+    .filter((branch) =>
+      !selected.has(branch.id)
+      && branch.outcome === 'success'
+      && frontier.some((candidate) => candidate.ancestorBranchIds?.includes(branch.id)),
+    );
+
+  for (const branch of successfulAncestors) {
+    if (selected.size >= maxCompletedBranches) {
+      break;
     }
+    selected.set(branch.id, branch);
   }
 
+  const recentResolved = [...branches]
+    .reverse()
+    .filter((branch) =>
+      !selected.has(branch.id)
+      && (branch.outcome === 'success' || branch.disposition === 'resolved'),
+    );
+
+  for (const branch of recentResolved) {
+    if (selected.size >= maxCompletedBranches) {
+      break;
+    }
+    selected.set(branch.id, branch);
+  }
+
+  const orderedSelected = branches.filter((branch) => selected.has(branch.id));
+  const archived = branches.filter((branch) => !selected.has(branch.id));
   return {
-    ...summary,
-    resultDomains: dedupeNonEmpty(resultDomains),
+    selectedBranches: orderedSelected,
+    archivedSummary: archived.length > 0 ? buildArchivedBranchSummary(archived) : '',
   };
-}
-
-function hasMaterialSearchDomainShift(
-  current: WebSearchRoundSummary,
-  priorRounds: WebSearchRoundSummary[],
-): boolean {
-  if (current.explicitDomains.length === 0) {
-    return false;
-  }
-  const priorDomains = new Set(
-    priorRounds.flatMap((round) => [...round.explicitDomains, ...round.resultDomains]).map((domain) => normalizeHost(domain)),
-  );
-  return current.explicitDomains.some((domain) => !priorDomains.has(normalizeHost(domain)));
-}
-
-function isNearDuplicateSearchRound(
-  current: WebSearchRoundSummary,
-  priorRound: WebSearchRoundSummary,
-): boolean {
-  if (priorRound.queries.length === 0 || current.queries.length === 0) {
-    return false;
-  }
-  return current.queries.every((query) =>
-    priorRound.queries.some((priorQuery) => querySimilarity(query, priorQuery) >= 0.6));
-}
-
-function clearPendingProviderToolReplay(branch: AgentBranchState): void {
-  const candidate = branch as AgentBranchState & {
-    pendingAnthropicAssistantContent?: unknown;
-    pendingAnthropicToolUseIds?: unknown;
-    pendingOpenAIAssistantMessage?: unknown;
-  };
-  if ('pendingAnthropicAssistantContent' in candidate) {
-    candidate.pendingAnthropicAssistantContent = null;
-  }
-  if ('pendingAnthropicToolUseIds' in candidate) {
-    candidate.pendingAnthropicToolUseIds = [];
-  }
-  if ('pendingOpenAIAssistantMessage' in candidate) {
-    candidate.pendingOpenAIAssistantMessage = null;
-  }
 }
 
 /**
@@ -579,10 +607,11 @@ export class AgentRuntime {
 
     const queue: AgentBranchState[] = [rootBranch];
     const completed: AgentBranchState[] = [];
-    const webSearchRoundHistory = new Map<string, WebSearchRoundSummary[]>();
     const siblingFamilies = new Map<string, { rootId: string; executionGroup: number }>();
     let lastTouchedBranch: AgentBranchState | null = rootBranch;
     let totalLoopSteps = 0;
+    let activeMutatingBranchId: string | null = null;
+    const mutationWaitQueue: Array<() => void> = [];
     const totalLoopBudget = this.maxTotalSteps
       ?? Math.max(this.maxSteps, this.maxSteps * this.maxBranchWidth * (this.maxBranchDepth + 1));
     const kanbanCards = new Map<string, BranchKanbanCard>();
@@ -756,7 +785,7 @@ export class AgentRuntime {
         return fallbackAnswer;
       }
       try {
-        const finalized = await this.finalizeBranch({ branch, reason });
+        const finalized = await this.finalizeBranch({ branch, reason, fallbackAnswer });
         return finalized?.trim() || fallbackAnswer;
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
@@ -789,8 +818,13 @@ export class AgentRuntime {
       summaryFallback: string,
       blockers?: string[],
     ) => {
+      const terminalStatus: BranchKanbanStatus = (
+        branch.disposition === 'planner_error' || branch.finalizationMode === 'planner_fallback'
+      )
+        ? 'error'
+        : 'completed';
       upsertKanbanCard(branch, {
-        status: 'completed',
+        status: terminalStatus,
         outcome: branch.outcome,
         disposition: branch.disposition,
         summary: previewText(
@@ -860,6 +894,37 @@ export class AgentRuntime {
       return renderObservation(toolCall, execResult);
     };
 
+    const acquireMutatingBranchLock = async (branch: AgentBranchState) => {
+      if (activeMutatingBranchId === null || activeMutatingBranchId === branch.id) {
+        activeMutatingBranchId = branch.id;
+        return () => {
+          if (activeMutatingBranchId === branch.id) {
+            activeMutatingBranchId = null;
+          }
+          const next = mutationWaitQueue.shift();
+          next?.();
+        };
+      }
+
+      emitBranchTrace(
+        'thought',
+        branch,
+        `Waiting for mutating branch lock; ${activeMutatingBranchId} is currently executing workspace-changing tools.`,
+      );
+      await new Promise<void>((resolve) => {
+        mutationWaitQueue.push(resolve);
+      });
+      activeMutatingBranchId = branch.id;
+      emitBranchTrace('thought', branch, 'Acquired mutating branch lock.');
+      return () => {
+        if (activeMutatingBranchId === branch.id) {
+          activeMutatingBranchId = null;
+        }
+        const next = mutationWaitQueue.shift();
+        next?.();
+      };
+    };
+
     const emitObservationTrace = (branch: AgentBranchState, observation: ToolObservation) => {
       emitBranchTrace('observation', branch, observation.result, { toolName: observation.toolName });
     };
@@ -868,76 +933,27 @@ export class AgentRuntime {
       toolCalls.length > 1
       && toolCalls.every((toolCall) => AgentRuntime.PARALLEL_SAFE_TOOL_NAMES.has(toolCall.name));
 
-    const noteExecutedToolRound = (
-      branch: AgentBranchState,
-      toolCalls: PlannedToolCall[],
-      observations: ToolObservation[],
-    ) => {
-      const summary = enrichWebSearchRoundWithObservations(
-        summarizeWebSearchRound(toolCalls, branch.steps),
-        observations,
-      );
-      if (!summary) {
-        webSearchRoundHistory.delete(branch.id);
-        return;
-      }
-      const prior = webSearchRoundHistory.get(branch.id) || [];
-      webSearchRoundHistory.set(branch.id, [...prior, summary].slice(-4));
-    };
-
-    const buildRepeatedSearchLoopMessage = (
-      branch: AgentBranchState,
-      currentRound: WebSearchRoundSummary,
-      priorRounds: WebSearchRoundSummary[],
-    ) => {
-      const recentQueries = dedupeNonEmpty(priorRounds.flatMap((round) => round.queries)).slice(-4);
-      const recentDomains = dedupeNonEmpty(priorRounds.flatMap((round) => [...round.explicitDomains, ...round.resultDomains])).slice(0, 6);
-      const lines = [
-        `Blocked near-duplicate web search loop in branch "${branch.label}".`,
-        `You have already spent ${priorRounds.length} consecutive round(s) on near-duplicate web searches.`,
-        recentQueries.length > 0 ? `Recent queries: ${recentQueries.map((query) => JSON.stringify(query)).join(', ')}` : '',
-        recentDomains.length > 0 ? `Observed domains so far: ${recentDomains.join(', ')}` : '',
-        `The newly proposed search queries are still too similar: ${currentRound.queries.map((query) => JSON.stringify(query)).join(', ')}`,
-        'Do not continue the same search loop.',
-        'Your next step must do one of these instead: fetch a promising URL you already found, materially change domains/source type/language/date scope, or finalize with the best available evidence and explicit uncertainty.',
-      ].filter(Boolean);
-      return lines.join('\n');
-    };
-
-    const shouldBlockRepeatedSearchLoop = (
-      branch: AgentBranchState,
-      toolCalls: PlannedToolCall[],
-    ): string | null => {
-      const currentRound = summarizeWebSearchRound(toolCalls, branch.steps);
-      if (!currentRound) {
-        return null;
-      }
-      const history = webSearchRoundHistory.get(branch.id) || [];
-      if (history.length < 2) {
-        return null;
-      }
-      const priorRounds = history.slice(-2);
-      if (!priorRounds.every((round) => isNearDuplicateSearchRound(currentRound, round))) {
-        return null;
-      }
-      if (hasMaterialSearchDomainShift(currentRound, priorRounds)) {
-        return null;
-      }
-      return buildRepeatedSearchLoopMessage(branch, currentRound, priorRounds);
-    };
-
     const executeToolStep = async (branch: AgentBranchState, toolCalls: PlannedToolCall[]) => {
+      const needsMutatingLock = toolCalls.some((toolCall) => isMutatingToolCall(toolCall));
+      const releaseMutatingLock = needsMutatingLock
+        ? await acquireMutatingBranchLock(branch)
+        : null;
+
       let observations: ToolObservation[];
-      if (canRunToolCallsConcurrently(toolCalls)) {
-        observations = await Promise.all(
-          toolCalls.map((toolCall) => executeSingleToolCall(branch, toolCall)),
-        );
-      } else {
-        observations = [];
-        for (const toolCall of toolCalls) {
-          const observation = await executeSingleToolCall(branch, toolCall);
-          observations.push(observation);
+      try {
+        if (canRunToolCallsConcurrently(toolCalls)) {
+          observations = await Promise.all(
+            toolCalls.map((toolCall) => executeSingleToolCall(branch, toolCall)),
+          );
+        } else {
+          observations = [];
+          for (const toolCall of toolCalls) {
+            const observation = await executeSingleToolCall(branch, toolCall);
+            observations.push(observation);
+          }
         }
+      } finally {
+        releaseMutatingLock?.();
       }
 
       const customTranscript = this.buildToolTranscript?.({ branch, toolCalls, observations });
@@ -971,7 +987,6 @@ export class AgentRuntime {
           .map((observation) => `${observation.toolName}: ${previewText(observation.result, 120)}`),
         artifacts: extractArtifactPaths(toolCalls),
       });
-      noteExecutedToolRound(branch, toolCalls, observations);
 
       if (shouldRuntimeTraceTool()) {
         observations.forEach((observation) => emitObservationTrace(branch, observation));
@@ -1008,7 +1023,7 @@ export class AgentRuntime {
           },
           {
             role: 'user',
-            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nExecution group: ${executionGroup}\nDepends on sibling labels: ${dependsOn.length ? dependsOn.join(', ') : 'none'}\nThis branch owns only its local sub-problem.\nSibling branches in the same execution group may run in parallel. Higher execution groups wait until all lower groups under the same parent finish.\nIf depends_on is set, this branch should not start until those sibling labels have already finished.\nTreat execution_group and depends_on as binding coordination constraints, not hints.\nOnly do work that can make useful progress within this branch's scope. Do not perform downstream integration early if that integration mainly depends on sibling outputs that are still being produced elsewhere.\nRe-branch only if this branch still contains multiple genuinely independent substreams with low coordination risk. Do not branch again by default.\nDo not use multiple near-duplicate web searches as a substitute for branching.\nIf you emit multiple web searches in one response, vary the actual query terms and search dimensions, not just punctuation or word order. Change at least two of: keywords, aliases, domains, dates, language, or source type.\nYou may use tool calls, branch further if the goal truly benefits from independent sub-work, or return a final answer. Avoid repeating sibling work.${structuredHandoffBlock ? `\n\nStructured remediation handoff:\n${structuredHandoffBlock}` : ''}${kanbanSyncMessage ? `\n\n${kanbanSyncMessage}` : ''}`,
+            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nExecution group: ${executionGroup}\nDepends on sibling labels: ${dependsOn.length ? dependsOn.join(', ') : 'none'}\nThis branch owns only its local sub-problem.\nSibling branches in the same execution group may run in parallel. Higher execution groups wait until all lower groups under the same parent finish.\nIf depends_on is set, this branch should not start until those sibling labels have already finished.\nTreat execution_group and depends_on as binding coordination constraints, not hints.\nOnly do work that can make useful progress within this branch's scope. Do not perform downstream integration early if that integration mainly depends on sibling outputs that are still being produced elsewhere.\nRe-branch only if this branch still contains multiple genuinely independent substreams with low coordination risk. Do not branch again by default.\nUse web only in mode=fetch and only when you already have a trustworthy URL.\nYou may use tool calls, branch further if the goal truly benefits from independent sub-work, or return a final answer. Avoid repeating sibling work.${structuredHandoffBlock ? `\n\nStructured remediation handoff:\n${structuredHandoffBlock}` : ''}${kanbanSyncMessage ? `\n\n${kanbanSyncMessage}` : ''}`,
           },
         ];
 
@@ -1120,10 +1135,13 @@ export class AgentRuntime {
         if (agentStep.kind === 'final') {
           const needsExplicitFinalize = agentStep.finalizationMode === 'planner_fallback';
           if (needsExplicitFinalize) {
+            const fallbackFinalizeReason = agentStep.outcomeReason
+              || agentStep.completionSummary
+              || 'planner format fallback after schema repair retries';
             emitBranchTrace('thought', branch, `Planner fallback reply is not treated as a real final step; explicitly finalizing ${branch.id}.`);
             branch.finalAnswer = await finalizeBranchSafely(
               branch,
-              'planner format fallback after schema repair retries',
+              fallbackFinalizeReason,
               agentStep.content,
             );
             branch.outcome = branch.outcome ?? 'partial';
@@ -1154,26 +1172,6 @@ export class AgentRuntime {
               role: 'user',
               content: 'You chose a tool step but did not include any usable tool calls. Continue with at least one tool call or finish this branch.',
             });
-            continue;
-          }
-          const repeatedSearchLoopMessage = shouldBlockRepeatedSearchLoop(branch, toolCalls);
-          if (repeatedSearchLoopMessage) {
-            clearPendingProviderToolReplay(branch);
-            branch.transcript.push({
-              role: 'user',
-              content: repeatedSearchLoopMessage,
-            });
-            upsertKanbanCard(branch, {
-              status: 'active',
-              summary: 'Blocked near-duplicate web search loop; replanning required.',
-              blockers: ['repeated near-duplicate web search loop'],
-            });
-            emitBranchTrace(
-              'observation',
-              branch,
-              'Blocked near-duplicate web search loop; next step must fetch, materially change domains, or finalize.',
-              { toolNames: toolCalls.map((toolCall) => toolCall.name) },
-            );
             continue;
           }
           await executeToolStep(branch, toolCalls);
@@ -1218,13 +1216,32 @@ export class AgentRuntime {
           continue;
         }
 
-        const childBranches = buildChildBranches(branch, childPlans);
+        const validatedChildPlanSet = validateChildPlanSet(childPlans, this.maxBranchWidth);
+        if (!validatedChildPlanSet.valid) {
+          branch.transcript.push({
+            role: 'user',
+            content: `Branching was rejected because the child coordination graph was invalid:\n- ${validatedChildPlanSet.errors.join('\n- ')}\nContinue this branch without splitting until you can produce a valid sibling graph.`,
+          });
+          upsertKanbanCard(branch, {
+            status: 'active',
+            summary: 'Rejected invalid child branch graph; replanning required.',
+            blockers: validatedChildPlanSet.errors,
+          });
+          emitBranchTrace(
+            'observation',
+            branch,
+            `Rejected invalid child branch graph: ${validatedChildPlanSet.errors.join(' | ')}`,
+          );
+          continue;
+        }
+
+        const childBranches = buildChildBranches(branch, validatedChildPlanSet.normalizedBranches);
         upsertKanbanCard(branch, {
           status: 'completed',
-          summary: `Delegated to ${childPlans.length} child branch${childPlans.length === 1 ? '' : 'es'}.`,
+          summary: `Delegated to ${validatedChildPlanSet.normalizedBranches.length} child branch${validatedChildPlanSet.normalizedBranches.length === 1 ? '' : 'es'}.`,
           blockers: [],
         });
-        emitBranchTrace('action', branch, `Spawning ${childPlans.length} child branches.`, { childCount: childPlans.length });
+        emitBranchTrace('action', branch, `Spawning ${validatedChildPlanSet.normalizedBranches.length} child branches.`, { childCount: validatedChildPlanSet.normalizedBranches.length });
         for (const childBranch of childBranches) {
           this.emit({
             type: 'observation',
@@ -1396,16 +1413,26 @@ export class AgentRuntime {
     // needed, spawn them and re-enter the scheduling loop.
     let synthesisRetry = 0;
     while (true) {
-      const finalBranches = completed
+      const completedForSynthesis = completed
         .filter((branch) => typeof branch.finalAnswer === 'string' && branch.finalAnswer.length > 0);
+      const {
+        selectedBranches: finalBranches,
+        archivedSummary: archivedBranchSummary,
+      } = selectBranchesForSynthesis(completedForSynthesis, this.maxCompletedBranches);
       this.emit({
         type: 'thought',
-        content: `Starting synthesis attempt ${synthesisRetry + 1}/${this.maxSynthesisRetries + 1} with ${finalBranches.length} completed branch(es).`,
+        content: `Starting synthesis attempt ${synthesisRetry + 1}/${this.maxSynthesisRetries + 1} with ${finalBranches.length} selected branch(es) out of ${completedForSynthesis.length} completed branch(es).`,
       });
+      if (archivedBranchSummary) {
+        this.emit({
+          type: 'observation',
+          content: `Archived ${completedForSynthesis.length - finalBranches.length} completed branch(es) into compact synthesis summary to stay within maxCompletedBranches=${this.maxCompletedBranches}.`,
+        });
+      }
       let synthesisResult: SynthesisResult;
       try {
         synthesisResult = await this.synthesize(
-          userMessage, priorTranscript, finalBranches, synthesisRetry,
+          userMessage, priorTranscript, finalBranches, synthesisRetry, archivedBranchSummary,
         );
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1488,6 +1515,7 @@ export class AgentRuntime {
     priorTranscript: TranscriptMessage[],
     branches: AgentBranchState[],
     synthesisRetry: number,
+    archivedBranchSummary = '',
   ): Promise<SynthesisResult> {
     if (branches.length === 0) {
       return { done: true, answer: 'Maximum steps reached without a final answer.' };
@@ -1497,6 +1525,7 @@ export class AgentRuntime {
       const hookResult = await this.synthesizeFinal({
         userMessage,
         priorTranscript,
+        archivedBranchSummary,
         branches: branches.map((branch) => ({
           id: branch.id,
           label: branch.label,

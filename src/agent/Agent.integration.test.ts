@@ -18,6 +18,19 @@ function createTempProjectRoot(prefix: string): string {
   return dir;
 }
 
+function promptIncludesBranchLabel(prompt: string, label: string): boolean {
+  return prompt.includes(`- label: ${label}`) || prompt.includes(`child branch "${label}"`);
+}
+
+function promptIncludesBranchId(prompt: string, branchId: string): boolean {
+  return prompt.includes(`- branch_id: ${branchId}`) || prompt.includes(`branch_id: ${branchId}`);
+}
+
+function promptIncludesToolOutcome(prompt: string, toolName: string): boolean {
+  return prompt.includes(`last_tool_outcome: TOOL OBSERVATION for ${toolName}:`)
+    || prompt.includes(`TOOL OBSERVATION for ${toolName}:`);
+}
+
 function installAgentTestDoubles(agent: Agent, answerForRequest: (request: string) => Promise<string> | string): void {
   const anyAgent = agent as any;
   anyAgent.retrieveRelevantContext = async () => ({
@@ -208,7 +221,7 @@ test('synthesis rebranch only retries unresolved latest attempts and stops after
         ? messages.map((message) => String(message?.content || '')).join('\n\n')
         : '';
 
-      if (joined.includes('child branch "fix: Needs fix"')) {
+      if (promptIncludesBranchLabel(joined, 'fix: Needs fix')) {
         return {
           decision: {
             kind: 'final',
@@ -220,7 +233,7 @@ test('synthesis rebranch only retries unresolved latest attempts and stops after
         };
       }
 
-      if (joined.includes('child branch "Stable path"')) {
+      if (promptIncludesBranchLabel(joined, 'Stable path')) {
         return {
           decision: {
             kind: 'final',
@@ -232,7 +245,7 @@ test('synthesis rebranch only retries unresolved latest attempts and stops after
         };
       }
 
-      if (joined.includes('child branch "Needs fix"')) {
+      if (promptIncludesBranchLabel(joined, 'Needs fix')) {
         return {
           decision: {
             kind: 'final',
@@ -308,7 +321,7 @@ test('synthesis retries only the latest leaf task when a remediation branch fans
         ? messages.map((message) => String(message?.content || '')).join('\n\n')
         : '';
 
-      if (joined.includes('child branch "fix: Narrow child"')) {
+      if (promptIncludesBranchLabel(joined, 'fix: Narrow child')) {
         return {
           decision: {
             kind: 'final',
@@ -321,7 +334,7 @@ test('synthesis retries only the latest leaf task when a remediation branch fans
         };
       }
 
-      if (joined.includes('child branch "Narrow child"')) {
+      if (promptIncludesBranchLabel(joined, 'Narrow child')) {
         return {
           decision: {
             kind: 'final',
@@ -335,7 +348,7 @@ test('synthesis retries only the latest leaf task when a remediation branch fans
         };
       }
 
-      if (joined.includes('child branch "Covered child"')) {
+      if (promptIncludesBranchLabel(joined, 'Covered child')) {
         return {
           decision: {
             kind: 'final',
@@ -348,7 +361,7 @@ test('synthesis retries only the latest leaf task when a remediation branch fans
         };
       }
 
-      if (joined.includes('child branch "fix: Needs broad fix"')) {
+      if (promptIncludesBranchLabel(joined, 'fix: Needs broad fix')) {
         return {
           decision: {
             kind: 'branch',
@@ -361,7 +374,7 @@ test('synthesis retries only the latest leaf task when a remediation branch fans
         };
       }
 
-      if (joined.includes('child branch "Stable path"')) {
+      if (promptIncludesBranchLabel(joined, 'Stable path')) {
         return {
           decision: {
             kind: 'final',
@@ -374,7 +387,7 @@ test('synthesis retries only the latest leaf task when a remediation branch fans
         };
       }
 
-      if (joined.includes('child branch "Needs broad fix"')) {
+      if (promptIncludesBranchLabel(joined, 'Needs broad fix')) {
         return {
           decision: {
             kind: 'final',
@@ -460,7 +473,7 @@ test('synthesis keeps replanning unmet work from current progress across retries
         ? messages.map((message) => String(message?.content || '')).join('\n\n')
         : '';
 
-      if (joined.includes('branch_id: R2.1') && joined.includes('child branch "fix: Needs access workaround"')) {
+      if (promptIncludesBranchId(joined, 'R2.1') && promptIncludesBranchLabel(joined, 'fix: Needs access workaround')) {
         return {
           decision: {
             kind: 'final',
@@ -473,7 +486,7 @@ test('synthesis keeps replanning unmet work from current progress across retries
         };
       }
 
-      if (joined.includes('branch_id: R1.1') && joined.includes('child branch "fix: Needs access workaround"')) {
+      if (promptIncludesBranchId(joined, 'R1.1') && promptIncludesBranchLabel(joined, 'fix: Needs access workaround')) {
         return {
           decision: {
             kind: 'final',
@@ -487,7 +500,7 @@ test('synthesis keeps replanning unmet work from current progress across retries
         };
       }
 
-      if (joined.includes('child branch "Stable path"')) {
+      if (promptIncludesBranchLabel(joined, 'Stable path')) {
         return {
           decision: {
             kind: 'final',
@@ -500,7 +513,7 @@ test('synthesis keeps replanning unmet work from current progress across retries
         };
       }
 
-      if (joined.includes('child branch "Needs access workaround"')) {
+      if (promptIncludesBranchLabel(joined, 'Needs access workaround')) {
         return {
           decision: {
             kind: 'final',
@@ -583,7 +596,7 @@ test('synthesis skips remediation rebranch when REACT_REBRANCH_ENABLED is disabl
       ? messages.map((message) => String(message?.content || '')).join('\n\n')
       : '';
 
-    if (joined.includes('child branch "Stable path"')) {
+    if (promptIncludesBranchLabel(joined, 'Stable path')) {
       return {
         decision: {
           kind: 'final',
@@ -596,7 +609,7 @@ test('synthesis skips remediation rebranch when REACT_REBRANCH_ENABLED is disabl
       };
     }
 
-    if (joined.includes('child branch "Needs fix"')) {
+    if (promptIncludesBranchLabel(joined, 'Needs fix')) {
       return {
         decision: {
           kind: 'final',
@@ -713,6 +726,62 @@ test('planner timeout enters planner fallback finalization instead of returning 
   agent.stop();
 });
 
+test('planner usage-limit errors open degraded mode and finish without hanging remaining model steps', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-usage-limit-fallback-');
+  fs.writeFileSync(path.join(projectRoot, 'evidence.txt'), 'Observed brand facts already gathered.');
+
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  let plannerCalls = 0;
+
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+
+  anyAgent.generatePlannerDecision = async () => {
+    plannerCalls += 1;
+    if (plannerCalls === 1) {
+      return {
+        decision: {
+          kind: 'tool',
+          thought: 'Read local evidence first.',
+          tool_calls: [
+            {
+              name: 'read',
+              arguments: { path: path.join(projectRoot, 'evidence.txt'), target: 'workspace' },
+              goal: 'Inspect gathered evidence',
+            },
+          ],
+        },
+      };
+    }
+    throw new Error('Failed after 3 attempts. Last error: usage limit exceeded (2056)');
+  };
+
+  const traces: TraceEvent[] = [];
+  const answer = await agent.run('use gathered evidence and then hit provider usage limit', (event) => {
+    traces.push(event);
+  }, {
+    conversationId: 'thread-usage-limit-finalize',
+  });
+
+  assert.equal(answer, 'LLM provider limit reached; finalize from gathered evidence.');
+  assert.ok(
+    traces.some((event) => event.content.includes('LLM request queue entered degraded mode after provider limit error')),
+  );
+  assert.ok(
+    traces.some((event) => event.content.includes('Planner hit a provider usage/rate limit')),
+  );
+  assert.ok(
+    traces.some((event) => event.content.includes('Skipping branch finalization model call because the LLM queue is in degraded mode')),
+  );
+
+  agent.stop();
+});
+
 test('planner prompt keeps branching guidance principle-based without root coercion', async () => {
   const projectRoot = createTempProjectRoot('mempedia-agent-branch-guidance-');
   const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
@@ -747,19 +816,136 @@ test('planner prompt keeps branching guidance principle-based without root coerc
   assert.match(capturedPrompt, /Raise the priority of execution-structure planning over immediate tool use/i);
   assert.match(capturedPrompt, /Treat branching as parallel task planning/i);
   assert.match(capturedPrompt, /call read\/search\/edit\/bash\/web directly for work/i);
-  assert.match(capturedPrompt, /Prefer materially diverse search strategies/i);
+  assert.match(capturedPrompt, /Skill: brave-search/i);
+  assert.match(capturedPrompt, /web\s+-> fetch a known web page URL/i);
+  assert.match(capturedPrompt, /Use web only in mode=fetch/i);
+  assert.match(capturedPrompt, /Claude-compatible project agents under \.\/\.claude\/agents\/\*\.md/i);
   assert.match(capturedPrompt, /Branches may share the same execution_group only when each branch can make useful progress without waiting for sibling outputs/i);
   assert.match(capturedPrompt, /Re-branch only when the current branch still contains multiple independent workstreams with low coordination cost/i);
-  assert.match(capturedPrompt, /each must target a genuinely different evidence stream or hypothesis/i);
-  assert.match(capturedPrompt, /After 2-3 consecutive web\/search rounds without clear new information/i);
   assert.match(capturedPrompt, /Keep every `goal` concise and comfortably under the 240-character schema limit/i);
   assert.match(capturedPrompt, /Planning view only/i);
+  assert.match(capturedPrompt, /structured_branch_results:/i);
+  assert.match(capturedPrompt, /snapshot_summary:/i);
   assert.doesNotMatch(capturedPrompt, /Shared context for this request:/i);
   assert.doesNotMatch(capturedPrompt, /Always provide at least 2 branches/i);
   assert.doesNotMatch(capturedPrompt, /NEVER branch on the first step/i);
   assert.doesNotMatch(capturedPrompt, /default to one `web` tool call before branching/i);
   assert.doesNotMatch(capturedPrompt, /Return exactly one JSON object/i);
   assert.doesNotMatch(capturedPrompt, /planner_tool/i);
+  assert.doesNotMatch(capturedPrompt, /web mode=search/i);
+  assert.doesNotMatch(capturedPrompt, /Prefer materially diverse search strategies/i);
+  assert.doesNotMatch(capturedPrompt, /After 2-3 consecutive web\/search rounds without clear new information/i);
+
+  agent.stop();
+});
+
+test('planner skill routing injects summary-first guidance instead of the full raw skill body', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-skill-summary-');
+  const skillDir = path.join(projectRoot, 'skills', 'release-review');
+  fs.mkdirSync(skillDir, { recursive: true });
+  const longTail = 'Detailed checklist line.\n'.repeat(120);
+  fs.writeFileSync(
+    path.join(skillDir, 'SKILL.md'),
+    `---\nname: release-review\ndescription: "Release checklist"\n---\n\n# Overview\nKeep releases safe.\n\n## Validation\nRun focused validation before publishing.\n\n## Rollout\nShip in small steps.\n\n## Appendix\n${longTail}`,
+    'utf-8',
+  );
+
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+
+  let callCount = 0;
+  let capturedPrompt = '';
+  anyAgent.generatePlannerDecision = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+    callCount += 1;
+    const joined = Array.isArray(messages)
+      ? messages.map((message) => String(message?.content || '')).join('\n\n')
+      : '';
+    if (callCount === 1) {
+      return {
+        decision: {
+          kind: 'skills',
+          thought: 'Load release-review.',
+          skills_to_load: ['release-review'],
+        },
+      };
+    }
+    capturedPrompt = joined;
+    return {
+      decision: {
+        kind: 'final',
+        thought: 'Done.',
+        final_answer: 'ok',
+        completion_summary: 'ok',
+      },
+    };
+  };
+
+  const answer = await agent.run('请按 release review skill 检查 rollout validation', () => {}, {
+    conversationId: 'thread-skill-summary',
+  });
+  assert.equal(answer, 'ok');
+  assert.match(capturedPrompt, /summary-first guidance/i);
+  assert.match(capturedPrompt, /Section: Validation/i);
+  assert.doesNotMatch(capturedPrompt, /Detailed checklist line\.\nDetailed checklist line\.\nDetailed checklist line\.\nDetailed checklist line\.\nDetailed checklist line\./);
+
+  agent.stop();
+});
+
+test('planner prompt includes compact branch evidence digest after tool observations', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-branch-digest-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+
+  let callCount = 0;
+  let secondPrompt = '';
+  anyAgent.generatePlannerDecision = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+    callCount += 1;
+    const joined = Array.isArray(messages)
+      ? messages.map((message) => String(message?.content || '')).join('\n\n')
+      : '';
+    if (callCount === 1) {
+      return {
+        decision: {
+          kind: 'tool',
+          thought: 'Run one shell check.',
+          tool_calls: [{
+            name: 'bash',
+            arguments: { command: 'printf "verification complete"' },
+            goal: 'Collect one concrete observation',
+          }],
+        },
+      };
+    }
+    secondPrompt = joined;
+    return {
+      decision: {
+        kind: 'final',
+        thought: 'Done.',
+        final_answer: 'ok',
+        completion_summary: 'ok',
+      },
+    };
+  };
+
+  const answer = await agent.run('检查当前状态并总结', () => {}, {
+    conversationId: 'thread-branch-digest',
+  });
+  assert.equal(answer, 'ok');
+  assert.match(secondPrompt, /branch_evidence_digest:/i);
+  assert.match(secondPrompt, /last_tool_outcome:/i);
+  assert.match(secondPrompt, /verification complete/i);
 
   agent.stop();
 });
@@ -995,7 +1181,7 @@ test('child branch prompts stay on direct work tools instead of inheriting legac
       ? messages.map((message) => String(message?.content || '')).join('\n\n')
       : '';
 
-    if (!joined.includes('child branch "Source audit"')) {
+    if (!promptIncludesBranchLabel(joined, 'Source audit')) {
       return {
         kind: 'branch',
         thought: 'Split root from evidence collection.',
@@ -1012,14 +1198,16 @@ test('child branch prompts stay on direct work tools instead of inheriting legac
 
     assert.match(joined, /Call read\/search\/edit\/bash\/web directly for work/i);
     assert.match(joined, /Planning view only/i);
+    assert.match(joined, /structured_branch_results:/i);
     assert.doesNotMatch(joined, /Return exactly one JSON object/i);
     assert.doesNotMatch(joined, /\{"kind":"branch"/);
     assert.doesNotMatch(joined, /planner_tool/i);
-    assert.doesNotMatch(joined, /TOOL OBSERVATION for read:/);
     assert.doesNotMatch(joined, /Shared context for this request:/);
 
     if (sawChildPrompt) {
       sawPostToolPrompt = true;
+      assert.match(joined, /branch_evidence_digest:/i);
+      assert.match(joined, /last_tool_outcome:\s*TOOL OBSERVATION for read:/i);
       assert.doesNotMatch(joined, /\{"kind":"tool"/);
       return {
         kind: 'final',
@@ -1047,7 +1235,6 @@ test('child branch prompts stay on direct work tools instead of inheriting legac
   assert.equal(answer, '已基于 note.txt 完成验证。');
   assert.equal(sawChildPrompt, true);
   assert.equal(sawPostToolPrompt, true);
-  assert.equal(sawPostToolPrompt, true);
 
   agent.stop();
 });
@@ -1068,7 +1255,7 @@ test('child branches may execute workspace edits when the planner chooses them',
       ? messages.map((message) => String(message?.content || '')).join('\n\n')
       : '';
 
-    if (!joined.includes('child branch "Writer"')) {
+    if (!promptIncludesBranchLabel(joined, 'Writer')) {
       return {
         kind: 'branch',
         thought: 'Split root from child writer.',
@@ -1082,7 +1269,7 @@ test('child branches may execute workspace edits when the planner chooses them',
       };
     }
 
-    if (!joined.includes('TOOL OBSERVATION for edit:')) {
+    if (!promptIncludesToolOutcome(joined, 'edit')) {
       return {
         kind: 'tool',
         thought: 'Write the note from the child branch.',
@@ -1142,7 +1329,7 @@ test('planner executes structured tool decisions directly', async () => {
     const joined = Array.isArray(messages)
       ? messages.map((message) => String(message?.content || '')).join('\n\n')
       : '';
-    if (joined.includes('TOOL OBSERVATION for read:')) {
+    if (promptIncludesToolOutcome(joined, 'read')) {
       return {
         kind: 'final',
         thought: 'Done.',
@@ -1169,6 +1356,56 @@ test('planner executes structured tool decisions directly', async () => {
   assert.equal(answer, '已读取 note 文件。');
   assert.ok(traces.some((event) => event.type === 'action' && event.content.includes('Calling read')));
   assert.ok(traces.some((event) => event.type === 'observation' && event.content.includes('hello from note')));
+
+  agent.stop();
+});
+
+test('planner receives an explicit execution error when it still tries removed web search mode', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-web-search-removed-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+
+  let sawRemovalError = false;
+  anyAgent.generatePlannerDecision = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+    const joined = Array.isArray(messages)
+      ? messages.map((message) => String(message?.content || '')).join('\n\n')
+      : '';
+    if (joined.includes('web search has been removed')) {
+      sawRemovalError = true;
+      return {
+        kind: 'final',
+        thought: 'Stop searching and report the execution failure clearly.',
+        final_answer: '已确认内置 web search 已移除，应改用已知 URL 的 web fetch 或其他技能先提供候选链接。',
+        completion_summary: 'web search removed error handled',
+      };
+    }
+    return {
+      kind: 'tool',
+      thought: 'Search the web directly.',
+      tool_calls: [
+        {
+          name: 'web',
+          arguments: { mode: 'search', query: 'latest filings' },
+          goal: 'Search for current filings',
+        },
+      ],
+    };
+  };
+
+  const traces: TraceEvent[] = [];
+  const answer = await agent.run('帮我网上搜一下最新 filing', (event) => { traces.push(event); }, {
+    conversationId: 'thread-web-search-removed',
+  });
+
+  assert.equal(sawRemovalError, true);
+  assert.match(answer, /web search 已移除|已知 URL 的 web fetch/);
+  assert.ok(traces.some((event) => event.type === 'observation' && event.content.includes('web search has been removed')));
 
   agent.stop();
 });

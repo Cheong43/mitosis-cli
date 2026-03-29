@@ -7,11 +7,12 @@ export interface SkillRecord {
   name: string;
   description: string;
   content: string;
+  tools?: string[];
   category?: string;
   priority?: number;
   alwaysInclude?: boolean;
   tags?: string[];
-  source?: 'local' | 'remote';
+  source?: 'local' | 'remote' | 'claude-agent';
   location?: string;
   repository?: string;
 }
@@ -35,14 +36,61 @@ function listFiles(dir: string): string[] {
   return files;
 }
 
+function extractScalar(meta: string, key: string): string | undefined {
+  return meta.match(new RegExp(`(?:^|\\n)\\s*${key}:\\s*"?([^"\\n]+)"?\\s*$`, 'im'))?.[1]?.trim();
+}
+
+function extractYamlList(meta: string, key: string): string[] {
+  const inline = meta.match(new RegExp(`(?:^|\\n)\\s*${key}:\\s*\\[([^\\]]*)\\]\\s*$`, 'im'))?.[1];
+  if (inline) {
+    return inline
+      .split(',')
+      .map((value) => value.replace(/["']/g, '').trim())
+      .filter(Boolean);
+  }
+
+  const block = meta.match(new RegExp(`(?:^|\\n)\\s*${key}:\\s*\\r?\\n((?:\\s*-\\s*[^\\n]+\\r?\\n?)*)`, 'im'))?.[1];
+  if (block) {
+    return block
+      .split(/\r?\n/)
+      .map((line) => line.match(/^\s*-\s*(.+)$/)?.[1]?.replace(/["']/g, '').trim() || '')
+      .filter(Boolean);
+  }
+
+  const scalar = extractScalar(meta, key);
+  if (!scalar) {
+    return [];
+  }
+  return scalar
+    .split(',')
+    .map((value) => value.replace(/["']/g, '').trim())
+    .filter(Boolean);
+}
+
+function isClaudeAgentLocation(location?: string): boolean {
+  if (!location) {
+    return false;
+  }
+  const normalized = normalizePath(location);
+  return normalized.endsWith('/.claude/agents') || normalized.includes('/.claude/agents/');
+}
+
+function toDisplayLocation(projectRoot: string, filePath: string): string {
+  const relative = normalizePath(path.relative(projectRoot, filePath));
+  if (!relative.startsWith('..')) {
+    return relative;
+  }
+  return normalizePath(path.resolve(filePath));
+}
+
 export function parseSkillMarkdown(raw: string, fallbackName: string, extra: Partial<SkillRecord> = {}): SkillRecord {
   const frontmatter = raw.match(/^---\s*[\r\n]+([\s\S]*?)\s*[\r\n]+---\s*[\r\n]*/);
   const body = frontmatter ? raw.slice(frontmatter[0].length).trim() : raw.trim();
   const meta = frontmatter ? frontmatter[1] : '';
-  const name = meta.match(/name:\s*"?([^"\n]+)"?/i)?.[1]?.trim() || fallbackName;
-  const description = meta.match(/description:\s*"?([^"\n]+)"?/i)?.[1]?.trim() || 'No description';
-  const category = meta.match(/category:\s*"?([^"\n]+)"?/i)?.[1]?.trim();
-  const rawPriority = meta.match(/priority:\s*"?([^"\n]+)"?/i)?.[1]?.trim().toLowerCase();
+  const name = extractScalar(meta, 'name') || fallbackName;
+  const description = extractScalar(meta, 'description') || 'No description';
+  const category = extractScalar(meta, 'category');
+  const rawPriority = (extractScalar(meta, 'priority') || '').toLowerCase();
   const priority = rawPriority === 'high'
     ? 100
     : rawPriority === 'medium'
@@ -50,17 +98,15 @@ export function parseSkillMarkdown(raw: string, fallbackName: string, extra: Par
       : rawPriority === 'low'
         ? 10
         : Number(rawPriority || 0);
-  const alwaysInclude = /always_include:\s*(true|yes|1)/i.test(meta);
-  const tagBlock = meta.match(/tags:\s*\[([^\]]*)\]/i)?.[1] || '';
-  const tags = tagBlock
-    .split(',')
-    .map((value) => value.replace(/["']/g, '').trim())
-    .filter(Boolean);
+  const alwaysInclude = /(?:^|\n)\s*always_include:\s*(true|yes|1)\b/i.test(meta);
+  const tags = extractYamlList(meta, 'tags');
+  const tools = extractYamlList(meta, 'tools');
 
   return {
     name,
     description,
     content: body,
+    ...(tools.length > 0 ? { tools } : {}),
     category,
     priority: Number.isFinite(priority) ? priority : 0,
     alwaysInclude,
@@ -89,17 +135,31 @@ export function mergeSkills(...groups: SkillRecord[][]): SkillRecord[] {
 export function loadWorkspaceSkills(projectRoot: string, codeCliRoot: string): SkillRecord[] {
   const skillRoots = resolveWorkspaceSkillRoots(projectRoot, codeCliRoot);
   const loaded: SkillRecord[] = [];
+  const seenByName = new Set<string>();
   for (const root of skillRoots) {
     if (!fs.existsSync(root)) continue;
-    const skillFiles = listFiles(root).filter((filePath) => path.basename(filePath) === 'SKILL.md');
+    const skillFiles = listFiles(root).filter((filePath) => {
+      if (isClaudeAgentLocation(root)) {
+        return filePath.toLowerCase().endsWith('.md');
+      }
+      return path.basename(filePath) === 'SKILL.md';
+    });
     for (const filePath of skillFiles) {
       try {
         const markdown = fs.readFileSync(filePath, 'utf-8');
-        const fallbackName = path.basename(path.dirname(filePath)) || 'unnamed-skill';
-        loaded.push(parseSkillMarkdown(markdown, fallbackName, {
-          source: 'local',
-          location: normalizePath(path.relative(projectRoot, filePath)),
-        }));
+        const fallbackName = isClaudeAgentLocation(root)
+          ? path.basename(filePath, path.extname(filePath)) || 'unnamed-skill'
+          : path.basename(path.dirname(filePath)) || 'unnamed-skill';
+        const parsed = parseSkillMarkdown(markdown, fallbackName, {
+          source: isClaudeAgentLocation(root) ? 'claude-agent' : 'local',
+          location: toDisplayLocation(projectRoot, filePath),
+        });
+        const nameKey = parsed.name.trim().toLowerCase();
+        if (seenByName.has(nameKey)) {
+          continue;
+        }
+        seenByName.add(nameKey);
+        loaded.push(parsed);
       } catch {}
     }
   }
@@ -201,6 +261,17 @@ export function renderSkillCatalog(skills: SkillRecord[], maxCount = 24): string
 
 export function renderSkillGuidance(skills: SkillRecord[]): string {
   return skills
-    .map((skill) => `Skill: ${skill.name}\nDescription: ${skill.description}\nContent:\n${skill.content}`)
+    .map((skill) => {
+      const lines = [
+        `Skill: ${skill.name}`,
+        `Description: ${skill.description}`,
+      ];
+      if (skill.tools?.length) {
+        lines.push(`Allowed tools: ${skill.tools.join(', ')}`);
+      }
+      lines.push('Content:');
+      lines.push(skill.content);
+      return lines.join('\n');
+    })
     .join('\n\n---\n\n');
 }

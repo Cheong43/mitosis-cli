@@ -110,160 +110,34 @@ test('branch transcripts record planner decisions as text markers instead of leg
   assert.equal(answer, 'branch transcript clean');
 });
 
-test('web observations keep the search query in the branch transcript', async () => {
+test('web fetch observations keep the fetched URL in the branch transcript', async () => {
   const planner = new FakePlanner(async (transcript) => {
     const serialized = transcript.map((message) => String(message.content)).join('\n');
 
-    if (serialized.includes('TOOL OBSERVATION for web search query=')) {
-      assert.match(serialized, /TOOL OBSERVATION for web search query="Qin Shi Huang tomb army"/);
+    if (serialized.includes('TOOL OBSERVATION for web fetch url=')) {
+      assert.match(serialized, /TOOL OBSERVATION for web fetch url="https:\/\/example.com\/qin"/);
       return {
         kind: 'final',
-        content: 'web transcript keeps query',
+        content: 'web transcript keeps fetch url',
       };
     }
 
     return {
       kind: 'tool',
       toolCalls: [
-        { name: 'web', arguments: { mode: 'search', query: 'Qin Shi Huang tomb army' } },
+        { name: 'web', arguments: { mode: 'fetch', url: 'https://example.com/qin' } },
       ],
     };
   });
 
   const runtime = new AgentRuntime({
     planner,
-    toolRuntime: new FakeToolRuntime(async () => '{"kind":"web_search","query":"Qin Shi Huang tomb army","results":[]}'),
+    toolRuntime: new FakeToolRuntime(async () => '{"kind":"web_fetch","url":"https://example.com/qin","summary":"short"}'),
     maxSteps: 2,
   });
 
-  const answer = await runtime.run('search history should be preserved');
-  assert.equal(answer, 'web transcript keeps query');
-});
-
-test('root branch blocks a third near-duplicate web-search round and forces replanning', async () => {
-  const executedQueries: string[] = [];
-  let sawGuardMessage = false;
-  let planCount = 0;
-
-  const planner = new FakePlanner(async (transcript) => {
-    const serialized = transcript.map((message) => String(message.content)).join('\n');
-    if (serialized.includes('Blocked near-duplicate web search loop')) {
-      sawGuardMessage = true;
-      return {
-        kind: 'final',
-        content: 'guarded root final',
-      };
-    }
-
-    planCount += 1;
-    if (planCount === 1) {
-      return {
-        kind: 'tool',
-        toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba latest revenue' } }],
-      };
-    }
-    if (planCount === 2) {
-      return {
-        kind: 'tool',
-        toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba latest revenue today' } }],
-      };
-    }
-    return {
-      kind: 'tool',
-      toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba latest revenue current' } }],
-    };
-  });
-
-  const runtime = new AgentRuntime({
-    planner,
-    toolRuntime: new FakeToolRuntime(async (_toolName, args) => {
-      const query = String(args.query || '');
-      executedQueries.push(query);
-      return JSON.stringify({
-        kind: 'web_search',
-        query,
-        results: [{ title: 'Alibaba Group', url: 'https://www.alibabagroup.com/en/news' }],
-      });
-    }),
-    maxSteps: 5,
-  });
-
-  const answer = await runtime.run('research alibaba');
-  assert.equal(answer, 'guarded root final');
-  assert.equal(sawGuardMessage, true);
-  assert.deepEqual(executedQueries, [
-    'Alibaba latest revenue',
-    'Alibaba latest revenue today',
-  ]);
-});
-
-test('child branches inherit the same repeated web-search loop guard', async () => {
-  const executedQueries: string[] = [];
-  let sawChildGuardMessage = false;
-  let childPlanCount = 0;
-
-  const planner = new FakePlanner(async (transcript) => {
-    const serialized = transcript.map((message) => String(message.content)).join('\n');
-    if (!serialized.includes('child branch "Evidence path"')) {
-      return {
-        kind: 'branch',
-        branches: [
-          { label: 'Evidence path', goal: 'Collect web evidence', priority: 1 },
-        ],
-      };
-    }
-
-    if (serialized.includes('Blocked near-duplicate web search loop')) {
-      sawChildGuardMessage = true;
-      return {
-        kind: 'final',
-        content: 'guarded child final',
-      };
-    }
-
-    childPlanCount += 1;
-    if (childPlanCount === 1) {
-      return {
-        kind: 'tool',
-        toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba cloud revenue' } }],
-      };
-    }
-    if (childPlanCount === 2) {
-      return {
-        kind: 'tool',
-        toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba cloud revenue latest' } }],
-      };
-    }
-    return {
-      kind: 'tool',
-      toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba cloud revenue current' } }],
-    };
-  });
-
-  const runtime = new AgentRuntime({
-    planner,
-    toolRuntime: new FakeToolRuntime(async (_toolName, args) => {
-      const query = String(args.query || '');
-      executedQueries.push(query);
-      return JSON.stringify({
-        kind: 'web_search',
-        query,
-        results: [{ title: 'Alibaba Cloud', url: 'https://www.alibabacloud.com/company/news' }],
-      });
-    }),
-    maxSteps: 5,
-    maxBranchDepth: 1,
-    maxBranchWidth: 1,
-    maxCompletedBranches: 1,
-  });
-
-  const answer = await runtime.run('branch for evidence');
-  assert.equal(answer, 'guarded child final');
-  assert.equal(sawChildGuardMessage, true);
-  assert.deepEqual(executedQueries, [
-    'Alibaba cloud revenue',
-    'Alibaba cloud revenue latest',
-  ]);
+  const answer = await runtime.run('fetch history should be preserved');
+  assert.equal(answer, 'web transcript keeps fetch url');
 });
 
 test('branches execute concurrently up to branchConcurrency', async () => {
@@ -456,7 +330,102 @@ test('depends_on gates same-group siblings until prerequisites complete', async 
   assert.equal(completedLabels.includes('C'), true);
 });
 
-test('branches are unlimited by default and rely on external throttling unless a cap is set', async () => {
+test('invalid duplicate child labels are rejected and the branch replans instead of spawning polluted siblings', async () => {
+  let planCount = 0;
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => String(message.content)).join('\n');
+    if (serialized.includes('child coordination graph was invalid')) {
+      return {
+        kind: 'final',
+        content: 'replanned-after-duplicate-labels',
+      };
+    }
+
+    planCount += 1;
+    if (planCount === 1) {
+      return {
+        kind: 'branch',
+        branches: [
+          { label: 'Duplicate', goal: 'first branch' },
+          { label: 'Duplicate', goal: 'second branch' },
+        ],
+      };
+    }
+
+    return {
+      kind: 'final',
+      content: 'unexpected',
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 3,
+  });
+
+  const answer = await runtime.run('reject duplicate child labels');
+  assert.equal(answer, 'replanned-after-duplicate-labels');
+});
+
+test('invalid missing depends_on targets are rejected and surfaced back to the planner', async () => {
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => String(message.content)).join('\n');
+    if (serialized.includes('depends_on unknown sibling')) {
+      return {
+        kind: 'final',
+        content: 'replanned-after-missing-dependency',
+      };
+    }
+    return {
+      kind: 'branch',
+      branches: [
+        { label: 'A', goal: 'first branch' },
+        { label: 'B', goal: 'blocked branch', dependsOn: ['Missing'] },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 3,
+  });
+
+  const answer = await runtime.run('reject missing dependency');
+  assert.equal(answer, 'replanned-after-missing-dependency');
+});
+
+test('invalid cyclic depends_on graphs are rejected and do not enter the scheduler', async () => {
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => String(message.content)).join('\n');
+    if (serialized.includes('cyclic sibling depends_on graph')) {
+      return {
+        kind: 'final',
+        content: 'replanned-after-cycle',
+      };
+    }
+    return {
+      kind: 'branch',
+      branches: [
+        { label: 'A', goal: 'branch A', dependsOn: ['B'] },
+        { label: 'B', goal: 'branch B', dependsOn: ['A'] },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 3,
+  });
+
+  const answer = await runtime.run('reject cyclic dependencies');
+  assert.equal(answer, 'replanned-after-cycle');
+});
+
+test('default branch concurrency remains unlimited when no explicit cap is provided', async () => {
   let maxObservedConcurrency = 0;
   let currentConcurrency = 0;
 
@@ -492,6 +461,8 @@ test('branches are unlimited by default and rely on external throttling unless a
         { label: 'A', goal: 'Wait in branch A', priority: 1 },
         { label: 'B', goal: 'Wait in branch B', priority: 1 },
         { label: 'C', goal: 'Wait in branch C', priority: 1 },
+        { label: 'D', goal: 'Wait in branch D', priority: 1 },
+        { label: 'E', goal: 'Wait in branch E', priority: 1 },
       ],
     };
   });
@@ -501,16 +472,75 @@ test('branches are unlimited by default and rely on external throttling unless a
     toolRuntime,
     maxSteps: 2,
     maxBranchDepth: 1,
-    maxBranchWidth: 3,
-    maxCompletedBranches: 3,
+    maxBranchWidth: 5,
+    maxCompletedBranches: 5,
     synthesizeFinal: async ({ branches }) => branches.map((branch) => branch.finalAnswer).join(' | '),
   });
 
-  const answer = await runtime.run('run three waits');
+  const answer = await runtime.run('run five waits');
   assert.match(answer, /A done/);
   assert.match(answer, /B done/);
   assert.match(answer, /C done/);
-  assert.equal(maxObservedConcurrency, 3);
+  assert.match(answer, /D done/);
+  assert.match(answer, /E done/);
+  assert.equal(maxObservedConcurrency, 5);
+});
+
+test('mutating sibling branches are serialized even when branchConcurrency allows parallel scheduling', async () => {
+  let maxObservedMutatingConcurrency = 0;
+  let currentMutatingConcurrency = 0;
+
+  const toolRuntime = new FakeToolRuntime(async (_toolName, args) => {
+    currentMutatingConcurrency += 1;
+    maxObservedMutatingConcurrency = Math.max(maxObservedMutatingConcurrency, currentMutatingConcurrency);
+    await new Promise((resolve) => setTimeout(resolve, Number(args.delayMs ?? 0)));
+    currentMutatingConcurrency -= 1;
+    return { ok: true };
+  });
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => String(message.content)).join('\n');
+    const childMatch = serialized.match(/child branch "([^"]+)"/);
+    const childLabel = childMatch ? childMatch[1] : '';
+
+    if (serialized.includes('TOOL OBSERVATION for edit:')) {
+      return {
+        kind: 'final',
+        content: `${childLabel} mutated`,
+      };
+    }
+
+    if (childLabel) {
+      return {
+        kind: 'tool',
+        toolCalls: [{ name: 'edit', arguments: { path: `${childLabel}.txt`, delayMs: 80 } }],
+      };
+    }
+
+    return {
+      kind: 'branch',
+      branches: [
+        { label: 'A', goal: 'edit branch A', priority: 1 },
+        { label: 'B', goal: 'edit branch B', priority: 1 },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime,
+    maxSteps: 2,
+    maxBranchDepth: 1,
+    maxBranchWidth: 2,
+    maxCompletedBranches: 2,
+    branchConcurrency: 2,
+    synthesizeFinal: async ({ branches }) => branches.map((branch) => branch.finalAnswer).join(' | '),
+  });
+
+  const answer = await runtime.run('serialize mutating siblings');
+  assert.match(answer, /A mutated/);
+  assert.match(answer, /B mutated/);
+  assert.equal(maxObservedMutatingConcurrency, 1);
 });
 
 test('later branches receive a shared kanban snapshot in their planning transcript', async () => {
@@ -670,6 +700,7 @@ test('trace metadata carries structured kanban cards with artifacts and summarie
 });
 
 test('planner fallback finals trigger explicit branch finalization before synthesis', async () => {
+  const traces: AgentTraceEvent[] = [];
   const planner = new FakePlanner(async (transcript) => {
     const serialized = transcript.map((message) => message.content).join('\n');
     if (serialized.includes('child branch "Needs finalize"')) {
@@ -694,10 +725,20 @@ test('planner fallback finals trigger explicit branch finalization before synthe
     maxSteps: 2,
     maxBranchDepth: 1,
     finalizeBranch: async ({ branch, reason }) => `finalized:${branch.id}:${reason}`,
+    onTrace: (event) => {
+      traces.push(event);
+    },
   });
 
   const answer = await runtime.run('recover from fallback');
   assert.equal(answer, 'finalized:B0.1:planner format fallback after schema repair retries');
+
+  const fallbackCompletion = traces.find((event) =>
+    event.type === 'observation' && String(event.content).includes('Branch finalized after planner fallback.'));
+  const fallbackCard = fallbackCompletion?.metadata?.kanbanCard as any;
+  assert.ok(fallbackCard, 'planner fallback completion should include kanban metadata');
+  assert.equal(fallbackCard?.status, 'error');
+  assert.equal(fallbackCard?.disposition, 'planner_error');
 });
 
 test('safe tool calls inside one branch execute concurrently and preserve observation order', async () => {
@@ -1046,6 +1087,55 @@ test('re-branch respects maxSynthesisRetries and forces done on limit', async ()
   // 1 initial + 2 retries = 3 synthesis calls
   assert.equal(synthesisCallCount, 3, 'synthesis called 3 times (initial + 2 retries)');
   assert.equal(answer, 'gave-up');
+});
+
+test('synthesis receives archived branch summary when completed branches exceed maxCompletedBranches', async () => {
+  let receivedArchivedSummary = '';
+  let receivedBranchCount = 0;
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => String(message.content)).join('\n');
+    const childMatch = serialized.match(/child branch "([^"]+)"/);
+    const childLabel = childMatch ? childMatch[1] : '';
+
+    if (childLabel) {
+      return {
+        kind: 'final',
+        content: `${childLabel}-answer`,
+        completionSummary: `${childLabel}-summary`,
+        outcome: 'success',
+      };
+    }
+
+    return {
+      kind: 'branch',
+      branches: [
+        { label: 'A', goal: 'branch A' },
+        { label: 'B', goal: 'branch B' },
+        { label: 'C', goal: 'branch C' },
+        { label: 'D', goal: 'branch D' },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 2,
+    maxBranchDepth: 1,
+    maxBranchWidth: 4,
+    maxCompletedBranches: 2,
+    synthesizeFinal: async ({ branches, archivedBranchSummary }) => {
+      receivedBranchCount = branches.length;
+      receivedArchivedSummary = archivedBranchSummary || '';
+      return 'trimmed-synthesis';
+    },
+  });
+
+  const answer = await runtime.run('trim completed branches before synthesis');
+  assert.equal(answer, 'trimmed-synthesis');
+  assert.equal(receivedBranchCount, 2);
+  assert.match(receivedArchivedSummary, /\[B0\.[0-9]+\] [A-D]/);
 });
 
 test('branch execution errors are recorded and still reach synthesis', async () => {

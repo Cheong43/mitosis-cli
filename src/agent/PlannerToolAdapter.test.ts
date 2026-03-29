@@ -79,32 +79,6 @@ async function withMockFetch(
   }
 }
 
-async function withEnv(
-  updates: Record<string, string | undefined>,
-  fn: () => Promise<void>,
-) {
-  const originals = new Map<string, string | undefined>();
-  for (const [key, value] of Object.entries(updates)) {
-    originals.set(key, process.env[key]);
-    if (value === undefined) {
-      delete process.env[key];
-    } else {
-      process.env[key] = value;
-    }
-  }
-  try {
-    await fn();
-  } finally {
-    for (const [key, value] of originals.entries()) {
-      if (value === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = value;
-      }
-    }
-  }
-}
-
 test('PlannerToolAdapter routes workspace reads through read_file', async () => {
   const projectRoot = createTempProjectRoot('planner-tool-adapter-workspace-');
   const { adapter, calls } = createAdapter(projectRoot);
@@ -177,58 +151,17 @@ test('PlannerToolAdapter routes memory search through a Mempedia shell action', 
   assert.match(String(calls[0]?.args.command || ''), /\\"query\\":\\"cap rate\\"/);
 });
 
-test('PlannerToolAdapter web search sends the full query to the engine, not only the first term', async () => {
-  const projectRoot = createTempProjectRoot('planner-tool-adapter-web-query-');
-  const { adapter } = createAdapter(projectRoot);
-  const requestedUrls: string[] = [];
-  const query = 'Qin Shi Huang burning books historical debate';
-
-  await withMockFetch(async (input) => {
-    requestedUrls.push(String(input));
-    return createHtmlResponse(`
-      <html>
-        <a class="result__a" href="https://example.com/article">Article</a>
-        <a class="result__snippet">Useful snippet</a>
-      </html>
-    `);
-  }, async () => {
-    const raw = await adapter.execute('web', { mode: 'search', query });
-    const result = JSON.parse(raw);
-    assert.equal(result.kind, 'web_search');
-    assert.equal(result.query, query);
-  });
-
-  assert.equal(requestedUrls.length, 1);
-  assert.match(requestedUrls[0], new RegExp(`q=${encodeURIComponent(query)}`));
-  assert.doesNotMatch(requestedUrls[0], /q=Qin(?:&|$)/);
-});
-
-test('PlannerToolAdapter web search returns citation-oriented metadata with budget and permissions', async () => {
-  const projectRoot = createTempProjectRoot('planner-tool-adapter-web-citations-');
+test('PlannerToolAdapter rejects removed web search mode with an explicit error', async () => {
+  const projectRoot = createTempProjectRoot('planner-tool-adapter-web-search-removed-');
   const { adapter } = createAdapter(projectRoot);
 
-  await withMockFetch(async () => createHtmlResponse(`
-    <html>
-      <a class="result__a" href="https://docs.example.com/article">Docs result</a>
-      <a class="result__snippet">Useful snippet</a>
-    </html>
-  `), async () => {
-    const raw = await adapter.execute('web', {
-      mode: 'search',
-      query: 'example docs',
-      allowed_domains: ['docs.example.com'],
-    });
-    const result = JSON.parse(raw);
-    assert.equal(result.kind, 'web_search');
-    assert.equal(result.engine, 'duckduckgo');
-    assert.equal(result.results[0].citation, '[1]');
-    assert.equal(result.results[0].domain, 'docs.example.com');
-    assert.deepEqual(result.permissions.allowed_domains, ['docs.example.com']);
-    assert.equal(result.budget.used, 1);
-    assert.equal(result.budget.remaining, 7);
-    assert.match(String(result.summary || ''), /Best citations to inspect next/);
-    assert.deepEqual(result.recommended_fetch_urls, ['https://docs.example.com/article']);
+  const raw = await adapter.execute('web', {
+    mode: 'search',
+    query: 'example docs',
   });
+  const result = JSON.parse(raw);
+  assert.equal(result.kind, 'error');
+  assert.match(String(result.message || ''), /web search has been removed/i);
 });
 
 test('PlannerToolAdapter blocks web fetches outside allowed domains', async () => {
@@ -275,107 +208,4 @@ test('PlannerToolAdapter web fetch returns citation summary instead of full raw 
     assert.equal('content' in result, false);
     assert.match(String(result.recommended_next_action || ''), /content_preview/);
   });
-});
-
-test('PlannerToolAdapter enforces a per-run web search budget', async () => {
-  await withEnv({ MITOSIS_WEB_SEARCH_BUDGET: '2' }, async () => {
-    const projectRoot = createTempProjectRoot('planner-tool-adapter-web-budget-');
-    const { adapter } = createAdapter(projectRoot);
-
-    await withMockFetch(async () => createHtmlResponse(`
-      <html>
-        <a class="result__a" href="https://example.com/one">One</a>
-        <a class="result__snippet">Snippet</a>
-      </html>
-    `), async () => {
-      const first = JSON.parse(await adapter.execute('web', { mode: 'search', query: 'first' }));
-      const second = JSON.parse(await adapter.execute('web', { mode: 'search', query: 'second' }));
-      const third = JSON.parse(await adapter.execute('web', { mode: 'search', query: 'third' }));
-
-      assert.equal(first.kind, 'web_search');
-      assert.equal(second.kind, 'web_search');
-      assert.equal(third.kind, 'error');
-      assert.match(String(third.message || ''), /budget exhausted/);
-      assert.equal(third.budget.used, 2);
-      assert.equal(third.budget.limit, 2);
-    });
-  });
-});
-
-test('PlannerToolAdapter can return identical result sets for different queries when the upstream engine responds with identical HTML', async () => {
-  const projectRoot = createTempProjectRoot('planner-tool-adapter-web-same-upstream-');
-  const { adapter } = createAdapter(projectRoot);
-  const html = `
-    <html>
-      <a class="result__a" href="https://example.com/qin-overview">Qin Overview</a>
-      <a class="result__snippet">A generic Qin snippet</a>
-      <a class="result__a" href="https://example.com/qin-timeline">Qin Timeline</a>
-      <a class="result__snippet">A generic timeline snippet</a>
-    </html>
-  `;
-
-  await withMockFetch(async () => createHtmlResponse(html), async () => {
-    const first = JSON.parse(await adapter.execute('web', {
-      mode: 'search',
-      query: 'Qin Shi Huang burning books',
-    }));
-    const second = JSON.parse(await adapter.execute('web', {
-      mode: 'search',
-      query: 'Qin Shi Huang terracotta army',
-    }));
-
-    assert.notEqual(first.query, second.query);
-    assert.deepEqual(first.results, second.results);
-  });
-});
-
-test('PlannerToolAdapter fallback chain can amplify same-result behavior when DDG and Bing fail and Baidu returns the same head results', async () => {
-  const projectRoot = createTempProjectRoot('planner-tool-adapter-web-baidu-fallback-');
-  const { adapter } = createAdapter(projectRoot);
-  const requestedUrls: string[] = [];
-  const baiduHtml = `
-    <html>
-      <div class="result c-container">
-        <h3><a href="https://example.com/qin-intro">秦始皇 - 词条</a></h3>
-        <div class="c-abstract">首屏固定结果</div>
-      </div>
-      <div class="result c-container">
-        <h3><a href="https://example.com/qin-history">秦朝历史</a></h3>
-        <div class="c-abstract">另一个固定结果</div>
-      </div>
-    </html>
-  `;
-
-  await withMockFetch(async (input) => {
-    const url = String(input);
-    requestedUrls.push(url);
-    if (url.includes('duckduckgo.com')) {
-      return createHtmlResponse('<html><body>no parseable results</body></html>');
-    }
-    if (url.includes('bing.com')) {
-      return createHtmlResponse('<html><body>no parseable results</body></html>');
-    }
-    if (url.includes('baidu.com')) {
-      return createHtmlResponse(baiduHtml);
-    }
-    throw new Error(`Unexpected URL: ${url}`);
-  }, async () => {
-    const first = JSON.parse(await adapter.execute('web', {
-      mode: 'search',
-      query: '秦始皇 焚书坑儒',
-    }));
-    const second = JSON.parse(await adapter.execute('web', {
-      mode: 'search',
-      query: '秦始皇 兵马俑 阿房宫',
-    }));
-
-    assert.notEqual(first.query, second.query);
-    assert.deepEqual(first.results, second.results);
-  });
-
-  assert.equal(requestedUrls.filter((url) => url.includes('duckduckgo.com')).length, 2);
-  assert.equal(requestedUrls.filter((url) => url.includes('bing.com')).length, 2);
-  assert.equal(requestedUrls.filter((url) => url.includes('baidu.com')).length, 2);
-  assert.ok(requestedUrls.some((url) => url.includes(encodeURIComponent('秦始皇 焚书坑儒'))));
-  assert.ok(requestedUrls.some((url) => url.includes(encodeURIComponent('秦始皇 兵马俑 阿房宫'))));
 });
