@@ -140,6 +140,132 @@ test('web observations keep the search query in the branch transcript', async ()
   assert.equal(answer, 'web transcript keeps query');
 });
 
+test('root branch blocks a third near-duplicate web-search round and forces replanning', async () => {
+  const executedQueries: string[] = [];
+  let sawGuardMessage = false;
+  let planCount = 0;
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => String(message.content)).join('\n');
+    if (serialized.includes('Blocked near-duplicate web search loop')) {
+      sawGuardMessage = true;
+      return {
+        kind: 'final',
+        content: 'guarded root final',
+      };
+    }
+
+    planCount += 1;
+    if (planCount === 1) {
+      return {
+        kind: 'tool',
+        toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba latest revenue' } }],
+      };
+    }
+    if (planCount === 2) {
+      return {
+        kind: 'tool',
+        toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba latest revenue today' } }],
+      };
+    }
+    return {
+      kind: 'tool',
+      toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba latest revenue current' } }],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(async (_toolName, args) => {
+      const query = String(args.query || '');
+      executedQueries.push(query);
+      return JSON.stringify({
+        kind: 'web_search',
+        query,
+        results: [{ title: 'Alibaba Group', url: 'https://www.alibabagroup.com/en/news' }],
+      });
+    }),
+    maxSteps: 5,
+  });
+
+  const answer = await runtime.run('research alibaba');
+  assert.equal(answer, 'guarded root final');
+  assert.equal(sawGuardMessage, true);
+  assert.deepEqual(executedQueries, [
+    'Alibaba latest revenue',
+    'Alibaba latest revenue today',
+  ]);
+});
+
+test('child branches inherit the same repeated web-search loop guard', async () => {
+  const executedQueries: string[] = [];
+  let sawChildGuardMessage = false;
+  let childPlanCount = 0;
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => String(message.content)).join('\n');
+    if (!serialized.includes('child branch "Evidence path"')) {
+      return {
+        kind: 'branch',
+        branches: [
+          { label: 'Evidence path', goal: 'Collect web evidence', priority: 1 },
+        ],
+      };
+    }
+
+    if (serialized.includes('Blocked near-duplicate web search loop')) {
+      sawChildGuardMessage = true;
+      return {
+        kind: 'final',
+        content: 'guarded child final',
+      };
+    }
+
+    childPlanCount += 1;
+    if (childPlanCount === 1) {
+      return {
+        kind: 'tool',
+        toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba cloud revenue' } }],
+      };
+    }
+    if (childPlanCount === 2) {
+      return {
+        kind: 'tool',
+        toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba cloud revenue latest' } }],
+      };
+    }
+    return {
+      kind: 'tool',
+      toolCalls: [{ name: 'web', arguments: { mode: 'search', query: 'Alibaba cloud revenue current' } }],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(async (_toolName, args) => {
+      const query = String(args.query || '');
+      executedQueries.push(query);
+      return JSON.stringify({
+        kind: 'web_search',
+        query,
+        results: [{ title: 'Alibaba Cloud', url: 'https://www.alibabacloud.com/company/news' }],
+      });
+    }),
+    maxSteps: 5,
+    maxBranchDepth: 1,
+    maxBranchWidth: 1,
+    maxCompletedBranches: 1,
+  });
+
+  const answer = await runtime.run('branch for evidence');
+  assert.equal(answer, 'guarded child final');
+  assert.equal(sawChildGuardMessage, true);
+  assert.deepEqual(executedQueries, [
+    'Alibaba cloud revenue',
+    'Alibaba cloud revenue latest',
+  ]);
+});
+
 test('branches execute concurrently up to branchConcurrency', async () => {
   let maxObservedConcurrency = 0;
   let currentConcurrency = 0;
@@ -438,6 +564,63 @@ test('later branches receive a shared kanban snapshot in their planning transcri
   const answer = await runtime.run('share branch board');
   assert.equal(answer, 'alpha ready + beta ready');
   assert.equal(sawKanbanSnapshot, true);
+});
+
+test('kanban sync stays in the leading system message instead of inserting a later system role', async () => {
+  let inspectedChildTranscript = false;
+
+  const planner = new FakePlanner(async (transcript) => {
+    const serialized = transcript.map((message) => String(message.content)).join('\n');
+
+    if (serialized.includes('child branch "Alpha"')) {
+      return {
+        kind: 'final' as const,
+        content: 'alpha ok',
+        outcome: 'success',
+      };
+    }
+
+    if (serialized.includes('child branch "Beta"')) {
+      const systemIndexes = transcript
+        .map((message, index) => ({ role: message.role, index }))
+        .filter((message) => message.role === 'system')
+        .map((message) => message.index);
+      assert.deepEqual(systemIndexes, [0]);
+      assert.match(String(transcript[0]?.content || ''), /Shared branch kanban snapshot:/);
+      inspectedChildTranscript = true;
+      return {
+        kind: 'final' as const,
+        content: 'beta ok',
+        outcome: 'success',
+      };
+    }
+
+    return {
+      kind: 'branch' as const,
+      thought: 'split into alpha then beta',
+      branches: [
+        { label: 'Alpha', goal: 'Finish alpha first', priority: 1 },
+        { label: 'Beta', goal: 'Run after alpha and inspect sync placement', priority: 0.2, executionGroup: 2 },
+      ],
+    };
+  });
+
+  const runtime = new AgentRuntime({
+    planner,
+    toolRuntime: new FakeToolRuntime(),
+    maxSteps: 2,
+    maxBranchDepth: 1,
+    maxBranchWidth: 2,
+    branchConcurrency: 1,
+    maxCompletedBranches: 2,
+    synthesizeFinal: async ({ branches }) => branches.map((branch) => branch.finalAnswer).join(' + '),
+  });
+
+  const answer = await runtime.run('inspect kanban sync placement', [
+    { role: 'system', content: 'base system prompt' },
+  ]);
+  assert.equal(answer, 'alpha ok + beta ok');
+  assert.equal(inspectedChildTranscript, true);
 });
 
 test('trace metadata carries structured kanban cards with artifacts and summaries', async () => {

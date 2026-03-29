@@ -46,13 +46,12 @@ export { ReadFileTool } from './tools/builtin/local/ReadFileTool.js';
 export { WriteFileTool } from './tools/builtin/local/WriteFileTool.js';
 export { RunShellTool } from './tools/builtin/local/RunShellTool.js';
 export { AgentRuntime } from './agent/AgentRuntime.js';
-export { SimplePlanner } from './agent/SimplePlanner.js';
 
 
 export type { Policy } from './governance/types.js';
 export type { ApprovalEngine } from './governance/types.js';
 export type { ToolDefinition, ToolExecutionContext, ToolExecutionResult } from './tools/types.js';
-export type { AgentTraceEvent, BeamPath, PathScorer, PathHistoryEntry } from './agent/types.js';
+export type { AgentTraceEvent } from './agent/types.js';
 
 export interface RuntimeConfig {
   projectRoot: string;

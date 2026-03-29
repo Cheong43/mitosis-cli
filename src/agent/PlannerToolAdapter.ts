@@ -16,15 +16,73 @@ interface PlannerToolAdapterOptions {
   runtimeHandle: RuntimeHandle;
 }
 
+interface WebPermissionPolicy {
+  allowedDomains: string[];
+  blockedDomains: string[];
+}
+
+interface WebSearchResultRecord {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+function normalizeDomain(value: string): string {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/\/.*$/, '');
+}
+
+function extractHostname(value: string): string {
+  try {
+    return normalizeDomain(new URL(value).hostname);
+  } catch {
+    return normalizeDomain(value);
+  }
+}
+
+function parseDomainList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return [...new Set(value.map((entry) => normalizeDomain(String(entry || ''))).filter(Boolean))];
+  }
+  if (typeof value === 'string') {
+    return [...new Set(
+      value
+        .split(/[,\s]+/)
+        .map((entry) => normalizeDomain(entry))
+        .filter(Boolean),
+    )];
+  }
+  return [];
+}
+
+function matchesDomainRule(hostname: string, rule: string): boolean {
+  return hostname === rule || hostname.endsWith(`.${rule}`);
+}
+
 export class PlannerToolAdapter {
   private readonly projectRoot: string;
   private readonly codeCliRoot: string;
   private readonly runtimeHandle: RuntimeHandle;
+  private readonly webSearchBudget: number;
+  private readonly defaultWebPermissionPolicy: WebPermissionPolicy;
+  private webSearchUses = 0;
 
   constructor(options: PlannerToolAdapterOptions) {
     this.projectRoot = options.projectRoot;
     this.codeCliRoot = options.codeCliRoot;
     this.runtimeHandle = options.runtimeHandle;
+    const configuredBudget = Number(process.env.MITOSIS_WEB_SEARCH_BUDGET ?? 8);
+    this.webSearchBudget = Number.isFinite(configuredBudget)
+      ? Math.max(0, Math.floor(configuredBudget))
+      : 8;
+    this.defaultWebPermissionPolicy = {
+      allowedDomains: parseDomainList(process.env.MITOSIS_WEB_ALLOWED_DOMAINS),
+      blockedDomains: parseDomainList(process.env.MITOSIS_WEB_BLOCKED_DOMAINS),
+    };
   }
 
   async execute(toolName: PlannerToolName, args: Record<string, unknown>): Promise<string> {
@@ -46,6 +104,166 @@ export class PlannerToolAdapter {
 
   private normalizeTarget(value: unknown): string {
     return String(value || '').trim().toLowerCase();
+  }
+
+  private getWebPermissionPolicy(args: Record<string, unknown>): WebPermissionPolicy {
+    const allowedDomains = parseDomainList(args.allowed_domains);
+    const blockedDomains = parseDomainList(args.blocked_domains);
+    return {
+      allowedDomains: allowedDomains.length > 0 ? allowedDomains : this.defaultWebPermissionPolicy.allowedDomains,
+      blockedDomains: [...new Set([...this.defaultWebPermissionPolicy.blockedDomains, ...blockedDomains])],
+    };
+  }
+
+  private evaluateWebAccess(url: string, policy: WebPermissionPolicy): { allowed: boolean; host: string; reason?: string } {
+    const host = extractHostname(url);
+    if (!host) {
+      return { allowed: false, host: '', reason: 'invalid or missing hostname' };
+    }
+    if (policy.blockedDomains.some((domain) => matchesDomainRule(host, domain))) {
+      return { allowed: false, host, reason: `domain ${host} is blocked` };
+    }
+    if (
+      policy.allowedDomains.length > 0
+      && !policy.allowedDomains.some((domain) => matchesDomainRule(host, domain))
+    ) {
+      return {
+        allowed: false,
+        host,
+        reason: `domain ${host} is outside allowed_domains (${policy.allowedDomains.join(', ')})`,
+      };
+    }
+    return { allowed: true, host };
+  }
+
+  private filterSearchResults(
+    results: WebSearchResultRecord[],
+    policy: WebPermissionPolicy,
+  ): { results: Array<WebSearchResultRecord & { domain: string; citation: string }>; filteredOut: string[] } {
+    const filteredOut: string[] = [];
+    const accepted = results
+      .map((result) => ({ result, access: this.evaluateWebAccess(result.url, policy) }))
+      .filter(({ access }) => {
+        if (access.allowed) {
+          return true;
+        }
+        if (access.host) {
+          filteredOut.push(access.host);
+        }
+        return false;
+      })
+      .map(({ result, access }, index) => ({
+        ...result,
+        domain: access.host,
+        citation: `[${index + 1}]`,
+      }));
+    return { results: accepted, filteredOut: [...new Set(filteredOut)] };
+  }
+
+  private buildSearchBudgetPayload() {
+    return {
+      type: 'search',
+      used: this.webSearchUses,
+      limit: this.webSearchBudget,
+      remaining: Math.max(0, this.webSearchBudget - this.webSearchUses),
+    };
+  }
+
+  private buildWebSearchResponse(
+    query: string,
+    engine: string,
+    results: Array<WebSearchResultRecord & { domain: string; citation: string }>,
+    policy: WebPermissionPolicy,
+    filteredOutDomains: string[],
+  ): string {
+    const citations = results.map((result) => ({
+      citation: result.citation,
+      title: result.title,
+      url: result.url,
+      domain: result.domain,
+      snippet: result.snippet,
+    }));
+    const summaryParts = [
+      `${engine} returned ${results.length} allowed result(s) for ${JSON.stringify(query)}.`,
+      citations.length > 0
+        ? `Best citations to inspect next: ${citations.slice(0, 3).map((item) => `${item.citation} ${item.domain}`).join(', ')}.`
+        : 'No allowed citations remain after filtering.',
+      filteredOutDomains.length > 0
+        ? `Filtered out blocked/disallowed domains: ${filteredOutDomains.join(', ')}.`
+        : '',
+      `Search budget remaining: ${Math.max(0, this.webSearchBudget - this.webSearchUses)}/${this.webSearchBudget}.`,
+    ].filter(Boolean);
+
+    return JSON.stringify({
+      kind: 'web_search',
+      query,
+      engine,
+      summary: summaryParts.join(' '),
+      budget: this.buildSearchBudgetPayload(),
+      permissions: {
+        allowed_domains: policy.allowedDomains,
+        blocked_domains: policy.blockedDomains,
+      },
+      citations,
+      results,
+      recommended_fetch_urls: results.slice(0, 3).map((result) => result.url),
+    });
+  }
+
+  private summarizeFetchedText(text: string): {
+    summary: string;
+    highlights: string[];
+    contentPreview: string;
+    contentLength: number;
+  } {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    const sentences = normalized
+      .split(/(?<=[。！？!?;；.])\s+/)
+      .map((sentence) => sentence.trim())
+      .filter((sentence) => sentence.length >= 40);
+    const uniqueHighlights = [...new Set(sentences)].slice(0, 5).map((sentence) => sentence.slice(0, 240));
+    const contentPreview = normalized.slice(0, 1400);
+    const summaryParts = [
+      normalized
+        ? `Fetched page text length: ${normalized.length} characters.`
+        : 'Fetched page contained little extractable text.',
+      uniqueHighlights.length > 0
+        ? `Top highlights: ${uniqueHighlights.map((highlight, index) => `[${index + 1}] ${highlight}`).join(' ')}`
+        : '',
+    ].filter(Boolean);
+
+    return {
+      summary: summaryParts.join(' '),
+      highlights: uniqueHighlights,
+      contentPreview,
+      contentLength: normalized.length,
+    };
+  }
+
+  private buildWebFetchResponse(
+    url: string,
+    domain: string,
+    title: string,
+    text: string,
+    policy: WebPermissionPolicy,
+  ): string {
+    const fetched = this.summarizeFetchedText(text);
+    return JSON.stringify({
+      kind: 'web_fetch',
+      url,
+      domain,
+      title,
+      citation: '[fetch]',
+      summary: fetched.summary,
+      highlights: fetched.highlights,
+      content_preview: fetched.contentPreview,
+      content_length: fetched.contentLength,
+      recommended_next_action: 'Use the highlights and content_preview first; fetch another page only if critical evidence is still missing.',
+      permissions: {
+        allowed_domains: policy.allowedDomains,
+        blocked_domains: policy.blockedDomains,
+      },
+    });
   }
 
   private async executeRead(args: Record<string, unknown>): Promise<string> {
@@ -121,11 +339,23 @@ export class PlannerToolAdapter {
     const safeWebTimeout =
       Number.isFinite(webTimeoutMs) && webTimeoutMs > 0 ? webTimeoutMs : 15000;
     const mode = String(args.mode || '').trim();
+    const policy = this.getWebPermissionPolicy(args);
 
     if (mode === 'fetch') {
       const url = String(args.url || '').trim();
       if (!url) {
         return JSON.stringify({ kind: 'error', message: 'web fetch requires url' });
+      }
+      const access = this.evaluateWebAccess(url, policy);
+      if (!access.allowed) {
+        return JSON.stringify({
+          kind: 'error',
+          message: `web fetch blocked: ${access.reason || 'domain not allowed'}`,
+          permissions: {
+            allowed_domains: policy.allowedDomains,
+            blocked_domains: policy.blockedDomains,
+          },
+        });
       }
 
       const userAgent =
@@ -161,12 +391,13 @@ export class PlannerToolAdapter {
               .match(/<title>([\s\S]*?)<\/title>/i)?.[1]
               ?.replace(/\s+/g, ' ')
               .trim() || url;
-          return JSON.stringify({
-            kind: 'web_fetch',
+          return this.buildWebFetchResponse(
             url,
+            access.host,
             title,
-            content: this.stripHtml(html).slice(0, 12000),
-          });
+            this.stripHtml(html),
+            policy,
+          );
         } catch (err: any) {
           const isAbort = err?.name === 'AbortError';
           return JSON.stringify({
@@ -192,6 +423,18 @@ export class PlannerToolAdapter {
     if (!query) {
       return JSON.stringify({ kind: 'error', message: 'web search requires query' });
     }
+    if (this.webSearchUses >= this.webSearchBudget) {
+      return JSON.stringify({
+        kind: 'error',
+        message: `web search budget exhausted after ${this.webSearchUses}/${this.webSearchBudget} uses; fetch a promising URL, narrow allowed_domains, or finalize with current evidence.`,
+        budget: this.buildSearchBudgetPayload(),
+        permissions: {
+          allowed_domains: policy.allowedDomains,
+          blocked_domains: policy.blockedDomains,
+        },
+      });
+    }
+    this.webSearchUses += 1;
     const limit = Math.max(
       1,
       Math.min(10, Number.isFinite(Number(args.limit)) ? Math.floor(Number(args.limit)) : 5),
@@ -283,12 +526,15 @@ export class PlannerToolAdapter {
         const response = await fetch(ddgUrl, { headers, signal: ac.signal });
         const html = await response.text();
         if (response.ok) {
-          const results = parseDuckDuckGo(html);
+          const rawResults = parseDuckDuckGo(html);
+          const { results, filteredOut } = this.filterSearchResults(rawResults, policy);
           if (results.length > 0) {
-            return JSON.stringify({ kind: 'web_search', query, results });
+            return this.buildWebSearchResponse(query, 'duckduckgo', results, policy, filteredOut);
           }
+          ddgError = filteredOut.length > 0 ? `filtered out all results (${filteredOut.join(', ')})` : 'empty results';
+        } else {
+          ddgError = `HTTP ${response.status}`;
         }
-        ddgError = `HTTP ${response.status}`;
       } catch (err: any) {
         ddgError = err?.name === 'AbortError' ? 'timed out' : String(err?.message || err);
       } finally {
@@ -307,11 +553,12 @@ export class PlannerToolAdapter {
         if (!response.ok) {
           bingError = `HTTP ${response.status} ${response.statusText}`;
         } else {
-          const results = parseBing(html);
+          const rawResults = parseBing(html);
+          const { results, filteredOut } = this.filterSearchResults(rawResults, policy);
           if (results.length > 0) {
-            return JSON.stringify({ kind: 'web_search', query, results });
+            return this.buildWebSearchResponse(query, 'bing', results, policy, filteredOut);
           }
-          bingError = 'empty results';
+          bingError = filteredOut.length > 0 ? `filtered out all results (${filteredOut.join(', ')})` : 'empty results';
         }
       } catch (err: any) {
         bingError =
@@ -334,15 +581,26 @@ export class PlannerToolAdapter {
           return JSON.stringify({
             kind: 'error',
             message: `DDG: ${ddgError}; Bing: ${bingError}; Baidu: HTTP ${response.status} ${response.statusText}`,
+            budget: this.buildSearchBudgetPayload(),
+            permissions: {
+              allowed_domains: policy.allowedDomains,
+              blocked_domains: policy.blockedDomains,
+            },
           });
         }
-        const results = parseBaidu(html);
+        const rawResults = parseBaidu(html);
+        const { results, filteredOut } = this.filterSearchResults(rawResults, policy);
         if (results.length > 0) {
-          return JSON.stringify({ kind: 'web_search', query, results });
+          return this.buildWebSearchResponse(query, 'baidu', results, policy, filteredOut);
         }
         return JSON.stringify({
           kind: 'error',
           message: `DDG: ${ddgError}; Bing: ${bingError}; Baidu: empty results`,
+          budget: this.buildSearchBudgetPayload(),
+          permissions: {
+            allowed_domains: policy.allowedDomains,
+            blocked_domains: policy.blockedDomains,
+          },
         });
       } catch (err: any) {
         const baiduError =
@@ -352,6 +610,11 @@ export class PlannerToolAdapter {
         return JSON.stringify({
           kind: 'error',
           message: `DDG: ${ddgError}; Bing: ${bingError}; Baidu: ${baiduError}`,
+          budget: this.buildSearchBudgetPayload(),
+          permissions: {
+            allowed_domains: policy.allowedDomains,
+            blocked_domains: policy.blockedDomains,
+          },
         });
       } finally {
         clearTimeout(timer);

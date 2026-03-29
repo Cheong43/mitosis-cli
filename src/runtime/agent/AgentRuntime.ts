@@ -13,7 +13,7 @@ import {
   ToolObservation,
   TranscriptMessage,
 } from './types.js';
-import { Planner } from './SimplePlanner.js';
+import type { Planner } from './Planner.js';
 import { ToolExecutionResult } from '../tools/types.js';
 import {
   compressBranchTranscript,
@@ -316,6 +316,178 @@ function extractArtifactPaths(toolCalls: PlannedToolCall[]): string[] {
   return dedupeNonEmpty(collected);
 }
 
+interface WebSearchRoundSummary {
+  step: number;
+  queries: string[];
+  explicitDomains: string[];
+  resultDomains: string[];
+}
+
+function normalizeHost(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/\/.*$/, '');
+}
+
+function extractHostFromUrl(value: string): string {
+  try {
+    return normalizeHost(new URL(value).hostname);
+  } catch {
+    return '';
+  }
+}
+
+function extractExplicitSearchDomains(query: string): string[] {
+  const matches = query.toLowerCase().matchAll(/\bsite:([a-z0-9.-]+\.[a-z]{2,})\b/g);
+  return dedupeNonEmpty(Array.from(matches, (match) => normalizeHost(match[1] || '')));
+}
+
+function tokenizeSearchQuery(query: string): string[] {
+  return dedupeNonEmpty(
+    query
+      .toLowerCase()
+      .replace(/\bsite:[^\s]+/g, ' ')
+      .match(/[a-z0-9]{2,}|[\u4e00-\u9fff]{2,}/g) || [],
+  );
+}
+
+function querySimilarity(left: string, right: string): number {
+  const normalizedLeft = previewText(left.toLowerCase(), 400);
+  const normalizedRight = previewText(right.toLowerCase(), 400);
+  if (!normalizedLeft || !normalizedRight) {
+    return 0;
+  }
+  if (normalizedLeft === normalizedRight) {
+    return 1;
+  }
+  if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) {
+    return 0.92;
+  }
+
+  const leftTokens = new Set(tokenizeSearchQuery(normalizedLeft));
+  const rightTokens = new Set(tokenizeSearchQuery(normalizedRight));
+  if (leftTokens.size === 0 || rightTokens.size === 0) {
+    return 0;
+  }
+
+  let intersection = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) {
+      intersection += 1;
+    }
+  }
+  const union = new Set([...leftTokens, ...rightTokens]).size;
+  return union > 0 ? intersection / union : 0;
+}
+
+function summarizeWebSearchRound(toolCalls: PlannedToolCall[], step: number): WebSearchRoundSummary | null {
+  if (toolCalls.length === 0) {
+    return null;
+  }
+
+  const queries: string[] = [];
+  const explicitDomains: string[] = [];
+  for (const toolCall of toolCalls) {
+    if (toolCall.name !== 'web' || String(toolCall.arguments?.mode || '').trim() !== 'search') {
+      return null;
+    }
+    const query = String(toolCall.arguments?.query || '').trim();
+    if (!query) {
+      return null;
+    }
+    queries.push(query);
+    explicitDomains.push(...extractExplicitSearchDomains(query));
+  }
+
+  return {
+    step,
+    queries,
+    explicitDomains: dedupeNonEmpty(explicitDomains),
+    resultDomains: [],
+  };
+}
+
+function enrichWebSearchRoundWithObservations(
+  summary: WebSearchRoundSummary | null,
+  observations: ToolObservation[],
+): WebSearchRoundSummary | null {
+  if (!summary) {
+    return null;
+  }
+
+  const resultDomains: string[] = [];
+  for (const observation of observations) {
+    if (observation.toolName !== 'web') {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(String(observation.result || ''));
+      if (parsed?.kind !== 'web_search' || !Array.isArray(parsed.results)) {
+        continue;
+      }
+      for (const result of parsed.results) {
+        if (typeof result?.url === 'string') {
+          const host = extractHostFromUrl(result.url);
+          if (host) {
+            resultDomains.push(host);
+          }
+        }
+      }
+    } catch {
+      // Ignore malformed observations and keep the query-only summary.
+    }
+  }
+
+  return {
+    ...summary,
+    resultDomains: dedupeNonEmpty(resultDomains),
+  };
+}
+
+function hasMaterialSearchDomainShift(
+  current: WebSearchRoundSummary,
+  priorRounds: WebSearchRoundSummary[],
+): boolean {
+  if (current.explicitDomains.length === 0) {
+    return false;
+  }
+  const priorDomains = new Set(
+    priorRounds.flatMap((round) => [...round.explicitDomains, ...round.resultDomains]).map((domain) => normalizeHost(domain)),
+  );
+  return current.explicitDomains.some((domain) => !priorDomains.has(normalizeHost(domain)));
+}
+
+function isNearDuplicateSearchRound(
+  current: WebSearchRoundSummary,
+  priorRound: WebSearchRoundSummary,
+): boolean {
+  if (priorRound.queries.length === 0 || current.queries.length === 0) {
+    return false;
+  }
+  return current.queries.every((query) =>
+    priorRound.queries.some((priorQuery) => querySimilarity(query, priorQuery) >= 0.6));
+}
+
+function clearPendingProviderToolReplay(branch: AgentBranchState): void {
+  const candidate = branch as AgentBranchState & {
+    pendingAnthropicAssistantContent?: unknown;
+    pendingAnthropicToolUseIds?: unknown;
+    pendingOpenAIAssistantMessage?: unknown;
+  };
+  if ('pendingAnthropicAssistantContent' in candidate) {
+    candidate.pendingAnthropicAssistantContent = null;
+  }
+  if ('pendingAnthropicToolUseIds' in candidate) {
+    candidate.pendingAnthropicToolUseIds = [];
+  }
+  if ('pendingOpenAIAssistantMessage' in candidate) {
+    candidate.pendingOpenAIAssistantMessage = null;
+  }
+}
+
 /**
  * AgentRuntime orchestrates the ReAct loop:
  *   thought → tool call → observation → … → final answer
@@ -407,6 +579,7 @@ export class AgentRuntime {
 
     const queue: AgentBranchState[] = [rootBranch];
     const completed: AgentBranchState[] = [];
+    const webSearchRoundHistory = new Map<string, WebSearchRoundSummary[]>();
     const siblingFamilies = new Map<string, { rootId: string; executionGroup: number }>();
     let lastTouchedBranch: AgentBranchState | null = rootBranch;
     let totalLoopSteps = 0;
@@ -508,14 +681,19 @@ export class AgentRuntime {
       if (!syncMessage) {
         return branch.transcript;
       }
-      const tail = branch.transcript.at(-1);
-      if (!tail) {
+      if (branch.transcript.length === 0) {
         return [{ role: 'system', content: syncMessage }];
       }
+      const [head, ...rest] = branch.transcript;
+      if (head?.role === 'system') {
+        return [
+          { role: 'system', content: `${head.content}\n\n${syncMessage}` },
+          ...rest,
+        ];
+      }
       return [
-        ...branch.transcript.slice(0, -1),
         { role: 'system', content: syncMessage },
-        tail,
+        ...branch.transcript,
       ];
     };
 
@@ -690,6 +868,64 @@ export class AgentRuntime {
       toolCalls.length > 1
       && toolCalls.every((toolCall) => AgentRuntime.PARALLEL_SAFE_TOOL_NAMES.has(toolCall.name));
 
+    const noteExecutedToolRound = (
+      branch: AgentBranchState,
+      toolCalls: PlannedToolCall[],
+      observations: ToolObservation[],
+    ) => {
+      const summary = enrichWebSearchRoundWithObservations(
+        summarizeWebSearchRound(toolCalls, branch.steps),
+        observations,
+      );
+      if (!summary) {
+        webSearchRoundHistory.delete(branch.id);
+        return;
+      }
+      const prior = webSearchRoundHistory.get(branch.id) || [];
+      webSearchRoundHistory.set(branch.id, [...prior, summary].slice(-4));
+    };
+
+    const buildRepeatedSearchLoopMessage = (
+      branch: AgentBranchState,
+      currentRound: WebSearchRoundSummary,
+      priorRounds: WebSearchRoundSummary[],
+    ) => {
+      const recentQueries = dedupeNonEmpty(priorRounds.flatMap((round) => round.queries)).slice(-4);
+      const recentDomains = dedupeNonEmpty(priorRounds.flatMap((round) => [...round.explicitDomains, ...round.resultDomains])).slice(0, 6);
+      const lines = [
+        `Blocked near-duplicate web search loop in branch "${branch.label}".`,
+        `You have already spent ${priorRounds.length} consecutive round(s) on near-duplicate web searches.`,
+        recentQueries.length > 0 ? `Recent queries: ${recentQueries.map((query) => JSON.stringify(query)).join(', ')}` : '',
+        recentDomains.length > 0 ? `Observed domains so far: ${recentDomains.join(', ')}` : '',
+        `The newly proposed search queries are still too similar: ${currentRound.queries.map((query) => JSON.stringify(query)).join(', ')}`,
+        'Do not continue the same search loop.',
+        'Your next step must do one of these instead: fetch a promising URL you already found, materially change domains/source type/language/date scope, or finalize with the best available evidence and explicit uncertainty.',
+      ].filter(Boolean);
+      return lines.join('\n');
+    };
+
+    const shouldBlockRepeatedSearchLoop = (
+      branch: AgentBranchState,
+      toolCalls: PlannedToolCall[],
+    ): string | null => {
+      const currentRound = summarizeWebSearchRound(toolCalls, branch.steps);
+      if (!currentRound) {
+        return null;
+      }
+      const history = webSearchRoundHistory.get(branch.id) || [];
+      if (history.length < 2) {
+        return null;
+      }
+      const priorRounds = history.slice(-2);
+      if (!priorRounds.every((round) => isNearDuplicateSearchRound(currentRound, round))) {
+        return null;
+      }
+      if (hasMaterialSearchDomainShift(currentRound, priorRounds)) {
+        return null;
+      }
+      return buildRepeatedSearchLoopMessage(branch, currentRound, priorRounds);
+    };
+
     const executeToolStep = async (branch: AgentBranchState, toolCalls: PlannedToolCall[]) => {
       let observations: ToolObservation[];
       if (canRunToolCallsConcurrently(toolCalls)) {
@@ -735,6 +971,7 @@ export class AgentRuntime {
           .map((observation) => `${observation.toolName}: ${previewText(observation.result, 120)}`),
         artifacts: extractArtifactPaths(toolCalls),
       });
+      noteExecutedToolRound(branch, toolCalls, observations);
 
       if (shouldRuntimeTraceTool()) {
         observations.forEach((observation) => emitObservationTrace(branch, observation));
@@ -771,7 +1008,7 @@ export class AgentRuntime {
           },
           {
             role: 'user',
-            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nExecution group: ${executionGroup}\nDepends on sibling labels: ${dependsOn.length ? dependsOn.join(', ') : 'none'}\nSibling branches in the same execution group may run in parallel. Higher execution groups wait until all lower groups under the same parent finish.\nIf depends_on is set, this branch should not start until those sibling labels have already finished.\nChild branches are for evidence gathering, option comparison, and focused sub-problem solving.\nUse execution_group and depends_on as the coordination contract when sibling work must be ordered.\nIf this child goal can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing direct work tools.\nDo not use multiple near-duplicate web searches as a substitute for branching.\nIf you emit multiple web searches in one response, vary the actual query terms and search dimensions, not just punctuation or word order. Change at least two of: keywords, aliases, domains, dates, language, or source type.\nYou may use tool calls, branch further if the goal benefits from parallel exploration, or return a final answer. Avoid repeating sibling work.${structuredHandoffBlock ? `\n\nStructured remediation handoff:\n${structuredHandoffBlock}` : ''}${kanbanSyncMessage ? `\n\n${kanbanSyncMessage}` : ''}`,
+            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nExecution group: ${executionGroup}\nDepends on sibling labels: ${dependsOn.length ? dependsOn.join(', ') : 'none'}\nThis branch owns only its local sub-problem.\nSibling branches in the same execution group may run in parallel. Higher execution groups wait until all lower groups under the same parent finish.\nIf depends_on is set, this branch should not start until those sibling labels have already finished.\nTreat execution_group and depends_on as binding coordination constraints, not hints.\nOnly do work that can make useful progress within this branch's scope. Do not perform downstream integration early if that integration mainly depends on sibling outputs that are still being produced elsewhere.\nRe-branch only if this branch still contains multiple genuinely independent substreams with low coordination risk. Do not branch again by default.\nDo not use multiple near-duplicate web searches as a substitute for branching.\nIf you emit multiple web searches in one response, vary the actual query terms and search dimensions, not just punctuation or word order. Change at least two of: keywords, aliases, domains, dates, language, or source type.\nYou may use tool calls, branch further if the goal truly benefits from independent sub-work, or return a final answer. Avoid repeating sibling work.${structuredHandoffBlock ? `\n\nStructured remediation handoff:\n${structuredHandoffBlock}` : ''}${kanbanSyncMessage ? `\n\n${kanbanSyncMessage}` : ''}`,
           },
         ];
 
@@ -917,6 +1154,26 @@ export class AgentRuntime {
               role: 'user',
               content: 'You chose a tool step but did not include any usable tool calls. Continue with at least one tool call or finish this branch.',
             });
+            continue;
+          }
+          const repeatedSearchLoopMessage = shouldBlockRepeatedSearchLoop(branch, toolCalls);
+          if (repeatedSearchLoopMessage) {
+            clearPendingProviderToolReplay(branch);
+            branch.transcript.push({
+              role: 'user',
+              content: repeatedSearchLoopMessage,
+            });
+            upsertKanbanCard(branch, {
+              status: 'active',
+              summary: 'Blocked near-duplicate web search loop; replanning required.',
+              blockers: ['repeated near-duplicate web search loop'],
+            });
+            emitBranchTrace(
+              'observation',
+              branch,
+              'Blocked near-duplicate web search loop; next step must fetch, materially change domains, or finalize.',
+              { toolNames: toolCalls.map((toolCall) => toolCall.name) },
+            );
             continue;
           }
           await executeToolStep(branch, toolCalls);

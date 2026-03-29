@@ -89,6 +89,33 @@ test('one Agent instance supports concurrent runs across different conversation 
   agent.stop();
 });
 
+test('live turns skip context retrieval before planning', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-skip-context-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  let retrievalCalls = 0;
+
+  anyAgent.retrieveRelevantContext = async () => {
+    retrievalCalls += 1;
+    throw new Error('retrieveRelevantContext should not be called');
+  };
+  anyAgent.generatePlannerDecision = async () => ({
+    kind: 'final',
+    thought: 'Done.',
+    final_answer: 'ok',
+    completion_summary: 'ok',
+  });
+
+  const traces: TraceEvent[] = [];
+  const answer = await agent.run('hi', (event) => { traces.push(event); }, { conversationId: 'thread-skip-context' });
+
+  assert.equal(answer, 'ok');
+  assert.equal(retrievalCalls, 0);
+  assert.ok(traces.some((event) => event.content.includes('Context retrieval is disabled for live turns.')));
+
+  agent.stop();
+});
+
 test('planner uses structured decision generation instead of raw JSON text repair', async () => {
   const projectRoot = createTempProjectRoot('mempedia-agent-structured-');
   const agent = new Agent({ apiKey: 'test-key', model: 'Doubao-Seed-2.0-pro' }, projectRoot);
@@ -712,17 +739,22 @@ test('planner prompt keeps branching guidance principle-based without root coerc
 
   const answer = await agent.run('竭尽所能收集中英今天的盘前信源', () => {}, { conversationId: 'thread-branch-guidance' });
   assert.equal(answer, 'ok');
-  assert.match(capturedPrompt, /independent sub-goals that are worth exploring in parallel/i);
-  assert.match(capturedPrompt, /Decompose aggressively/i);
-  assert.match(capturedPrompt, /default toward planner_branch on the first meaningful step/i);
-  assert.match(capturedPrompt, /task can be decomposed into independent parts/i);
-  assert.match(capturedPrompt, /multiple plausible independent avenues to explore/i);
+  assert.match(capturedPrompt, /Optimize for correct end-to-end completion of the user's deliverable/i);
+  assert.match(capturedPrompt, /classify candidate workstreams as one of four relationships/i);
+  assert.match(capturedPrompt, /If work is inseparable, or if dependency is unclear, prefer fewer branches/i);
+  assert.match(capturedPrompt, /Branch only when genuine independent progress is available/i);
+  assert.match(capturedPrompt, /For integrated artifacts such as websites, reports, refactors, or single deliverables/i);
+  assert.match(capturedPrompt, /Raise the priority of execution-structure planning over immediate tool use/i);
+  assert.match(capturedPrompt, /Treat branching as parallel task planning/i);
   assert.match(capturedPrompt, /call read\/search\/edit\/bash\/web directly for work/i);
   assert.match(capturedPrompt, /Prefer materially diverse search strategies/i);
-  assert.match(capturedPrompt, /If this branch can still be split into 2 or more genuinely independent evidence streams or workstreams/i);
+  assert.match(capturedPrompt, /Branches may share the same execution_group only when each branch can make useful progress without waiting for sibling outputs/i);
+  assert.match(capturedPrompt, /Re-branch only when the current branch still contains multiple independent workstreams with low coordination cost/i);
   assert.match(capturedPrompt, /each must target a genuinely different evidence stream or hypothesis/i);
   assert.match(capturedPrompt, /After 2-3 consecutive web\/search rounds without clear new information/i);
   assert.match(capturedPrompt, /Keep every `goal` concise and comfortably under the 240-character schema limit/i);
+  assert.match(capturedPrompt, /Planning view only/i);
+  assert.doesNotMatch(capturedPrompt, /Shared context for this request:/i);
   assert.doesNotMatch(capturedPrompt, /Always provide at least 2 branches/i);
   assert.doesNotMatch(capturedPrompt, /NEVER branch on the first step/i);
   assert.doesNotMatch(capturedPrompt, /default to one `web` tool call before branching/i);
@@ -784,6 +816,7 @@ test('sequential execution-discipline decisions use strict plan-and-execute inst
   assert.ok(executionPrompt);
   assert.match(planningPrompt!, /You are a branching ReAct agent/i);
   assert.match(planningPrompt!, /PLAN stage/i);
+  assert.match(planningPrompt!, /Raise the priority of execution-structure planning over immediate tool use/i);
   assert.doesNotMatch(planningPrompt!, /Planning is strictly read-only/i);
   assert.match(executionPrompt!, /You are a classic ReAct agent/i);
   assert.match(executionPrompt!, /EXECUTE stage/i);
@@ -978,13 +1011,15 @@ test('child branch prompts stay on direct work tools instead of inheriting legac
     }
 
     assert.match(joined, /Call read\/search\/edit\/bash\/web directly for work/i);
+    assert.match(joined, /Planning view only/i);
     assert.doesNotMatch(joined, /Return exactly one JSON object/i);
     assert.doesNotMatch(joined, /\{"kind":"branch"/);
     assert.doesNotMatch(joined, /planner_tool/i);
+    assert.doesNotMatch(joined, /TOOL OBSERVATION for read:/);
+    assert.doesNotMatch(joined, /Shared context for this request:/);
 
-    if (joined.includes('TOOL OBSERVATION for read:')) {
+    if (sawChildPrompt) {
       sawPostToolPrompt = true;
-      assert.match(joined, /PLANNER TOOL DECISION:/);
       assert.doesNotMatch(joined, /\{"kind":"tool"/);
       return {
         kind: 'final',
@@ -995,7 +1030,6 @@ test('child branch prompts stay on direct work tools instead of inheriting legac
     }
 
     sawChildPrompt = true;
-    assert.match(joined, /PLANNER BRANCH DECISION:/);
     return {
       kind: 'tool',
       thought: 'Read the note file for concrete evidence.',
@@ -1012,6 +1046,7 @@ test('child branch prompts stay on direct work tools instead of inheriting legac
   const answer = await agent.run('检查子分支 planner transcript', () => {}, { conversationId: 'thread-child-tool-regression' });
   assert.equal(answer, '已基于 note.txt 完成验证。');
   assert.equal(sawChildPrompt, true);
+  assert.equal(sawPostToolPrompt, true);
   assert.equal(sawPostToolPrompt, true);
 
   agent.stop();

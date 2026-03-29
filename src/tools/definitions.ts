@@ -95,7 +95,7 @@ export const TOOLS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'web',
-      description: 'Search the web (returns title + url + snippet per result) or fetch a specific web page. Use for external/current information not in the workspace.',
+      description: 'Search the web with budget/permission-aware citation results, or fetch a specific web page into a citation summary with highlights and a short preview. Use for external/current information not in the workspace.',
       parameters: {
         type: 'object',
         properties: {
@@ -103,6 +103,16 @@ export const TOOLS: ToolDefinition[] = [
           query: { type: 'string', description: 'Search query when mode=search.' },
           url: { type: 'string', description: 'URL to fetch when mode=fetch.' },
           limit: { type: 'number', description: 'Maximum number of search results.' },
+          allowed_domains: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional domain allowlist. When set, only these domains/subdomains may appear in results or be fetched.',
+          },
+          blocked_domains: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional domain blocklist. Matching domains/subdomains are removed from results and cannot be fetched.',
+          },
         },
         required: ['mode'],
       },

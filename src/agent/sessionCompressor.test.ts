@@ -38,7 +38,7 @@ test('isRunExhausted: detects exhaustion in final answer', () => {
   assert.ok(isRunExhausted(traces, 'Branch B0 stopped because step budget reached.'));
 });
 
-test('isRunExhausted: detects beam search depth exhaustion', () => {
+test('isRunExhausted: detects depth exhaustion wording', () => {
   const traces: TraceEventLike[] = [
     { type: 'observation', content: 'Maximum depth reached without a final answer.' },
   ];

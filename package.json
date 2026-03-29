@@ -18,12 +18,13 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.80.0",
+    "@ai-sdk/anthropic": "^3.0.64",
+    "@ai-sdk/openai-compatible": "^2.0.37",
+    "ai": "^6.0.141",
     "dotenv": "^16.4.7",
     "ink": "^5.0.1",
     "ink-text-input": "^6.0.0",
     "json5": "^2.2.3",
-    "openai": "^6.32.0",
     "react": "^18.2.0",
     "zod": "^3.24.1"
   },

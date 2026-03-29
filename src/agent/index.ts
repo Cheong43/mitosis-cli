@@ -9,6 +9,8 @@ import {
   type ChatMessageContent,
   type AnthropicMessageContentBlock,
   type AnthropicToolResultContentBlock,
+  type OpenAIAssistantReplayContent,
+  type OpenAIToolResultReplayContent,
 } from './llm.js';
 import { MempediaClient } from '../mempedia/client.js';
 import { ToolAction } from '../mempedia/types.js';
@@ -220,6 +222,7 @@ interface PlannerDecisionResult {
   decision: PlannerDecision;
   anthropicAssistantContent?: AnthropicMessageContentBlock[];
   anthropicToolUseIds?: string[];
+  openaiAssistantMessage?: Record<string, unknown>;
 }
 interface ExecutablePlannerDecisionResult extends Omit<PlannerDecisionResult, 'decision'> {
   decision: ExecutablePlannerDecision;
@@ -314,6 +317,7 @@ interface BranchState {
   savedNodeIds: string[];
   pendingAnthropicAssistantContent?: AnthropicMessageContentBlock[] | null;
   pendingAnthropicToolUseIds?: string[];
+  pendingOpenAIAssistantMessage?: Record<string, unknown> | null;
   completionSummary?: string;
   finalAnswer?: string;
   outcome?: BranchOutcome;
@@ -501,9 +505,18 @@ export class Agent {
     this.model = config.anthropicModel || config.model || 'gpt-4o';
     this.memoryModel = config.memoryModel || this.model;
 
-    // ── Primary LLM: prefer Anthropic if configured ────────────────────
+    // ── Primary LLM: prefer MiniMax OpenAI-compat when available ───────
     const useAnthropic = Boolean(config.anthropicAuthToken);
-    if (useAnthropic) {
+    const primaryOpenAICompatBaseURL = this.deriveOpenAICompatBaseURL(config.baseURL)
+      || this.deriveOpenAICompatBaseURL(config.anthropicBaseURL);
+    const useOpenAICompat = Boolean(config.anthropicAuthToken && primaryOpenAICompatBaseURL);
+    if (useOpenAICompat) {
+      this.openai = buildLanguageModel({
+        model: this.model,
+        apiKey: config.apiKey || config.anthropicAuthToken!,
+        baseURL: primaryOpenAICompatBaseURL,
+      });
+    } else if (useAnthropic) {
       const anthropicModel = buildAnthropicLanguageModel({
         model: this.model,
         authToken: config.anthropicAuthToken!,
@@ -523,10 +536,18 @@ export class Agent {
 
     // ── Memory LLM: reuse Anthropic if no separate memory config ───────
     const memoryBaseURL = config.memoryBaseURL || config.baseURL;
+    const memoryOpenAICompatBaseURL = this.deriveOpenAICompatBaseURL(config.memoryBaseURL)
+      || primaryOpenAICompatBaseURL;
     const memoryAccessKey = config.memoryHmacAccessKey || config.hmacAccessKey;
     const memorySecretKey = config.memoryHmacSecretKey || config.hmacSecretKey;
     const memoryGatewayKey = config.memoryGatewayApiKey || config.gatewayApiKey;
-    if (useAnthropic && !config.memoryApiKey) {
+    if (useOpenAICompat) {
+      this.memoryOpenai = buildLanguageModel({
+        model: this.memoryModel,
+        apiKey: config.memoryApiKey || config.apiKey || config.anthropicAuthToken!,
+        baseURL: memoryOpenAICompatBaseURL || primaryOpenAICompatBaseURL,
+      });
+    } else if (useAnthropic && !config.memoryApiKey) {
       this.memoryOpenai = buildAnthropicLanguageModel({
         model: this.memoryModel,
         authToken: config.anthropicAuthToken!,
@@ -601,6 +622,20 @@ export class Agent {
       rpmLimiter: this.llmRpmLimiter,
     });
     this.sessionCompressor = new SessionCompressor();
+  }
+
+  private deriveOpenAICompatBaseURL(baseURL?: string): string | undefined {
+    const normalized = String(baseURL || '').trim();
+    if (!normalized) {
+      return undefined;
+    }
+    if (/\/v1\/?$/i.test(normalized)) {
+      return normalized.replace(/\/+$/g, '');
+    }
+    if (/api\.minimaxi\.com/i.test(normalized) && /\/anthropic\/?$/i.test(normalized)) {
+      return normalized.replace(/\/anthropic\/?$/i, '/v1');
+    }
+    return undefined;
   }
 
   onBackgroundTask(callback: (task: string, status: 'started' | 'completed') => void) {
@@ -785,7 +820,7 @@ export class Agent {
     if (allowBranching) {
       tools.push({
         name: 'planner_branch',
-        description: 'Split the work into distinct child loops. Keep each branch goal short and concrete, comfortably under 240 characters. Use execution_group for broad waves and depends_on for precise sibling prerequisites within the same planner_branch call.',
+        description: 'Split work into child loops only when they can make useful progress independently. Each planner_branch call should describe the full sibling coordination graph for that parent step. Keep each branch goal short and concrete, comfortably under 240 characters. Use execution_group for ordered waves and depends_on for exact sibling prerequisites within the same planner_branch call. If one branch mainly integrates outputs from others, place it in a later wave or keep it out of branching.',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -2276,8 +2311,13 @@ Return exactly one JSON object with this shape:
 {"mode":"branching"|"sequential","reason":"short reason"}
 
 Use first-principles task reasoning, not keyword matching.
-Choose "sequential" when successful execution likely requires coordinated writes to shared workspace files/directories, non-isolated shell side effects, or one executor integrating ordered changes that sibling branches would contend on.
-Choose "branching" when the work can proceed as genuinely independent research, evaluation, or isolated workstreams with low coordination risk.
+Optimize for end-to-end correctness and coordination safety, not maximum parallelism.
+Both modes should begin from planning. The real choice is between one ordered plan and one parallel coordination plan.
+Choose "sequential" when the request mainly produces one integrated artifact or one ordered implementation thread, especially when later steps need outputs, decisions, or constraints produced by earlier steps. This includes coordinated writes to shared workspace files/directories, non-isolated shell side effects, or one executor integrating ordered changes that sibling branches would otherwise contend on. Choosing "sequential" here means the work should converge to one ordered owner even if some planning or research could still be parallelized.
+Choose "branching" when the work benefits from a parallel task plan: substantial parts can make useful progress independently without waiting for sibling outputs, and the plan can be expressed as a small coordination graph with low coordination risk.
+A brief upfront plan does not by itself require "sequential"; branching is still a form of planning when the work can be decomposed safely.
+Raise the priority of execution-structure planning over immediate tool use when the safer next step is not obvious.
+When in doubt, prefer the mode whose plan shape is clearer; if independent progress is plausible and coordination risk is low, lean "branching".
 Keep the reason short and concrete.`,
       },
       {
@@ -2347,7 +2387,7 @@ Decide the safer execution discipline for this turn.`,
 
     return {
       mode: 'branching',
-      reason: 'Execution-discipline gate did not reach a confident sequential-only conclusion.',
+      reason: 'Execution-discipline gate defaulted to branching; decide the coordination graph before direct tool work.',
     };
   }
 
@@ -2478,7 +2518,7 @@ Decide the safer execution discipline for this turn.`,
           messages: [
             {
               role: 'system',
-              content: 'You are a context selector. First assume all recalled context may be noisy. Then choose only the context candidates that are directly relevant to the current user request. Return JSON only: {"relevant_node_ids":[...],"rationale":"..."}. Select at most 3 node ids.',
+              content: 'You are a context selector. Treat recalled context as noisy by default. Choose only the candidates that are directly relevant to the current user request in light of the selected recent conversation turns. Prefer candidates that clarify entities, constraints, decisions, or unresolved work carried forward from the recent turns, even if the current request is short or elliptical. Ignore candidates that only match older tangents. Return JSON only: {"relevant_node_ids":[...],"rationale":"..."}. Select at most 3 node ids.',
             },
             {
               role: 'user',
@@ -2738,9 +2778,7 @@ Decide the safer execution discipline for this turn.`,
 1.1 如果内容明确来自 README、源码、配置、项目目录或其他仓库文件，并且回答总结了项目架构、模块职责、存储结构、接口能力、构建方式等稳定事实，应优先提取到 atomic_knowledge。
 2. Layer 3 User Preferences：仅提取稳定偏好，不要临时状态。
 3. Layer 4 Agent Skills：只提取可复用流程/策略，避免一次性日志。
-4. 不要逐字复制对话；保留抽象、可复用长期知识。
-5. 严禁输出寒暄、临时上下文、错误堆栈。
-6. 忽略类似“Original user request”“Active branch”“Branch goal”这类调度包装文本，不要把它们当作知识点。`;
+4. 不要逐字复制对话；保留抽象、可复用长期知识，并忽略寒暄、临时上下文、错误堆栈与所有调度包装文本（如“Original user request”“Active branch”“Branch goal”）。`;
 
     const userPayload = `用户输入:\n${compactInput}\n\n执行轨迹:\n${compactTraces}\n\n最终回答:\n${compactAnswer}`;
     try {
@@ -3070,21 +3108,10 @@ Decide the safer execution discipline for this turn.`,
     const rawAutoQueueMemorySave = String(process.env.AUTO_QUEUE_MEMORY_SAVE ?? '1').toLowerCase();
     const autoQueueMemorySave = rawAutoQueueMemorySave !== '0' && rawAutoQueueMemorySave !== 'false' && rawAutoQueueMemorySave !== 'off';
     let memoryQueuedThisRun = false;
-    try {
-      const retrieved = await this.measure(perfEntries, 'context_retrieval', async () =>
-        this.retrieveRelevantContext(input, selectedConversationTurns, perfEntries)
-      );
-      context = retrieved.contextText;
-      recalledNodeIds = retrieved.recalledNodeIds;
-      selectedNodeIds = retrieved.selectedNodeIds;
-      emitTrace({
-        type: 'observation',
-        content: `Recalled ${recalledNodeIds.length} context candidate(s); selected ${selectedNodeIds.length} relevant node(s). ${retrieved.rationale}`,
-      });
-    } catch (e: any) {
-      console.error('Context retrieval failed:', e);
-      context = 'Failed to retrieve context from Mempedia.';
-    }
+    emitTrace({
+      type: 'observation',
+      content: 'Recalled 0 context candidate(s); selected 0 relevant node(s). Context retrieval is disabled for live turns.',
+    });
 
     // ── Session carry-over from previous exhausted runs ─────────────────
     const carryOver = this.sessionCompressor.getCarryOver(conversationId);
@@ -3133,25 +3160,11 @@ Decide the safer execution discipline for this turn.`,
     const isBranchingMode = agentMode === 'branching';
     const isPlanStage = runPhase === 'plan';
     const isExecuteStage = runPhase === 'execute';
-
-    const systemPrompt = isBranchingMode
-      ? `You are a branching ReAct agent.
-Treat ReAct as a functional loop. A branch is an independent child loop with its own thought -> action -> observation state.
-
-${isPlanStage ? `PLAN-AND-EXECUTE CONTRACT:
-You are in the PLAN stage.
-Prioritize producing one coherent execution plan for a single sequential executor.
-You may inspect, compare options, and use tools when needed, but finish by returning an execution plan via planner_final.
-` : ''}
-
-BRANCHING PHILOSOPHY:
-Before deciding on any action, first ask: "Can this goal be decomposed into independent sub-goals that are worth exploring in parallel?"
-If yes, prefer the control tool named planner_branch over direct work-tool calls.
-Decompose aggressively — many goals that appear simple on the surface have multiple angles (different sources, different sub-tasks, alternative strategies, independent file locations, etc.) that benefit from concurrent exploration.
-In branching mode, default toward planner_branch on the first meaningful step whenever the task can be decomposed into independent parts or there are multiple plausible independent avenues to explore. Only skip branching when the next action is clearly atomic and parallel exploration would not help.
-However, only branch when branches are genuinely distinct. If two branches would perform the exact same work or one is strictly a prerequisite of the other, do NOT split them — call the needed work tool directly instead.
-
-You only use five top-level tools:
+    const joinPromptSections = (...sections: Array<string | false | null | undefined>): string =>
+      sections.filter((section): section is string => typeof section === 'string' && section.trim().length > 0).join('\n\n');
+    const renderPromptList = (items: string[], ordered = false): string =>
+      items.map((item, index) => `${ordered ? `${index + 1}.` : '-'} ${item}`).join('\n');
+    const sharedToolAndTargetGuidance = `You only use five top-level tools:
   read   -> read semantic targets such as workspace files, memory nodes, preferences, or skills
   search -> search semantic targets such as workspace, memory, preferences, or skills
   edit   -> edit semantic targets such as workspace files, memory nodes, preferences, or skills
@@ -3162,151 +3175,170 @@ Tool target guidance:
   target=workspace   -> normal repository files
   target=memory      -> Mempedia nodes and episodic memory search
   target=preferences -> project preference markdown
-  target=skills      -> local SKILL.md guidance files
-
-Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md and ./.github/skills/*/SKILL.md.
+  target=skills      -> local SKILL.md guidance files`;
+    const sharedSkillAndKnowledgeGuidance = `Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md and ./.github/skills/*/SKILL.md.
 ${localSkillsIndex ? `${localSkillsIndex}\n` : ''}Skills are guidance documents, not tool names. Never emit skill names such as project-discovery in tool_calls.name.
 If skill guidance has been injected for the turn, treat it as internal policy only. Do not inspect the skills directory, verify skill files, or summarize skill text back to the user unless the user explicitly asked about skills.
 When you save knowledge, prefer markdown-first notes that preserve concrete facts, numbers, data points, historical changes, viewpoints, evidence, and explicit uncertainties instead of terse summaries.
-    Separate facts from opinions or viewpoints. Never fabricate facts; if something is uncertain, attribute it or mark it as uncertain.
+Separate facts from opinions or viewpoints. Never fabricate facts; if something is uncertain, attribute it or mark it as uncertain.`;
+    const sharedGeneralRules = renderPromptList([
+      'Raise the priority of execution-structure planning over immediate tool use. In both sequential and branching modes, decide the plan shape first: one ordered owner or one explicit coordination graph.',
+      'Prefer search before edit when the correct answer may already exist in repository files.',
+      'For repository discovery, prefer read and search on workspace evidence before using web.',
+      'Prefer relative file paths rooted at the current project. Use absolute paths only when necessary for clarity or when the tool requires them.',
+      'The skill catalog is lightweight; request full skill guidance only when it materially changes the next step.',
+      'Do not answer a project-overview question by listing local skills unless the user explicitly asked about the skill system.',
+      'Use bash whenever shell is the practical tool, but remember dangerous shell operations are sandboxed and should require confirmation.',
+    ]);
+    const sharedWebRules = renderPromptList([
+      'Use web for questions about external topics, current events, APIs, libraries, or anything not answerable from workspace files. Prefer workspace evidence only for project-specific questions. When web search returns results, read the snippet field first; fetch a page only when the snippet is insufficient.',
+      'Prefer materially diverse search strategies over paraphrased near-duplicate queries.',
+      'web mode=search returns citation-oriented results with snippets, domains, budget, and permission metadata; web mode=fetch returns a citation summary with highlights and a short preview instead of dumping the whole page.',
+      'Treat web search as a budgeted tool, not an open-ended browsing loop. If budget is getting low, narrow scope with allowed_domains or switch to fetch/finalize.',
+      'When source quality matters, pass allowed_domains or blocked_domains instead of hoping the search engine ranking is good enough.',
+      'When you need current or external information, use web proactively instead of guessing from training data.',
+      'If you issue multiple web/search calls in one response, each must target a genuinely different evidence stream or hypothesis. Do not batch paraphrased near-duplicate queries. Vary at least two of: keywords, aliases, domains, dates, language, or source type.',
+      'When a web search is weak, noisy, or repetitive, change strategy materially before searching again. Vary keywords, aliases, dates, source types, domains, languages, jurisdictions, or fetch a promising result instead of issuing another broad near-duplicate search.',
+      'After 2-3 consecutive web/search rounds without clear new information, do not continue the same-category search loop. Either call planner_final with the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy.',
+    ]);
+    const sharedCompletionAndStorageRules = renderPromptList([
+      'When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.',
+      'When you finish, call planner_final with a direct user-facing answer.',
+      'When calling planner_final, always set `outcome` to `success`, `partial`, or `failed`. If a test or validation failed, set outcome=`failed` and include the key error in `outcome_reason`. Also set `disposition` when possible: `missing_evidence`, `blocked_external`, `exhausted_search`, or `planner_error`.',
+      'NEVER use `edit target=workspace` to write directly into raw `.mempedia` storage. Use semantic targets instead: `target=memory`, `target=preferences`, or `target=skills`.',
+      'NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value.',
+    ]);
+    const sharedSkillReviewRules = renderPromptList([
+      'Always-active skills are pre-loaded in this system prompt and are already binding; do NOT request them again via planner_skills. For other skills in the catalog whose description overlaps with the task, call planner_skills to load their full guidance before the first tool call. If no additional skill is needed, proceed directly to read/search/edit/bash/web.',
+      'After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.',
+      'For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.',
+      'If the user asks what is in Mempedia or what skills are available, prefer `search/read` with `target=memory` or `target=skills` before planner_final.',
+    ]);
+    const branchingSkillReviewRules = sharedSkillReviewRules.replace(
+      'proceed directly to read/search/edit/bash/web.',
+      'proceed directly to read/search/edit/bash/web or planner_branch.',
+    );
+    const plainTextOnlyRule = 'Return only plain natural-language text for the user. Do not output tool calls, internal control markup, XML-like tags, or any structured wrapper markup.';
+    const sharedPromptFooter = joinPromptSections(
+      alwaysIncludeBlock ? `${alwaysIncludeBlock}
 
+IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool-call arguments. They are not the planner response format.` : '',
+      `Available tools:
+${toolCatalog}`,
+      `Shared context for this request:
+${context || '(no context found)'}`,
+      `Selected context node ids:
+${selectedNodeIds.length > 0 ? selectedNodeIds.join(', ') : '(none)'}`,
+      soulsGuidance ? `Global souls.md guidance:
+${soulsGuidance}` : '',
+    );
+    const plannerPromptFooter = joinPromptSections(
+      alwaysIncludeBlock ? `${alwaysIncludeBlock}
 
-CONTROL TOOLS:
-- planner_branch: split the work into distinct independent child loops.
+IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool-call arguments. They are not the planner response format.` : '',
+      `Available tools:
+${toolCatalog}`,
+      soulsGuidance ? `Global souls.md guidance:
+${soulsGuidance}` : '',
+    );
+    const branchingModeSpecificRule = isPlanStage
+      ? 'Because this is the PLAN stage, planner_final must return one ordered execution plan for a single owner, not a claim that the code has already been changed.'
+      : 'Treat execution_group and depends_on as the explicit work graph for sibling coordination. Use them whenever waves or prerequisites exist.';
+    const sequentialModeSpecificRule = isExecuteStage
+      ? 'Treat the approved plan as binding. Execute it step by step instead of improvising parallel alternatives.'
+      : 'Stay sequential and do not branch.';
+
+    const buildBranchingModePrompt = (footer: string) => joinPromptSections(
+          'You are a branching ReAct agent.\nTreat ReAct as a functional loop. A branch is an independent child loop with its own thought -> action -> observation state.',
+          isPlanStage ? `PLAN-AND-EXECUTE CONTRACT:
+You are in the PLAN stage.
+Prioritize producing one coherent execution plan for a single sequential executor.
+You may inspect, compare options, and use tools when needed, but finish by returning an execution plan via planner_final.` : '',
+          `COORDINATION PHILOSOPHY:
+Optimize for correct end-to-end completion of the user's deliverable, not maximum branch count or maximum parallelism.
+Before calling planner_branch, classify candidate workstreams as one of four relationships:
+- independent: each workstream can make useful progress without waiting for sibling outputs.
+- wave-gated: later work depends on conclusions from earlier waves, but not on one exact sibling label.
+- strict prerequisite: a workstream needs concrete outputs from specific sibling labels.
+- inseparable: one workstream would mostly integrate, apply, or package another workstream's outputs.
+Treat branching as parallel task planning, not as permission to skip planning and jump straight into tool churn.
+Only independent workstreams belong in the same execution_group.
+Use higher execution_group values for wave-gated work.
+Use depends_on for strict prerequisites within the same planner_branch call.
+If work is inseparable, or if dependency is unclear, prefer fewer branches, more ordering, or a single owner rather than parallel siblings.
+Branch only when genuine independent progress is available. Do not branch merely because the task has multiple stages.
+For integrated artifacts such as websites, reports, refactors, or single deliverables, branch mainly for planning, research, or option comparison; keep implementation and integration ordered unless parts are truly isolated.`,
+          sharedToolAndTargetGuidance,
+          sharedSkillAndKnowledgeGuidance,
+          `CONTROL TOOLS:
+- planner_branch: express the current step as a small coordination graph of distinct child loops only when real independence exists.
 - planner_final: finish with a direct user-facing answer in final_answer.
 - planner_skills: request full guidance for one or two local skills before continuing.
 - For normal work, call read/search/edit/bash/web directly.
 - Your response must be one or more tool calls. Never reply with plain text or raw JSON.
-- Never mix control tools with direct work-tool calls in the same response.
-
-Rules:
-1. DECOMPOSE FIRST: Before executing any single tool call, ask "can this goal be split into independent sub-goals?" If yes, call planner_branch instead of direct work tools. Only fall back to direct work-tool calls when the next action is atomic and cannot be meaningfully parallelised.
-2. DEFAULT TO BRANCHING: In branch mode, start with planner_branch whenever the task can be split into independent sub-problems or there are multiple plausible independent approaches, hypotheses, evidence sources, or workstreams worth exploring. If the next action is obviously atomic, direct work tools are fine.
-3. Use planner_branch liberally for: (a) independent sub-tasks within a goal, (b) parallel information gathering from different sources, (c) alternative strategies or hypotheses to evaluate concurrently, (d) different files/modules/topics that can be researched simultaneously, (e) multi-part user requests where parts do not depend on each other.
-4. Each branch must have a genuinely distinct purpose, a unique label, and a different goal string. Write branch goals as short executable instructions, not mini-paragraphs. Keep every \`goal\` concise and comfortably under the 240-character schema limit. Do NOT branch when: both branches would issue the same tool call, one branch is a strict prerequisite of the other, or the task is a single atomic read/write/search. Redundant or near-duplicate branches waste budget and degrade quality.
-4a. Inside an existing child branch, if the child goal can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing batches of direct work tools.
-4b. When some sibling branches may run together while later siblings must wait, set \`execution_group\`. Branches in the same \`execution_group\` may run in parallel; higher groups wait for all lower groups under the same parent to finish. For example, two evidence branches can both use \`execution_group=1\`, and a synthesis or follow-up branch can use \`execution_group=2\`.
-4c. When a branch must wait for specific sibling labels, even inside the same \`execution_group\`, set \`depends_on\` to those sibling labels. Only reference labels from the same planner_branch call. Never depend on yourself. Do not create cycles.
-5. Never create more than ${this.branchMaxWidth} child branches in one step. Aim for 2–${this.branchMaxWidth} well-scoped branches rather than one monolithic sequential thread.
-6. Prefer search before edit when the correct answer may already exist in repository files.
-7. For repository discovery, prefer read and search on workspace evidence before using web.
-8. Prefer relative file paths rooted at the current project. Use absolute paths only when necessary for clarity or when the tool requires them.
-9. The skill catalog is lightweight; request full skill guidance only when it materially changes the next step.
-10. Do not answer a project-overview question by listing local skills unless the user explicitly asked about the skill system.
-11. Use bash whenever shell is the practical tool, but remember dangerous shell operations are sandboxed and should require confirmation.
-12. Use web for questions about external topics, current events, APIs, libraries, or anything not answerable from workspace files. Prefer workspace evidence only for project-specific questions. When web search returns results, read the snippet field first — only fetch a page if the snippet is insufficient.
-12a. web mode=search returns {title, url, snippet} — use snippets to decide which results are relevant before fetching full pages.
-12b. When you need current/external information, use web proactively — do not guess or rely on training data when a quick search would give a definitive answer.
-12bb. If you issue multiple web/search calls in one response, each one must target a genuinely different evidence stream or hypothesis. Do not emit paraphrased or near-duplicate queries that chase the same evidence. Vary the actual query terms and change at least two of: keywords, aliases, domains, dates, language, or source type.
-12c. When a web search is weak, noisy, or repetitive, change strategy materially before searching again. Vary keywords, aliases, dates, source types, domains, languages, jurisdictions, or fetch a promising result instead of issuing another broad near-duplicate search.
-12d. Avoid near-duplicate web searches. After 2-3 consecutive web/search rounds without clear new information, you MUST either call planner_final using the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy. Do not continue the same-category search loop.
-13. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
-14. When you finish, call planner_final with a direct user-facing answer.
-14a. OUTCOME REPORTING: When calling planner_final, always set \`outcome\` to 'success', 'partial', or 'failed'. If the branch ran a test or validation that failed, set outcome='failed' and include the key error message in \`outcome_reason\`. If the goal was only partially achieved (e.g. code written but tests not run), set outcome='partial'. Also set \`disposition\` when possible: use \`missing_evidence\` if a focused retry could plausibly close the gap, \`blocked_external\` for paywalls/403/dynamic pages, \`exhausted_search\` when the current search strategy is played out, and \`planner_error\` for timeout/schema/planner failures. This enables the system to retry only the right branches.
-14b. CODING TASKS: When a branch writes code and runs tests, include the first few lines of any test failure output in \`outcome_reason\` so sibling or retry branches can use the error to fix the issue.
-14c. ${isPlanStage ? 'Because this is the PLAN stage, planner_final must return an execution plan, not a claim that the code has already been changed.' : 'When operating in normal branching mode, use execution_group and depends_on whenever sibling work needs ordered coordination.'}
-15. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via planner_skills. For other skills in the catalog whose description overlaps with the task, call planner_skills to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to read/search/edit/bash/web or planner_branch.
-16. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
-17. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
-18. If the user asks what is in Mempedia or what skills are available, prefer \`search/read\` with \`target=memory\` or \`target=skills\` before final_answer.
-19. NEVER use \`edit target=workspace\` to write directly into raw \`.mempedia\` storage. Use semantic targets instead: \`target=memory\`, \`target=preferences\`, or \`target=skills\`.
-20. NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value. Saving a greeting or one-liner response wastes storage and pollutes search results.
-${alwaysIncludeBlock ? `
-${alwaysIncludeBlock}
-
-IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool-call arguments — they are NOT the planner response format. Your planner response must always be tool calls, never plain text.
-` : ''}
-Available tools:
-${toolCatalog}
-
-Shared context for this request:
-${context || '(no context found)'}
-
-Selected context node ids:
-${selectedNodeIds.length > 0 ? selectedNodeIds.join(', ') : '(none)'}
-
-${soulsGuidance ? `Global souls.md guidance:
-${soulsGuidance}
-` : ''}`
-      : `You are a classic ReAct agent. Follow a strict sequential loop: Think → Act → Observe → Think → … → Final Answer.
-Do NOT branch. Execute one tool call at a time, observe the result, and decide the next step.
-
-${isExecuteStage ? `PLAN-AND-EXECUTE CONTRACT:
+- Never mix control tools with direct work-tool calls in the same response.`,
+          `Branching rules:
+${renderPromptList([
+  'Each planner_branch call should emit the full sibling coordination graph for the current parent step, not a partially ordered sketch. Every branch must have a genuinely distinct purpose, a unique label, and a different goal string.',
+  'Write branch goals as short executable instructions, not mini-paragraphs. Keep every `goal` concise and comfortably under the 240-character schema limit.',
+  'A branch that mainly consumes, integrates, or applies sibling outputs is not independent. Put it in a later execution_group, add depends_on when exact sibling prerequisites exist, or keep it inside one ordered branch instead of parallelizing it.',
+  'Branches may share the same execution_group only when each branch can make useful progress without waiting for sibling outputs. Use execution_group for ordered waves and depends_on for exact sibling prerequisites from the same planner_branch call. Never depend on yourself and do not create cycles.',
+  'Re-branch only when the current branch still contains multiple independent workstreams with low coordination cost. Do not recursively branch by default.',
+  `Never create more than ${this.branchMaxWidth} child branches in one step. Aim for 2-${this.branchMaxWidth} well-scoped branches rather than one monolithic sequential thread.`,
+], true)}`,
+          `General rules:
+${sharedGeneralRules}`,
+          `Web research rules:
+${sharedWebRules}`,
+          `Completion and storage rules:
+${renderPromptList([
+  'If the goal was only partially achieved, use outcome=`partial`. If the branch wrote code and ran tests, include the first few lines of any test failure output in `outcome_reason` so sibling or retry branches can use the error.',
+  branchingModeSpecificRule,
+], false)}
+${sharedCompletionAndStorageRules}`,
+          `Skill and local-evidence rules:
+${branchingSkillReviewRules}`,
+          footer,
+        );
+    const buildSequentialModePrompt = (footer: string) => joinPromptSections(
+          'You are a classic ReAct agent. Follow a strict sequential loop: Think -> Act -> Observe -> Think -> ... -> Final Answer.\nDo NOT branch. Execute one tool call at a time, observe the result, and decide the next step.',
+          isExecuteStage ? `PLAN-AND-EXECUTE CONTRACT:
 You are in the EXECUTE stage.
 An approved plan already exists.
 Follow it sequentially and keep exactly one active line of execution.
 Only revise the plan when a direct tool observation proves the current step is wrong or incomplete.
-Do not restart exploration from scratch and do not fork parallel workstreams.
-` : ''}
-
-You only use five top-level tools:
-  read   -> read semantic targets such as workspace files, memory nodes, preferences, or skills
-  search -> search semantic targets such as workspace, memory, preferences, or skills
-  edit   -> edit semantic targets such as workspace files, memory nodes, preferences, or skills
-  bash   -> run sandboxed shell commands
-  web    -> search the web (returns title+url+snippet) or fetch a page; use for external/current information
-
-Tool target guidance:
-  target=workspace   -> normal repository files
-  target=memory      -> Mempedia nodes and episodic memory search
-  target=preferences -> project preference markdown
-  target=skills      -> local SKILL.md guidance files
-
-Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md and ./.github/skills/*/SKILL.md.
-${localSkillsIndex ? `${localSkillsIndex}\n` : ''}Skills are guidance documents, not tool names. Never emit skill names such as project-discovery in tool_calls.name.
-If skill guidance has been injected for the turn, treat it as internal policy only. Do not inspect the skills directory, verify skill files, or summarize skill text back to the user unless the user explicitly asked about skills.
-When you save knowledge, prefer markdown-first notes that preserve concrete facts, numbers, data points, historical changes, viewpoints, evidence, and explicit uncertainties instead of terse summaries.
-    Separate facts from opinions or viewpoints. Never fabricate facts; if something is uncertain, attribute it or mark it as uncertain.
-
-
-Planner decision kinds:
+Do not restart exploration from scratch and do not fork parallel workstreams.` : '',
+          sharedToolAndTargetGuidance,
+          sharedSkillAndKnowledgeGuidance,
+          `Planner decision kinds:
 - planner_final: finish with a direct user-facing answer in final_answer.
 - planner_skills: request full guidance for one or two local skills before continuing.
 - NEVER call planner_branch in classic ReAct mode.
 - For normal work, call exactly one direct work tool: read/search/edit/bash/web.
-- Your response must be exactly one tool call. Never reply with plain text or raw JSON.
+- Your response must be exactly one tool call. Never reply with plain text or raw JSON.`,
+          `Sequential rules:
+${renderPromptList([
+  'Always use exactly one direct work-tool call when you need more information.',
+  'Do NOT call planner_branch; you are running in classic sequential ReAct mode.',
+  sequentialModeSpecificRule,
+], true)}`,
+          `General rules:
+${sharedGeneralRules}`,
+          `Web research rules:
+${sharedWebRules}`,
+          `Completion and storage rules:
+${sharedCompletionAndStorageRules}`,
+          `Skill and local-evidence rules:
+${sharedSkillReviewRules}`,
+          footer,
+        );
 
-Rules:
-1. Always use exactly one direct work-tool call when you need more information.
-2. Do NOT call planner_branch — you are running in classic sequential ReAct mode.
-3. Prefer search before edit when the correct answer may already exist in repository files.
-4. For repository discovery, prefer read and search on workspace evidence before using web.
-5. Prefer relative file paths rooted at the current project. Use absolute paths only when necessary for clarity or when the tool requires them.
-6. The skill catalog is lightweight; request full skill guidance only when it materially changes the next step.
-7. Do not answer a project-overview question by listing local skills unless the user explicitly asked about the skill system.
-8. Use bash whenever shell is the practical tool, but remember dangerous shell operations are sandboxed and should require confirmation.
-9. Use web for questions about external topics, current events, APIs, libraries, or anything not answerable from workspace files. Prefer workspace evidence only for project-specific questions. When web search returns results, read the snippet field first — only fetch a page if the snippet is insufficient.
-9a. web mode=search returns {title, url, snippet} — use snippets to decide which results are relevant before fetching full pages.
-9b. When you need current/external information, use web proactively — do not guess or rely on training data when a quick search would give a definitive answer.
-9c. When a web search is weak, noisy, or repetitive, change strategy materially before searching again. Vary keywords, aliases, dates, source types, domains, languages, jurisdictions, or fetch a promising result instead of issuing another broad near-duplicate search.
-9d. Avoid near-duplicate web searches. After 2-3 consecutive web/search rounds without clear new information, you MUST either call planner_final using the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy. Do not continue the same-category search loop.
-10. When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.
-11. When you finish, call planner_final with a direct user-facing answer.
-11a. OUTCOME REPORTING: When calling planner_final, always set \`outcome\` to 'success', 'partial', or 'failed'. If a test or validation failed, set outcome='failed' and include the key error in \`outcome_reason\`. Also set \`disposition\` when possible: \`missing_evidence\`, \`blocked_external\`, \`exhausted_search\`, or \`planner_error\`.
-11b. ${isExecuteStage ? 'Treat the approved plan as binding. Execute it step by step instead of improvising parallel alternatives.' : 'Stay sequential and do not branch.'}
-12. NEVER use \`edit target=workspace\` to write directly into raw \`.mempedia\` storage. Use semantic targets instead: \`target=memory\`, \`target=preferences\`, or \`target=skills\`.
-13. SKILL REVIEW: Always-active skills are pre-loaded in this system prompt and are already binding — do NOT request them again via planner_skills. For other skills in the catalog whose description overlaps with the task, call planner_skills to load their full guidance before the first tool call. If no additional skill is needed (or the catalog is empty), proceed directly to read/search/edit/bash/web.
-14. After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.
-15. For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.
-16. If the user asks what is in Mempedia or what skills are available, prefer \`search/read\` with \`target=memory\` or \`target=skills\` before final_answer.
-17. NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value. Saving a greeting or one-liner response wastes storage and pollutes search results.
-${alwaysIncludeBlock ? `
-${alwaysIncludeBlock}
-
-IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool-call arguments — they are NOT the planner response format. Your planner response must always be exactly one tool call.
-` : ''}
-Available tools:
-${toolCatalog}
-
-Shared context for this request:
-${context || '(no context found)'}
-
-Selected context node ids:
-${selectedNodeIds.length > 0 ? selectedNodeIds.join(', ') : '(none)'}
-
-${soulsGuidance ? `Global souls.md guidance:
-${soulsGuidance}
-` : ''}`;
+    const systemPrompt = isBranchingMode
+      ? buildBranchingModePrompt(sharedPromptFooter)
+      : buildSequentialModePrompt(sharedPromptFooter);
+    const plannerSystemPrompt = isBranchingMode
+      ? buildBranchingModePrompt(plannerPromptFooter)
+      : buildSequentialModePrompt(plannerPromptFooter);
 
     // ── Dynamic context budget computation ──────────────────────────────
     const systemPromptTokens = estimateTokens(systemPrompt);
@@ -3328,6 +3360,27 @@ ${soulsGuidance}
     const extractText = (content: any): string => {
       if (typeof content === 'string') {
         return content;
+      }
+      if (content && typeof content === 'object') {
+        if ((content as { type?: unknown }).type === 'openai_tool_result') {
+          return typeof (content as OpenAIToolResultReplayContent).content === 'string'
+            ? (content as OpenAIToolResultReplayContent).content
+            : '';
+        }
+        if ((content as { type?: unknown }).type === 'openai_assistant_message') {
+          const message = (content as OpenAIAssistantReplayContent).message || {};
+          const parts: string[] = [];
+          if (typeof message.content === 'string') {
+            parts.push(message.content);
+          }
+          if (Array.isArray(message.reasoning_details)) {
+            parts.push(JSON.stringify(message.reasoning_details));
+          }
+          if (Array.isArray(message.tool_calls)) {
+            parts.push(JSON.stringify(message.tool_calls));
+          }
+          return parts.filter(Boolean).join('\n');
+        }
       }
       if (Array.isArray(content)) {
         return content.map((item) => {
@@ -3581,18 +3634,26 @@ ${soulsGuidance}
       };
     };
 
-    const clearPendingAnthropicToolState = (branch: BranchState) => {
+    const clearPendingProviderToolState = (branch: BranchState) => {
       branch.pendingAnthropicAssistantContent = null;
       branch.pendingAnthropicToolUseIds = [];
+      branch.pendingOpenAIAssistantMessage = null;
     };
 
     const applyPlannerResultToBranch = (branch: BranchState, result: PlannerDecisionResult) => {
-      if (this.openai.provider === 'anthropic' && result.decision.kind === 'tool') {
+      if (result.decision.kind === 'tool' && this.openai.provider === 'anthropic') {
         branch.pendingAnthropicAssistantContent = result.anthropicAssistantContent ?? null;
         branch.pendingAnthropicToolUseIds = result.anthropicToolUseIds ?? [];
+        branch.pendingOpenAIAssistantMessage = null;
         return;
       }
-      clearPendingAnthropicToolState(branch);
+      if (result.decision.kind === 'tool' && this.openai.provider === 'openai') {
+        branch.pendingOpenAIAssistantMessage = result.openaiAssistantMessage ?? null;
+        branch.pendingAnthropicAssistantContent = null;
+        branch.pendingAnthropicToolUseIds = [];
+        return;
+      }
+      clearPendingProviderToolState(branch);
     };
 
     const buildAnthropicToolTranscript = (
@@ -3604,7 +3665,7 @@ ${soulsGuidance}
       }
       const assistantContent = branch.pendingAnthropicAssistantContent;
       const toolUseIds = branch.pendingAnthropicToolUseIds ?? [];
-      clearPendingAnthropicToolState(branch);
+      clearPendingProviderToolState(branch);
       if (!assistantContent || assistantContent.length === 0 || toolUseIds.length !== observations.length) {
         return null;
       }
@@ -3621,6 +3682,47 @@ ${soulsGuidance}
         { role: 'user', content: toolResults },
       ];
     };
+
+    const buildOpenAIToolTranscript = (
+      branch: BranchState,
+      observations: Array<{ result: string; success: boolean }>,
+    ): Array<{ role: 'assistant' | 'user'; content: ChatMessageContent }> | null => {
+      if (this.openai.provider !== 'openai') {
+        return null;
+      }
+      const assistantMessage = branch.pendingOpenAIAssistantMessage;
+      clearPendingProviderToolState(branch);
+      const toolCallIds = Array.isArray(assistantMessage?.tool_calls)
+        ? assistantMessage.tool_calls
+          .map((toolCall: any) => (typeof toolCall?.id === 'string' ? toolCall.id.trim() : ''))
+          .filter(Boolean)
+        : [];
+      if (!assistantMessage || toolCallIds.length < observations.length) {
+        return null;
+      }
+
+      const assistantReplay: OpenAIAssistantReplayContent = {
+        type: 'openai_assistant_message',
+        message: assistantMessage,
+      };
+      const toolResults: OpenAIToolResultReplayContent[] = observations.map((observation, index) => ({
+        type: 'openai_tool_result',
+        tool_call_id: toolCallIds[index],
+        content: observation.result,
+      }));
+
+      return [
+        { role: 'assistant', content: assistantReplay },
+        ...toolResults.map((toolResult) => ({ role: 'user' as const, content: toolResult })),
+      ];
+    };
+
+    const buildProviderToolTranscript = (
+      branch: BranchState,
+      observations: Array<{ result: string; success: boolean }>,
+    ): Array<{ role: 'assistant' | 'user'; content: ChatMessageContent }> | null =>
+      buildAnthropicToolTranscript(branch, observations)
+      || buildOpenAIToolTranscript(branch, observations);
 
     const buildBranchMemoryJob = (
       branch: BranchState,
@@ -3647,7 +3749,7 @@ ${soulsGuidance}
       };
     };
 
-    const buildMessages = (branch: BranchState, transcriptOverride?: ChatMessage[]) => {
+    const buildPlannerMessages = (branch: BranchState): ChatMessage[] => {
       const renderStructuredBranchHandoff = (handoff?: BranchHandoff) => {
         if (!handoff) {
           return '(none)';
@@ -3681,48 +3783,37 @@ ${soulsGuidance}
         ].filter(Boolean).join('\n');
       };
 
-      let branchTranscript = (transcriptOverride as typeof branch.transcript | undefined) ?? branch.transcript;
-      const inheritedCount = Math.max(0, Math.min(branch.inheritedMessageCount, branchTranscript.length));
-      const inheritedTranscript = branchTranscript.slice(0, inheritedCount);
-      let localTranscript = branchTranscript.slice(inheritedCount);
-      if (ctxBudget.modelLimit > 0) {
-        const inheritedTokens = estimateTranscriptTokens(inheritedTranscript);
-        const checked = checkContextAndCompress(
-          localTranscript,
-          ctxBudget.modelLimit,
-          ctxBudget.committedTokens + inheritedTokens,
-        );
-        if (checked.compressed) {
-          localTranscript = checked.transcript as typeof branch.transcript;
-        }
-      } else {
-        const inheritedChars = inheritedTranscript.reduce((sum, message) => sum + extractText(message.content).length, 0);
-        localTranscript = compressTranscript(
-          localTranscript,
-          Math.max(4000, effectiveTranscriptBudgetChars - inheritedChars),
-        ) as typeof branch.transcript;
-      }
-      branchTranscript = [
-        ...inheritedTranscript,
-        ...localTranscript,
-      ];
-      if (!transcriptOverride) {
-        branch.transcript = branchTranscript;
-      }
-
-      const branchTranscriptTokens = estimateTranscriptTokens(branchTranscript);
-      const branchResidualBudget = Math.max(
-        0,
-        ctxBudget.modelLimit - ctxBudget.committedTokens - branchTranscriptTokens,
-      );
-
       return [
-        { role: 'system', content: systemPrompt },
-        ...recentConversationMessages,
-        ...branchTranscript,
+        { role: 'system', content: plannerSystemPrompt },
         {
           role: 'user' as const,
-          content: `Current branch state:\n- branch_id: ${branch.id}\n- parent_branch_id: ${branch.parentId || 'none'}\n- depth: ${branch.depth}\n- label: ${branch.label}\n- goal: ${branch.goal}\n- steps_so_far: ${branch.steps}\n- branch_inherited_messages: ${inheritedCount}\n- branch_local_messages: ${Math.max(0, branchTranscript.length - inheritedCount)}\n- branch_transcript_tokens: ${branchTranscriptTokens}\n- branch_context_budget_residual: ${branchResidualBudget} tokens\n- branch_disposition: ${branch.disposition || 'unknown'}\n- branch_handoff:\n${renderStructuredBranchHandoff(branch.handoff)}\n- shared_retry_context:\n${renderSharedRetryContext(branch.sharedHandoff)}\n- run_phase: ${runPhase || 'normal'}\n\nLoop guard:\n- Prefer materially diverse search strategies over paraphrased near-duplicate queries.\n- If this branch can still be split into 2 or more genuinely independent evidence streams or workstreams, prefer planner_branch again before issuing batches of direct work tools.\n- If you issue multiple web/search calls in one response, each must target a genuinely different evidence stream or hypothesis. Do not batch paraphrased versions of the same search. Vary the actual query terms and change at least two of: keywords, aliases, domains, dates, language, or source type.\n- If recent web/search rounds have been weak, noisy, or repetitive, change keywords, aliases, dates, domains, languages, source types, or switch from search to fetch.\n- Treat structured handoff fields as binding: preserve known good facts, focus on missing fields, and obey must_not_repeat unless you have a materially new strategy.\n- If sibling branches need staged execution, use planner_branch.execution_group. If a branch must wait for specific sibling labels, use planner_branch.depends_on.\n- After 2-3 consecutive web/search rounds without clear new information, do not continue the same-category search loop. Call planner_final with the best available evidence and explicit uncertainty, or switch to a meaningfully different tool or strategy.\n- ${isPlanStage ? 'PLAN stage rule: finish by returning an executable plan through planner_final.' : isExecuteStage ? 'EXECUTE stage rule: follow the approved plan sequentially. Use exactly one direct work tool at a time and revise the plan only when direct evidence forces you to.' : 'Normal mode rule: use execution_group and depends_on when sibling work needs ordered coordination.'}\n\nRespond by calling tool(s), not plain text. Call read/search/edit/bash/web directly for work. Use planner_branch/planner_final/planner_skills only for control flow, and never mix control tools with direct work-tool calls in the same response.`,
+          content: `Planning view only.
+Do not use conversation transcript, prior tool observations, or recalled context as planner input for this step.
+Plan only from the user goal and the current kanban task state below.
+
+Original user request:
+${originalUserRequest || input}
+
+Current branch state:
+- branch_id: ${branch.id}
+- parent_branch_id: ${branch.parentId || 'none'}
+- depth: ${branch.depth}
+- label: ${branch.label}
+- goal: ${branch.goal}
+- steps_so_far: ${branch.steps}
+- branch_disposition: ${branch.disposition || 'unknown'}
+- branch_handoff:
+${renderStructuredBranchHandoff(branch.handoff)}
+- shared_retry_context:
+${renderSharedRetryContext(branch.sharedHandoff)}
+- run_phase: ${runPhase || 'normal'}
+
+Loop guard:
+- Treat structured handoff fields as binding: preserve known good facts, focus on missing fields, and obey must_not_repeat unless you have a materially new strategy.
+- Use the branch state above to decide the next step. Do not restart sibling work, re-open already-covered avenues without concrete reason, or pull downstream integration work into this branch unless this branch explicitly owns that integration.
+- ${isPlanStage ? 'PLAN stage rule: finish by returning one executable plan through planner_final.' : isExecuteStage ? 'EXECUTE stage rule: follow the approved plan sequentially. Use exactly one direct work tool at a time and revise the plan only when direct evidence forces you to.' : 'Normal mode rule: preserve the coordination graph already implied by execution_group and depends_on.'}
+
+Respond by calling tool(s), not plain text. Call read/search/edit/bash/web directly for work. Use planner_branch/planner_final/planner_skills only for control flow, and never mix control tools with direct work-tool calls in the same response.`,
         },
       ] as ChatMessage[];
     };
@@ -3788,7 +3879,7 @@ ${soulsGuidance}
             temperature: this.responseTemperature,
             maxTokens: 1600,
             messages: ([
-              { role: 'system', content: `${systemPrompt}\nYou must now finish. Do not branch. Do not call tools. Do not output any XML tags such as <tool_call>, <invoke>, <minimax:tool_call>, or similar markup. Return ONLY plain natural-language text for the user.` },
+              { role: 'system', content: `${systemPrompt}\nYou must now finish. Do not branch. Do not call tools. ${plainTextOnlyRule}` },
               ...recentConversationMessages,
               ...compressedTranscript,
               { role: 'user', content: `Finalize branch ${branch.id}. User request:\n${input}\n\nReason: ${reason}` },
@@ -4300,7 +4391,7 @@ ${soulsGuidance}
               messages: [
                 {
                   role: 'system',
-                  content: `You are the synthesis stage for a branching ReAct agent. Merge completed branches into the best possible final answer. Prefer correctness and directness. Mention uncertainty only when branches genuinely disagree. If you mention saved node ids, use only ids explicitly listed in saved_nodes. Do not invent node ids. Do not output tool calls, XML tags such as <tool_call>, <invoke>, or any structured markup — return plain natural-language text only.${soulsGuidance ? `\n\n${soulsGuidance}` : ''}`,
+                  content: `You are the synthesis stage for a branching ReAct agent. Merge completed branches into the best possible final answer. Prefer correctness and directness. If branches conflict, prefer the most directly evidenced result, then the latest successful remediation branch, then the answer with the fewest unsupported assumptions. Mention uncertainty only when meaningful conflict remains unresolved. If you mention saved node ids, use only ids explicitly listed in saved_nodes. Do not invent node ids. ${plainTextOnlyRule}${soulsGuidance ? `\n\n${soulsGuidance}` : ''}`,
                 },
                 {
                   role: 'user',
@@ -4354,8 +4445,8 @@ ${soulsGuidance}
         modelLimit: ctxBudget.modelLimit,
         committedTokens: ctxBudget.committedTokens,
         planBranch: async ({ branch, planningTranscript }) => {
-          const plannerResult = await planWithSkillRouting(
-            buildMessages(branch as BranchState, planningTranscript as ChatMessage[] | undefined),
+        const plannerResult = await planWithSkillRouting(
+            buildPlannerMessages(branch as BranchState),
             async (workingTranscript) => {
               return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
                 this.generatePlannerDecision({
@@ -4377,7 +4468,7 @@ ${soulsGuidance}
           }
           if (decision.kind === 'branch') {
             // Classic react does not support branching — ask model to continue sequentially
-            clearPendingAnthropicToolState(branch as BranchState);
+            clearPendingProviderToolState(branch as BranchState);
             branch.transcript.push({
               role: 'user' as const,
               content: 'Branching is not available in classic ReAct mode. Please call exactly one direct work tool to proceed step by step, or call planner_final to finish.',
@@ -4395,7 +4486,7 @@ ${soulsGuidance}
             finalizationMode: (decision as any).finalization_mode,
           };
         },
-        buildToolTranscript: ({ branch, observations }) => buildAnthropicToolTranscript(branch as BranchState, observations),
+        buildToolTranscript: ({ branch, observations }) => buildProviderToolTranscript(branch as BranchState, observations),
         executeToolCall: async ({ branch, toolCall }) => {
           const result = await executeToolCall(branch as BranchState, toolCall as z.infer<typeof PlannerToolCallSchema>);
           return {
@@ -4427,7 +4518,7 @@ ${soulsGuidance}
       committedTokens: ctxBudget.committedTokens,
       planBranch: async ({ branch, planningTranscript }) => {
         const plannerResult = await planWithSkillRouting(
-          buildMessages(branch as BranchState, planningTranscript as ChatMessage[] | undefined),
+          buildPlannerMessages(branch as BranchState),
           async (workingTranscript) => {
             return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
               this.generatePlannerDecision({
@@ -4463,7 +4554,7 @@ ${soulsGuidance}
           finalizationMode: (decision as any).finalization_mode,
         };
       },
-      buildToolTranscript: ({ branch, observations }) => buildAnthropicToolTranscript(branch as BranchState, observations),
+      buildToolTranscript: ({ branch, observations }) => buildProviderToolTranscript(branch as BranchState, observations),
       executeToolCall: async ({branch, toolCall }) => {
         const result = await executeToolCall(branch as BranchState, toolCall as z.infer<typeof PlannerToolCallSchema>);
         return {
@@ -4512,7 +4603,7 @@ ${soulsGuidance}
         });
       }
     });
-    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. In branching mode, default to planner_branch whenever the task can be decomposed into independent parts or there are multiple plausible independent avenues to explore. Only start with direct work tools if the next action is clearly atomic. Call planner_final when you are ready to answer.`);
+    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. First plan the execution structure: decide whether the work should stay as one ordered execution thread or become a small coordination graph of genuinely independent branches. Raise the priority of execution-structure planning over immediate tool use. In both cases, plan before gathering more evidence. Branch only when each branch can make useful progress without waiting for sibling outputs. If the task mainly produces one integrated artifact, prefer one owner or an ordered plan over parallel siblings. Call planner_final when you are ready to answer.`);
     }
 
     finalAnswer = this.sanitizeUserFacingAnswer(

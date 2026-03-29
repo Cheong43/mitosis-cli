@@ -604,13 +604,36 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
       || /Requesting remediation re-branch/i.test(trimmed)
       || /^Synthesis requested \d+ remediation branch/i.test(trimmed)
       || trimmed.startsWith('Forcing finalization')
-      || trimmed.startsWith('Branch completed')
       || /no branch reached a natural final answer/i.test(trimmed)
       || /^Spawning \d+ child branches/i.test(trimmed)
     ) {
       return trimmed;
     }
     return null;
+  };
+
+  const isCompletionLikeBranchMessage = (value: string | null | undefined): boolean => {
+    const trimmed = String(value || '').trim();
+    return Boolean(
+      trimmed
+      && (
+        trimmed.startsWith('Branch completed')
+        || trimmed.startsWith('Branch finalized')
+        || /no branch reached a natural final answer/i.test(trimmed)
+      )
+    );
+  };
+
+  const buildLiveBranchStatusMessage = (activeCount: number, queueCount: number): string | null => {
+    if (activeCount <= 0) {
+      return queueCount > 0
+        ? `${queueCount} queued branch${queueCount === 1 ? '' : 'es'} waiting to run.`
+        : null;
+    }
+    if (queueCount > 0) {
+      return `${activeCount} active branch${activeCount === 1 ? '' : 'es'}, ${queueCount} queued.`;
+    }
+    return `${activeCount} active branch${activeCount === 1 ? '' : 'es'} still running.`;
   };
 
   const clipBranchText = (value: unknown, maxLength = 120): string => {
@@ -832,8 +855,15 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
     } else if (next.activeBranchIds.length > 0) {
       const hasActiveRebranch = allNodes.some((node) =>
         node.kind === 'rebranch' && (node.status === 'active' || node.status === 'finalizing' || node.status === 'queued'));
+      const liveStatusMessage = buildLiveBranchStatusMessage(next.activeBranchIds.length, next.queueCount);
       next.phase = hasActiveRebranch ? 'rebranching' : 'branching';
-      next.statusMessage = nextStatusMessage || next.statusMessage;
+      if (nextStatusMessage && !isCompletionLikeBranchMessage(nextStatusMessage)) {
+        next.statusMessage = nextStatusMessage;
+      } else if (isCompletionLikeBranchMessage(next.statusMessage)) {
+        next.statusMessage = liveStatusMessage || next.statusMessage;
+      } else {
+        next.statusMessage = nextStatusMessage || liveStatusMessage || next.statusMessage;
+      }
     } else if (allNodes.length > 0 && allNodes.every((node) => node.status === 'completed' || node.status === 'error')) {
       next.phase = 'complete';
       next.statusMessage = nextStatusMessage || next.statusMessage;

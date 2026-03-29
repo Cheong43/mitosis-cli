@@ -203,6 +203,27 @@ function extractTranscriptContentText(content: any): string {
   if (typeof content === 'string') {
     return content;
   }
+  if (content && typeof content === 'object') {
+    if ((content as { type?: unknown }).type === 'openai_tool_result') {
+      return typeof (content as { content?: unknown }).content === 'string'
+        ? (content as { content: string }).content
+        : '';
+    }
+    if ((content as { type?: unknown }).type === 'openai_assistant_message') {
+      const message = (content as { message?: Record<string, unknown> }).message || {};
+      const parts: string[] = [];
+      if (typeof message.content === 'string') {
+        parts.push(message.content);
+      }
+      if (Array.isArray(message.reasoning_details)) {
+        parts.push(JSON.stringify(message.reasoning_details));
+      }
+      if (Array.isArray(message.tool_calls)) {
+        parts.push(JSON.stringify(message.tool_calls));
+      }
+      return parts.filter(Boolean).join('\n');
+    }
+  }
   if (Array.isArray(content)) {
     return content
       .map((item) => {
