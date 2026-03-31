@@ -179,6 +179,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
   const [status, setStatus] = useState<string>('Ready');
   const [history, setHistory] = useState<Array<HistoryItem>>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [rpmWaitInfo, setRpmWaitInfo] = useState<{ waitMs: number; resumeTime: string } | null>(null);
   const [agent] = useState(() => new Agent({
     apiKey,
     baseURL,
@@ -256,7 +257,7 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
       setHistory((prev: HistoryItem[]) => [...prev, { type: 'info', content: `Error starting agent: ${err.message}` }]);
     });
     void refreshMempediaStatus(true);
-    
+
     // Subscribe to background task updates
     const unsubscribe = agent.onBackgroundTask((task, status) => {
         if (status === 'started') {
@@ -264,6 +265,13 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
         } else {
             setBackgroundTasks(prev => prev.filter(t => t !== task));
         }
+    });
+
+    // Subscribe to RPM limit wait notifications
+    agent.setRpmWaitCallback((waitMs, queueLength) => {
+      const resumeTime = new Date(Date.now() + waitMs).toLocaleTimeString();
+      setRpmWaitInfo({ waitMs, resumeTime });
+      setTimeout(() => setRpmWaitInfo(null), waitMs);
     });
 
     return () => {
@@ -2191,6 +2199,11 @@ export const App: React.FC<AppProps> = ({ apiKey, projectRoot, baseURL, model, m
       {backgroundTasks.length > 0 && (
         <Box marginTop={1}>
             <Text color="dim">⏳ Background tasks: {backgroundTasks.join(', ')}</Text>
+        </Box>
+      )}
+      {rpmWaitInfo && (
+        <Box marginTop={1}>
+          <Text color="yellow">⏱️  RPM limit reached. Waiting {Math.ceil(rpmWaitInfo.waitMs / 1000)}s. Resume at {rpmWaitInfo.resumeTime}</Text>
         </Box>
       )}
       {mempediaStatus && (

@@ -295,20 +295,51 @@ function shouldUseMiniMaxReasoningSplit(model: LanguageModelV1): boolean {
 }
 
 function parseJsonObjectText(text: string): unknown {
-  const trimmed = text.trim();
+  let trimmed = text.trim();
   if (!trimmed) {
     throw new NoObjectGeneratedError('No object generated: empty response body.');
   }
+  // Strip <think> tags if present
+  trimmed = trimmed.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  if (!trimmed) {
+    throw new NoObjectGeneratedError('No object generated: only <think> tags found.');
+  }
   try {
     return JSON.parse(trimmed);
-  } catch {
+  } catch (error) {
     const firstBrace = trimmed.indexOf('{');
     const lastBrace = trimmed.lastIndexOf('}');
     if (firstBrace >= 0 && lastBrace > firstBrace) {
-      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+      let extracted = trimmed.slice(firstBrace, lastBrace + 1);
+      try {
+        return JSON.parse(extracted);
+      } catch {
+        // Try to fix common array formatting issues
+        extracted = fixArrayFormatting(extracted);
+        try {
+          return JSON.parse(extracted);
+        } catch {
+          // If still fails, return original error
+        }
+      }
     }
-    throw new NoObjectGeneratedError(`No object generated: ${trimmed.slice(0, 240)}`);
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    throw new NoObjectGeneratedError(`No object generated: ${errorMsg}. Preview: ${trimmed.slice(0, 240)}`);
   }
+}
+
+function fixArrayFormatting(json: string): string {
+  // Fix missing commas between array elements
+  let fixed = json.replace(/\}\s*\{/g, '},{');
+  // Fix trailing commas before closing brackets
+  fixed = fixed.replace(/,(\s*[\]}])/g, '$1');
+  // Fix missing closing brackets for truncated arrays
+  const openBrackets = (fixed.match(/\[/g) || []).length;
+  const closeBrackets = (fixed.match(/\]/g) || []).length;
+  if (openBrackets > closeBrackets) {
+    fixed += ']'.repeat(openBrackets - closeBrackets);
+  }
+  return fixed;
 }
 
 function clipPreview(text: string, maxChars = 240): string {
@@ -708,13 +739,24 @@ function normalizeMessages(messages: ChatMessage[]): ModelMessage[] {
   const normalized: ModelMessage[] = [];
   const openAIToolNameById = new Map<string, string>();
   const anthropicToolNameById = new Map<string, string>();
+  // Track whether we have already emitted the single allowed system message.
+  // Models like MiniMax only allow one system role; extra system messages are
+  // merged into the first one to prevent API errors (error code 2013).
+  let systemEmitted = false;
 
   for (const message of messages) {
     if (message.role === 'system') {
-      normalized.push({
-        role: 'system',
-        content: extractTextParts(message.content),
-      });
+      const content = extractTextParts(message.content);
+      if (!systemEmitted) {
+        normalized.push({ role: 'system', content });
+        systemEmitted = true;
+      } else {
+        // Merge extra system content: find the existing system entry and append.
+        const existing = normalized.find((m) => m.role === 'system') as { role: 'system'; content: string } | undefined;
+        if (existing) {
+          existing.content = `${existing.content}\n\n${content}`;
+        }
+      }
       continue;
     }
 

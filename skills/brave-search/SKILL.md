@@ -1,7 +1,7 @@
 ---
 name: brave-search
 description: "Use when external web search is needed and a Brave Search channel is available. Prefer Brave-derived candidate URLs before calling web fetch."
-always_include: true
+always_include: false
 metadata:
   category: research
   priority: high

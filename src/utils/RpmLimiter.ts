@@ -21,11 +21,17 @@ export class RpmLimiter {
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
   /** FIFO dispatcher chain for queued request scheduling. */
   private dispatchTail: Promise<void> = Promise.resolve();
+  /** Callback for rate limit wait notifications. */
+  private onWaitCallback?: (waitMs: number, queueLength: number) => void;
 
   constructor(rpm: number) {
     this.rpm = 0;
     this.intervalMs = 0;
     this.configure(rpm);
+  }
+
+  setOnWaitCallback(callback: (waitMs: number, queueLength: number) => void): void {
+    this.onWaitCallback = callback;
   }
 
   /** Returns true when the limiter is effectively disabled. */
@@ -73,6 +79,11 @@ export class RpmLimiter {
     }
 
     // Slow path: enqueue and schedule drain.
+    const waitMs = Math.max(0, nextAllowed - now);
+    if (this.onWaitCallback && this.queue.length === 0) {
+      this.onWaitCallback(waitMs, this.queue.length + 1);
+    }
+
     return new Promise<void>((resolve) => {
       this.queue.push(resolve);
       this.scheduleDrain();

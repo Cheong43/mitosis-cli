@@ -23,8 +23,10 @@ import { AgentRuntime, createRuntime, CallbackApprovalEngine } from '../runtime/
 import type { ApprovalCallback } from '../runtime/index.js';
 import type { AgentBranchState, BranchSynthesisInput } from '../runtime/agent/AgentRuntime.js';
 import type {
+  AgentStep,
   BranchKanbanCard,
   BranchKanbanSnapshot,
+  CanonicalPlanState,
   BranchDisposition,
   BranchHandoff,
   BranchOutcome,
@@ -57,6 +59,17 @@ import {
 import { SessionCompressor, isRunExhausted } from './sessionCompressor.js';
 import { PlannerToolAdapter } from './PlannerToolAdapter.js';
 import { RpmLimiter, getGlobalRpmLimiter } from '../utils/RpmLimiter.js';
+import { logError } from '../utils/errorLogger.js';
+import { SubagentRegistry } from './subagents/registry.js';
+import { runSubagent } from './subagents/runner.js';
+import { planSubagentHandler } from './subagents/plan.js';
+import { researchSubagentHandler } from './subagents/research.js';
+import { WorkspaceManager } from '../persistence/WorkspaceManager.js';
+import type {
+  PlanSubagentInvocation,
+  ResearchSubagentInvocation,
+  SubagentInvocation,
+} from './subagents/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -74,10 +87,8 @@ const PlannerToolCallSchema = z.object({
 const PlannerBranchSchema = z.object({
   label: z.string().trim().min(1).max(80),
   goal: z.string().trim().min(1).max(240),
-  why: z.string().trim().min(1).max(240).optional(),
-  priority: z.number().min(0).max(1).optional(),
-  execution_group: z.number().int().min(1).max(8).optional(),
-  depends_on: z.array(z.string().trim().min(1).max(80)).min(1).max(7).optional(),
+  group: z.number().int().min(1).max(8).optional().default(1),
+  depends: z.array(z.string().trim().min(1).max(80)).min(0).max(7).optional(),
 });
 
 const PlannerThoughtSchema = z.string().trim().min(1);
@@ -101,11 +112,7 @@ const PlannerBranchDecisionBaseSchema = z.object({
 
 const PlannerBranchDecisionSchema = PlannerBranchDecisionBaseSchema.superRefine((decision, ctx) => {
   const labelToIndex = new Map<string, number>();
-  const normalizedGroups = decision.branches.map((branch) => (
-    typeof branch.execution_group === 'number' && Number.isFinite(branch.execution_group)
-      ? Math.max(1, Math.floor(branch.execution_group))
-      : 1
-  ));
+  const normalizedGroups = decision.branches.map((branch) => branch.group || 1);
 
   decision.branches.forEach((branch, index) => {
     if (labelToIndex.has(branch.label)) {
@@ -123,12 +130,12 @@ const PlannerBranchDecisionSchema = PlannerBranchDecisionBaseSchema.superRefine(
   const indegree = Array.from({ length: decision.branches.length }, () => 0);
 
   decision.branches.forEach((branch, index) => {
-    const dependencies = [...new Set((branch.depends_on || []).map((label) => label.trim()).filter(Boolean))];
+    const dependencies = [...new Set((branch.depends || []).map((label) => label.trim()).filter(Boolean))];
     dependencies.forEach((dependencyLabel, dependencyIndex) => {
       if (dependencyLabel === branch.label) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ['branches', index, 'depends_on', dependencyIndex],
+          path: ['branches', index, 'depends', dependencyIndex],
           message: 'A branch cannot depend on itself.',
         });
         return;
@@ -138,8 +145,8 @@ const PlannerBranchDecisionSchema = PlannerBranchDecisionBaseSchema.superRefine(
       if (dependencyBranchIndex === undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ['branches', index, 'depends_on', dependencyIndex],
-          message: 'depends_on must reference labels from the same planner_branch call.',
+          path: ['branches', index, 'depends', dependencyIndex],
+          message: 'depends must reference labels from the same planner_branch call.',
         });
         return;
       }
@@ -147,8 +154,8 @@ const PlannerBranchDecisionSchema = PlannerBranchDecisionBaseSchema.superRefine(
       if (normalizedGroups[dependencyBranchIndex] > normalizedGroups[index]) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ['branches', index, 'depends_on', dependencyIndex],
-          message: 'depends_on cannot point to a sibling in a later execution_group.',
+          path: ['branches', index, 'depends', dependencyIndex],
+          message: 'depends cannot point to a sibling in a later execution_group.',
         });
         return;
       }
@@ -181,41 +188,36 @@ const PlannerBranchDecisionSchema = PlannerBranchDecisionBaseSchema.superRefine(
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['branches'],
-      message: 'depends_on must form an acyclic dependency graph among sibling branch labels.',
+      message: 'depends must form an acyclic dependency graph among sibling branch labels.',
     });
   }
 });
 
 const PlannerFinalDecisionSchema = z.object({
   kind: z.literal('final'),
-  thought: PlannerThoughtSchema,
-  final_answer: z.string().trim().min(1),
-  completion_summary: z.string().trim().min(1).max(280).optional(),
-  outcome: z.enum(['success', 'partial', 'failed']).optional(),
-  outcome_reason: z.string().trim().max(300).optional(),
-  disposition: z.enum([
-    'resolved',
-    'missing_evidence',
-    'blocked_external',
-    'exhausted_search',
-    'planner_error',
-    'superseded',
-    'unknown',
-  ]).optional(),
-  finalization_mode: z.enum(['natural', 'planner_fallback']).optional(),
+  answer: z.string().trim().min(1),
+  status: z.enum(['success', 'failed', 'partial', 'blocked']),
+  reason: z.string().trim().max(300).optional(),
 });
 
 const PlannerSkillsDecisionSchema = z.object({
   kind: z.literal('skills'),
-  thought: PlannerThoughtSchema,
-  skills_to_load: z.array(z.string().trim().min(1)).min(1).max(2),
+  skills: z.array(z.string().trim().min(1)).min(1).max(2),
 });
 
-const PlannerDecisionSchema = z.discriminatedUnion('kind', [
+const PlannerSubagentDecisionSchema = z.object({
+  kind: z.literal('subagent'),
+  subagent: z.enum(['plan', 'research', 'crawler']),
+  task: z.string().trim().min(1).max(800),
+  context: z.string().trim().max(400).optional(),
+});
+
+const PlannerDecisionSchema = z.union([
   PlannerToolDecisionSchema,
   PlannerBranchDecisionBaseSchema,
   PlannerFinalDecisionSchema,
   PlannerSkillsDecisionSchema,
+  PlannerSubagentDecisionSchema,
 ]);
 
 type PlannerDecision = z.infer<typeof PlannerDecisionSchema>;
@@ -229,56 +231,10 @@ interface PlannerDecisionResult {
 interface ExecutablePlannerDecisionResult extends Omit<PlannerDecisionResult, 'decision'> {
   decision: ExecutablePlannerDecision;
 }
+type PlannerSubagentDecision = z.infer<typeof PlannerSubagentDecisionSchema>;
 type PlannerInvocation =
   | { kind: 'work_tool'; tool_call: z.infer<typeof PlannerToolCallSchema> }
   | { kind: 'control'; decision: PlannerDecision };
-
-const PLANNER_BRANCH_JSON_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  properties: {
-    label: {
-      type: 'string',
-      minLength: 1,
-      maxLength: 80,
-    },
-    goal: {
-      type: 'string',
-      minLength: 1,
-      maxLength: 240,
-      description: 'A short executable branch goal. Keep it concise and comfortably under 240 characters; do not paste long plans, prose, or multi-step paragraphs here.',
-    },
-    why: {
-      type: 'string',
-      minLength: 1,
-      maxLength: 240,
-    },
-    priority: {
-      type: 'number',
-      minimum: 0,
-      maximum: 1,
-    },
-    execution_group: {
-      type: 'integer',
-      minimum: 1,
-      maximum: 8,
-      description: 'Branches in the same execution_group may run in parallel. Higher execution_group values wait until all lower groups under the same parent finish.',
-    },
-    depends_on: {
-      type: 'array',
-      items: {
-        type: 'string',
-        minLength: 1,
-        maxLength: 80,
-      },
-      minItems: 1,
-      maxItems: 7,
-      uniqueItems: true,
-      description: 'Optional sibling branch labels from this same planner_branch call that must finish before this branch may start.',
-    },
-  },
-  required: ['label', 'goal'],
-} as const;
 
 const ContextSelectionSchema = z.object({
   relevant_node_ids: z.array(z.string()).max(4).default([]),
@@ -328,6 +284,9 @@ interface BranchState {
   finalizationMode?: 'natural' | 'planner_fallback';
   handoff?: BranchHandoff;
   sharedHandoff?: SynthesisSharedHandoff;
+  planVersionSeen?: number;
+  planExcerpt?: string;
+  alignmentChecks?: string[];
   ancestorBranchIds?: string[];
   ancestorBranchLabels?: string[];
 }
@@ -498,6 +457,8 @@ export class Agent {
   private readonly llmLimiterCircuitCooldownMs: number;
   /** Per-session compressor for exhausted-run carry-over. */
   private readonly sessionCompressor: SessionCompressor;
+  private readonly subagentRegistry: SubagentRegistry;
+  private readonly workspaceManager: WorkspaceManager;
   /** In-process caches to avoid re-reading disk on every request. */
   private cachedWorkspaceSkills: SkillRecord[] | null = null;
   private cachedSoulsMarkdown: string | null = null;
@@ -630,6 +591,11 @@ export class Agent {
       rpmLimiter: this.llmRpmLimiter,
     });
     this.sessionCompressor = new SessionCompressor();
+    this.subagentRegistry = new SubagentRegistry([
+      planSubagentHandler,
+      researchSubagentHandler,
+    ], projectRoot);
+    this.workspaceManager = new WorkspaceManager(projectRoot);
   }
 
   private deriveOpenAICompatBaseURL(baseURL?: string): string | undefined {
@@ -649,6 +615,10 @@ export class Agent {
   onBackgroundTask(callback: (task: string, status: 'started' | 'completed') => void) {
       this.onBackgroundTaskCallback = callback;
       return () => { this.onBackgroundTaskCallback = null; };
+  }
+
+  setRpmWaitCallback(callback: (waitMs: number, queueLength: number) => void) {
+    this.llmRpmLimiter.setOnWaitCallback(callback);
   }
 
   private notifyBackgroundTask(task: string, status: 'started' | 'completed') {
@@ -757,43 +727,42 @@ export class Agent {
           type: 'object',
           additionalProperties: false,
           properties: {
-            thought: {
-              type: 'string',
-              minLength: 1,
-            },
-            final_answer: {
+            answer: {
               type: 'string',
               minLength: 1,
               maxLength: 5000,
               description: 'User-facing markdown answer. Reference created file paths instead of repeating full code listings.',
             },
-            completion_summary: {
+            status: {
               type: 'string',
-              minLength: 1,
-              maxLength: 280,
+              enum: ['success', 'failed', 'partial', 'blocked'],
+              description: 'Result status: success if goal fully achieved, partial if some progress made, failed if goal not met, blocked if externally blocked.',
             },
-            outcome: {
-              type: 'string',
-              enum: ['success', 'partial', 'failed'],
-              description: 'Structured result of this branch: success if the goal was fully achieved, partial if some progress was made, failed if the goal was not met.',
-            },
-            outcome_reason: {
+            reason: {
               type: 'string',
               maxLength: 300,
-              description: 'Brief explanation when outcome is partial or failed (e.g. test error message).',
-            },
-            disposition: {
-              type: 'string',
-              enum: ['resolved', 'missing_evidence', 'blocked_external', 'exhausted_search', 'planner_error', 'superseded', 'unknown'],
-              description: 'Retry-oriented disposition. Use missing_evidence when a focused retry could plausibly close the gap; blocked_external for paywalls/403/dynamic pages; exhausted_search when the current search strategy is played out; planner_error for schema/timeout/tool-planning failures.',
+              description: 'Brief explanation when status is partial, failed, or blocked (e.g. error message, blocker description).',
             },
           },
-          required: ['thought', 'final_answer'],
+          required: ['answer', 'status'],
         },
-        parse: (input) => ({
-          kind: 'control',
-          decision: PlannerFinalDecisionSchema.parse({ kind: 'final', ...(input as Record<string, unknown>) }),
-        }),
+        parse: (input) => {
+          const record = (input && typeof input === 'object' && !Array.isArray(input))
+            ? input as Record<string, unknown>
+            : {};
+          // Provide fallbacks so a non-compliant LLM omitting required fields
+          // does not throw a Zod validation error that aborts the whole branch.
+          const patched = {
+            kind: 'final' as const,
+            answer: '抱歉，我未能生成答案，请重试一次。',
+            status: 'failed' as const,
+            ...record,
+          };
+          return {
+            kind: 'control',
+            decision: PlannerFinalDecisionSchema.parse(patched),
+          };
+        },
       },
       {
         name: 'planner_skills',
@@ -802,11 +771,7 @@ export class Agent {
           type: 'object',
           additionalProperties: false,
           properties: {
-            thought: {
-              type: 'string',
-              minLength: 1,
-            },
-            skills_to_load: {
+            skills: {
               type: 'array',
               minItems: 1,
               maxItems: 2,
@@ -816,7 +781,7 @@ export class Agent {
               },
             },
           },
-          required: ['thought', 'skills_to_load'],
+          required: ['skills'],
         },
         parse: (input) => ({
           kind: 'control',
@@ -827,28 +792,33 @@ export class Agent {
 
     if (allowBranching) {
       tools.push({
-        name: 'planner_branch',
-        description: 'Split work into child loops only when they can make useful progress independently. Each planner_branch call should describe the full sibling coordination graph for that parent step. Keep each branch goal short and concrete, comfortably under 240 characters. Use execution_group for ordered waves and depends_on for exact sibling prerequisites within the same planner_branch call. If one branch mainly integrates outputs from others, place it in a later wave or keep it out of branching.',
+        name: 'planner_subagent',
+        description: 'Request a subagent for specialized work. Use subagent=plan for branching/planning, subagent=research for research tasks, subagent=crawler for web scraping.',
         parameters: {
           type: 'object',
           additionalProperties: false,
           properties: {
-            thought: {
+            subagent: {
+              type: 'string',
+              enum: ['plan', 'research', 'crawler'],
+            },
+            task: {
               type: 'string',
               minLength: 1,
+              maxLength: 800,
+              description: 'The task for the subagent to perform.',
             },
-            branches: {
-              type: 'array',
-              minItems: 1,
-              maxItems: this.branchMaxWidth,
-              items: PLANNER_BRANCH_JSON_SCHEMA,
+            context: {
+              type: 'string',
+              maxLength: 400,
+              description: 'Optional additional context for the subagent.',
             },
           },
-          required: ['thought', 'branches'],
+          required: ['subagent', 'task'],
         },
         parse: (input) => ({
           kind: 'control',
-          decision: PlannerBranchDecisionSchema.parse({ kind: 'branch', ...(input as Record<string, unknown>) }),
+          decision: PlannerSubagentDecisionSchema.parse({ kind: 'subagent', ...(input as Record<string, unknown>) }),
         }),
       });
     }
@@ -2662,7 +2632,45 @@ Decide the safer execution discipline for this turn.`,
   }
 
   private appendConversationLog(runId: string, input: string, traces: TraceEvent[], answer: string): string {
-    return this.writeConversationPayload(this.conversationLogDir, runId, input, traces, answer);
+    const result = this.writeConversationPayload(this.conversationLogDir, runId, input, traces, answer);
+    // Remove the incremental sidecar now that the final log is written.
+    try {
+      const sidecarPath = path.join(this.conversationLogDir, `conv_${runId}.jsonl`);
+      if (fs.existsSync(sidecarPath)) {
+        fs.unlinkSync(sidecarPath);
+      }
+    } catch {}
+    return result;
+  }
+
+  /** Write an in-progress placeholder so runs that never complete still appear on disk. */
+  private openConversationLogInProgress(runId: string, input: string): void {
+    try {
+      const logDir = this.conversationLogDir;
+      fs.mkdirSync(logDir, { recursive: true });
+      const conversationId = `conv_${runId}`;
+      const payload = {
+        id: conversationId,
+        timestamp: new Date().toISOString(),
+        input,
+        status: 'in_progress',
+        answer: null,
+        traces: []
+      };
+      const filePath = path.join(logDir, `${conversationId}.json`);
+      fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8');
+    } catch {}
+  }
+
+  /** Append a single trace event as a NDJSON line for incremental disk flushing. */
+  private appendConversationTraceEvent(runId: string, event: TraceEvent): void {
+    try {
+      const logDir = this.conversationLogDir;
+      const conversationId = `conv_${runId}`;
+      const sidecarPath = path.join(logDir, `${conversationId}.jsonl`);
+      const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
+      fs.appendFileSync(sidecarPath, line, 'utf-8');
+    } catch {}
   }
 
   private appendMemoryJobSnapshot(runId: string, input: string, traces: TraceEvent[], answer: string): string {
@@ -3045,6 +3053,12 @@ Decide the safer execution discipline for this turn.`,
     const perfEnabled = process.env.AGENT_PERF !== '0';
     const perfEntries: PerfEntry[] | null = perfEnabled ? [] : null;
     const traceBuffer: TraceEvent[] = [];
+    // Generate runId early so the conversation log can be opened immediately.
+    const runId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    // Write an in-progress placeholder right away so partial/crashed runs always land on disk.
+    if (!runPhase) {
+      this.openConversationLogInProgress(runId, input);
+    }
     const runAgentId = options.agentId || 'agent-main';
     const agentMode: AgentMode = requestedAgentMode;
     const runSessionId = baseSessionId;
@@ -3062,6 +3076,11 @@ Decide the safer execution discipline for this turn.`,
     const emitTrace = (event: TraceEvent) => {
       traceBuffer.push(event);
       onTrace(event);
+      // Incrementally flush each trace event to the sidecar NDJSON so that mid-run
+      // state is recoverable even when the conversation never completes.
+      if (!runPhase) {
+        setImmediate(() => this.appendConversationTraceEvent(runId, event));
+      }
     };
     let llmCircuitOpenedAt = 0;
     let llmCircuitReason = '';
@@ -3096,13 +3115,9 @@ Decide the safer execution discipline for this turn.`,
     const buildLlmLimitFallbackDecision = (detail: string): ExecutablePlannerDecisionResult => ({
       decision: {
         kind: 'final',
-        thought: 'LLM provider limit reached before selecting the next step.',
-        final_answer: 'LLM provider limit reached; finalize from gathered evidence.',
-        completion_summary: 'LLM provider limit reached; finalizing from gathered evidence.',
-        outcome: 'partial',
-        outcome_reason: detail,
-        disposition: 'planner_error',
-        finalization_mode: 'planner_fallback',
+        answer: 'LLM provider limit reached; finalize from gathered evidence.',
+        status: 'partial',
+        reason: detail,
       },
     });
     emitTrace({
@@ -3221,56 +3236,19 @@ Decide the safer execution discipline for this turn.`,
     const renderPromptList = (items: string[], ordered = false): string =>
       items.map((item, index) => `${ordered ? `${index + 1}.` : '-'} ${item}`).join('\n');
     const clampNumber = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
-    const sharedToolAndTargetGuidance = `You only use five top-level tools:
-  read   -> read semantic targets such as workspace files, memory nodes, preferences, or skills
-  search -> search semantic targets such as workspace, memory, preferences, or skills
-  edit   -> edit semantic targets such as workspace files, memory nodes, preferences, or skills
-  bash   -> run sandboxed shell commands
-  web    -> fetch a known web page URL for external/current information
 
-Tool target guidance:
-  target=workspace   -> normal repository files
-  target=memory      -> Mempedia nodes and episodic memory search
-  target=preferences -> project preference markdown
-  target=skills      -> local skill guidance files, including SKILL.md and Claude-compatible agent markdown`;
-    const sharedSkillAndKnowledgeGuidance = `Local skills come from workspace SKILL.md files under ./skills/*/SKILL.md, ./.github/skills/*/SKILL.md, Claude-compatible project agents under ./.claude/agents/*.md, and user Claude agents under ~/.claude/agents/*.md.
-${localSkillsIndex ? `${localSkillsIndex}\n` : ''}Skills are guidance documents, not tool names. Never emit skill names such as project-discovery in tool_calls.name.
-If skill guidance has been injected for the turn, treat it as internal policy only. Do not inspect the skills directory, verify skill files, or summarize skill text back to the user unless the user explicitly asked about skills.
-When you save knowledge, prefer markdown-first notes that preserve concrete facts, numbers, data points, historical changes, viewpoints, evidence, and explicit uncertainties instead of terse summaries.
-Separate facts from opinions or viewpoints. Never fabricate facts; if something is uncertain, attribute it or mark it as uncertain.`;
-    const sharedGeneralRules = renderPromptList([
-      'Raise the priority of execution-structure planning over immediate tool use. In both sequential and branching modes, decide the plan shape first: one ordered owner or one explicit coordination graph.',
-      'Prefer search before edit when the correct answer may already exist in repository files.',
-      'For repository discovery, prefer read and search on workspace evidence before using web.',
-      'Prefer relative file paths rooted at the current project. Use absolute paths only when necessary for clarity or when the tool requires them.',
-      'The skill catalog is lightweight; request full skill guidance only when it materially changes the next step.',
-      'Do not answer a project-overview question by listing local skills unless the user explicitly asked about the skill system.',
-      'Use bash whenever shell is the practical tool, but remember dangerous shell operations are sandboxed and should require confirmation.',
-    ]);
-    const sharedWebRules = renderPromptList([
-      'Use web only in mode=fetch. It requires a concrete URL and returns a citation summary with highlights and a short preview instead of the full raw page.',
-      'Prefer workspace evidence first for project-specific questions. For external information, use web fetch only after the user, a local skill, or another tool has already provided a plausible URL.',
-      'When source quality matters, pass allowed_domains or blocked_domains so fetch stays within trusted sources.',
-      'If you do not have a trustworthy URL yet, do not invent one. Use local skills or other tools to obtain candidate URLs, or state that external fetching is blocked by missing links.',
-    ]);
-    const sharedCompletionAndStorageRules = renderPromptList([
-      'When writing markdown knowledge, prefer structured sections such as Facts, Data, History, Viewpoints, Relations, and Evidence when the material supports them.',
-      'When you finish, call planner_final with a direct user-facing answer.',
-      'When calling planner_final, always set `outcome` to `success`, `partial`, or `failed`. If a test or validation failed, set outcome=`failed` and include the key error in `outcome_reason`. Also set `disposition` when possible: `missing_evidence`, `blocked_external`, `exhausted_search`, or `planner_error`.',
-      'NEVER use `edit target=workspace` to write directly into raw `.mempedia` storage. Use semantic targets instead: `target=memory`, `target=preferences`, or `target=skills`.',
-      'NEVER save trivial conversational exchanges (greetings, thank-you messages, short pleasantries, error/failure responses) to Mempedia core knowledge via agent_upsert_markdown. Core knowledge is reserved for durable, factual, or structured content that has lasting value.',
-    ]);
-    const sharedSkillReviewRules = renderPromptList([
-      'Always-active skills are pre-loaded in this system prompt and are already binding; do NOT request them again via planner_skills. For other skills in the catalog whose description overlaps with the task, call planner_skills to load their full guidance before the first tool call. If no additional skill is needed, proceed directly to read/search/edit/bash/web.',
-      'After loading additional skills, follow their guidance strictly alongside the pre-loaded always-active skills. Skills are binding operational policy, not optional suggestions.',
-      'For questions about local Mempedia contents, workspace memory, preferences, or local skills, inspect semantic local evidence first. Do not answer from generic model background knowledge.',
-      'If the user asks what is in Mempedia or what skills are available, prefer `search/read` with `target=memory` or `target=skills` before planner_final.',
-    ]);
-    const branchingSkillReviewRules = sharedSkillReviewRules.replace(
-      'proceed directly to read/search/edit/bash/web.',
-      'proceed directly to read/search/edit/bash/web or planner_branch.',
-    );
+    // ── Compact planner rules (shared between branching and sequential) ──
+    const compactToolGuidance = `Tools: read, search, edit, bash, web (mode=fetch only, requires concrete URL).
+Targets: workspace (files), memory (Mempedia), preferences, skills.
+Never use edit target=workspace to write into raw .mempedia storage. Use semantic targets.`;
+    const compactSkillGuidance = localSkillsIndex
+      ? `Skills: ${localSkillsIndex}\nSkills are policy, not tool names. Pre-loaded always-active skills are binding; do not re-request them.`
+      : 'Skills are guidance documents, not tool names. Pre-loaded always-active skills are binding.';
+    const compactCompletionRules = `When done, call planner_final. Always set outcome (success/partial/failed) and disposition (resolved/missing_evidence/blocked_external/exhausted_search/planner_error). Include key error lines in outcome_reason when tests fail.
+Do not save trivial exchanges to Mempedia core knowledge.`;
     const plainTextOnlyRule = 'Return only plain natural-language text for the user. Do not output tool calls, internal control markup, XML-like tags, or any structured wrapper markup.';
+
+    // ── Prompt footers ──
     const sharedPromptFooter = joinPromptSections(
       alwaysIncludeBlock ? `${alwaysIncludeBlock}
 
@@ -3290,95 +3268,76 @@ ${soulsGuidance}` : '',
 IMPORTANT: The bash command patterns shown in the skill policies above are for use INSIDE bash tool-call arguments. They are not the planner response format.` : '',
       plannerToolSummary,
     );
-    const branchingModeSpecificRule = isPlanStage
-      ? 'Because this is the PLAN stage, planner_final must return one ordered execution plan for a single owner, not a claim that the code has already been changed.'
-      : 'Treat execution_group and depends_on as the explicit work graph for sibling coordination. Use them whenever waves or prerequisites exist.';
-    const sequentialModeSpecificRule = isExecuteStage
-      ? 'Treat the approved plan as binding. Execute it step by step instead of improvising parallel alternatives.'
-      : 'Stay sequential and do not branch.';
+    const planSubagentFooter = joinPromptSections(
+      alwaysIncludeBlock ? `${alwaysIncludeBlock}
 
+IMPORTANT: The plan subagent does not execute work tools itself. It only returns canonical planning structure.` : '',
+    );
+
+    // ── Branching mode system prompt (compact) ──
     const buildBranchingModePrompt = (footer: string) => joinPromptSections(
-          'You are a branching ReAct agent.\nTreat ReAct as a functional loop. A branch is an independent child loop with its own thought -> action -> observation state.',
-          isPlanStage ? `PLAN-AND-EXECUTE CONTRACT:
-You are in the PLAN stage.
-Prioritize producing one coherent execution plan for a single sequential executor.
-You may inspect, compare options, and use tools when needed, but finish by returning an execution plan via planner_final.` : '',
-          `COORDINATION PHILOSOPHY:
-Optimize for correct end-to-end completion of the user's deliverable, not maximum branch count or maximum parallelism.
-Before calling planner_branch, classify candidate workstreams as one of four relationships:
-- independent: each workstream can make useful progress without waiting for sibling outputs.
-- wave-gated: later work depends on conclusions from earlier waves, but not on one exact sibling label.
-- strict prerequisite: a workstream needs concrete outputs from specific sibling labels.
-- inseparable: one workstream would mostly integrate, apply, or package another workstream's outputs.
-Treat branching as parallel task planning, not as permission to skip planning and jump straight into tool churn.
-Only independent workstreams belong in the same execution_group.
-Use higher execution_group values for wave-gated work.
-Use depends_on for strict prerequisites within the same planner_branch call.
-If work is inseparable, or if dependency is unclear, prefer fewer branches, more ordering, or a single owner rather than parallel siblings.
-Branch only when genuine independent progress is available. Do not branch merely because the task has multiple stages.
-For integrated artifacts such as websites, reports, refactors, or single deliverables, branch mainly for planning, research, or option comparison; keep implementation and integration ordered unless parts are truly isolated.`,
-          sharedToolAndTargetGuidance,
-          sharedSkillAndKnowledgeGuidance,
-          `CONTROL TOOLS:
-- planner_branch: express the current step as a small coordination graph of distinct child loops only when real independence exists.
-- planner_final: finish with a direct user-facing answer in final_answer.
-- planner_skills: request full guidance for one or two local skills before continuing.
-- For normal work, call read/search/edit/bash/web directly.
-- Your response must be one or more tool calls. Never reply with plain text or raw JSON.
-- Never mix control tools with direct work-tool calls in the same response.`,
-          `Branching rules:
-${renderPromptList([
-  'Each planner_branch call should emit the full sibling coordination graph for the current parent step, not a partially ordered sketch. Every branch must have a genuinely distinct purpose, a unique label, and a different goal string.',
-  'Write branch goals as short executable instructions, not mini-paragraphs. Keep every `goal` concise and comfortably under the 240-character schema limit.',
-  'A branch that mainly consumes, integrates, or applies sibling outputs is not independent. Put it in a later execution_group, add depends_on when exact sibling prerequisites exist, or keep it inside one ordered branch instead of parallelizing it.',
-  'Branches may share the same execution_group only when each branch can make useful progress without waiting for sibling outputs. Use execution_group for ordered waves and depends_on for exact sibling prerequisites from the same planner_branch call. Never depend on yourself and do not create cycles.',
-  'Re-branch only when the current branch still contains multiple independent workstreams with low coordination cost. Do not recursively branch by default.',
-  `Never create more than ${this.branchMaxWidth} child branches in one step. Aim for 2-${this.branchMaxWidth} well-scoped branches rather than one monolithic sequential thread.`,
-], true)}`,
-          `General rules:
-${sharedGeneralRules}`,
-          `Web research rules:
-${sharedWebRules}`,
-          `Completion and storage rules:
-${renderPromptList([
-  'If the goal was only partially achieved, use outcome=`partial`. If the branch wrote code and ran tests, include the first few lines of any test failure output in `outcome_reason` so sibling or retry branches can use the error.',
-  branchingModeSpecificRule,
-], false)}
-${sharedCompletionAndStorageRules}`,
-          `Skill and local-evidence rules:
-${branchingSkillReviewRules}`,
-          footer,
-        );
+      'You are a branching ReAct agent coordinated by MainAgent. A branch is an execution owner for one scoped slice of the canonical plan.',
+      isPlanStage ? 'PLAN STAGE: produce one coherent execution plan for a single sequential executor via planner_final. Do not claim code has already been changed.' : '',
+      `RULES:
+${compactToolGuidance}
+${compactSkillGuidance}
+
+Control tools: planner_subagent (subagent=plan for initial branching / plan refresh / remediation), planner_final (finish), planner_skills (load skill guidance).
+For work, call read/search/edit/bash/web directly. Never mix control + work tools. Never reply with plain text. Never output <think> tags or reasoning text - always call tools directly.
+
+Execute your branch excerpt faithfully. Do not design sibling graphs — that belongs to planner_subagent with subagent=plan.
+Request planner_subagent with subagent=plan when: no canonical plan exists, current plan is wrong, or a local gap needs remediation rebranch.
+Respect execution_group and depends_on as binding constraints. Reuse branch_evidence_digest before issuing more search/fetch.
+Prefer search before edit. Prefer workspace evidence before web.
+${isPlanStage ? 'Finish by returning one executable plan through planner_final.' : isExecuteStage ? 'Follow the approved plan sequentially.' : 'Preserve the coordination graph implied by execution_group and depends_on.'}
+
+All work artifacts are automatically persisted to .mitosis/work/ for future reference.
+
+${compactCompletionRules}`,
+      footer,
+    );
+
+    // ── Sequential mode system prompt (compact) ──
     const buildSequentialModePrompt = (footer: string) => joinPromptSections(
-          'You are a classic ReAct agent. Follow a strict sequential loop: Think -> Act -> Observe -> Think -> ... -> Final Answer.\nDo NOT branch. Execute one tool call at a time, observe the result, and decide the next step.',
-          isExecuteStage ? `PLAN-AND-EXECUTE CONTRACT:
-You are in the EXECUTE stage.
-An approved plan already exists.
-Follow it sequentially and keep exactly one active line of execution.
-Only revise the plan when a direct tool observation proves the current step is wrong or incomplete.
-Do not restart exploration from scratch and do not fork parallel workstreams.` : '',
-          sharedToolAndTargetGuidance,
-          sharedSkillAndKnowledgeGuidance,
-          `Planner decision kinds:
-- planner_final: finish with a direct user-facing answer in final_answer.
-- planner_skills: request full guidance for one or two local skills before continuing.
-- NEVER call planner_branch in classic ReAct mode.
-- For normal work, call exactly one direct work tool: read/search/edit/bash/web.
-- Your response must be exactly one tool call. Never reply with plain text or raw JSON.`,
-          `Sequential rules:
+      'You are a classic ReAct agent. Think -> Act -> Observe -> repeat. One tool call at a time. Do NOT branch.',
+      isExecuteStage ? 'EXECUTE STAGE: follow the approved plan sequentially. Revise only when evidence forces it.' : '',
+      `RULES:
+${compactToolGuidance}
+${compactSkillGuidance}
+
+Control: planner_final (finish), planner_skills (load guidance). NEVER call planner_subagent.
+For work, call exactly one direct work tool: read/search/edit/bash/web. Never reply with plain text. Never output <think> tags or reasoning text - always call tools directly.
+${isExecuteStage ? 'Treat the approved plan as binding.' : 'Stay sequential and do not branch.'}
+Prefer search before edit. Prefer workspace evidence before web.
+
+${compactCompletionRules}`,
+      footer,
+    );
+    const buildPlanSubagentPrompt = (footer: string) => joinPromptSections(
+          'You are a plan execution model. Your only job is to output valid plan_subagent_result tool calls.',
+          `INPUT:
+- Task state object (JSON)
+- Current plan version and text
+- Branch status summary
+
+OUTPUT:
+- Exactly one plan_subagent_result tool call
+- No markdown, no prose, no reasoning, no <think> tags
+
+SUCCESS CONDITION:
+- Tool call matches schema exactly
+- canonical_plan ≤ 4000 tokens
+- Each branch has matching alignment entry
+- No cycles in depends_on`,
+          `PLANNING CONSTRAINTS:
 ${renderPromptList([
-  'Always use exactly one direct work-tool call when you need more information.',
-  'Do NOT call planner_branch; you are running in classic sequential ReAct mode.',
-  sequentialModeSpecificRule,
+  'Reconcile user goal + current plan + branch status into coherent canonical_plan',
+  'Compress aggressively: remove prose, deduplicate, stay under 4000 tokens',
+  'Design only necessary branches for current scope',
+  'Use execution_group for waves, depends_on for prerequisites',
+  'Each branch needs alignment excerpt stating its responsibility',
+  'Prefer one branch over many when scope is sequential',
 ], true)}`,
-          `General rules:
-${sharedGeneralRules}`,
-          `Web research rules:
-${sharedWebRules}`,
-          `Completion and storage rules:
-${sharedCompletionAndStorageRules}`,
-          `Skill and local-evidence rules:
-${sharedSkillReviewRules}`,
           footer,
         );
 
@@ -3388,6 +3347,7 @@ ${sharedSkillReviewRules}`,
     const plannerSystemPrompt = isBranchingMode
       ? buildBranchingModePrompt(plannerPromptFooter)
       : buildSequentialModePrompt(plannerPromptFooter);
+    const planSubagentPrompt = buildPlanSubagentPrompt(planSubagentFooter);
 
     // ── Stage-aware context budget computation ──────────────────────────
     const buildStageBudget = (
@@ -3426,16 +3386,26 @@ ${sharedSkillReviewRules}`,
       3072,
     );
     const synthesisBasePrompt = `You are the synthesis stage for a branching ReAct agent. Merge completed branches into the best possible final answer. Prefer correctness and directness. If branches conflict, prefer the most directly evidenced result, then the latest successful remediation branch, then the answer with the fewest unsupported assumptions. Mention uncertainty only when meaningful conflict remains unresolved. If you mention saved node ids, use only ids explicitly listed in saved_nodes. Do not invent node ids. ${plainTextOnlyRule}${soulsGuidance ? `\n\n${soulsGuidance}` : ''}`;
+    const planSubagentCtxBudget = buildStageBudget(planSubagentPrompt, 0, 0, 3072);
     const synthesisCtxBudget = buildStageBudget(synthesisBasePrompt, 0, 0, 3072);
     const plannerMaxTokens = deriveMaxOutputTokens(planningCtxBudget, 500, 1600, 0.08);
+    const planSubagentMaxTokens = deriveMaxOutputTokens(planSubagentCtxBudget, 1000, 2600, 0.14);
     const finalizeMaxTokens = deriveMaxOutputTokens(finalizeCtxBudget, 500, 1400, 0.1);
     const synthesisMaxTokens = deriveMaxOutputTokens(synthesisCtxBudget, 700, 1800, 0.12);
     emitTrace({
       type: 'observation',
-      content: `Context budget: model=${this.model} limit=${planningCtxBudget.modelLimit} committed=${planningCtxBudget.committedTokens} residual=${planningCtxBudget.residualBudget} transcriptChars=${planningCtxBudget.transcriptBudgetChars} agentMode=${agentMode} rpm=${this.llmRpmLimiter.disabled ? 'unlimited' : process.env.LLM_RPM_LIMIT} [plannerCommitted=${planningCtxBudget.committedTokens} executeCommitted=${executionCtxBudget.committedTokens} finalizeCommitted=${finalizeCtxBudget.committedTokens} synthesisCommitted=${synthesisCtxBudget.committedTokens}]`,
+      content: `Context budget: model=${this.model} limit=${planningCtxBudget.modelLimit} committed=${planningCtxBudget.committedTokens} residual=${planningCtxBudget.residualBudget} transcriptChars=${planningCtxBudget.transcriptBudgetChars} agentMode=${agentMode} rpm=${this.llmRpmLimiter.disabled ? 'unlimited' : process.env.LLM_RPM_LIMIT} [plannerCommitted=${planningCtxBudget.committedTokens} planSubagentCommitted=${planSubagentCtxBudget.committedTokens} executeCommitted=${executionCtxBudget.committedTokens} finalizeCommitted=${finalizeCtxBudget.committedTokens} synthesisCommitted=${synthesisCtxBudget.committedTokens}]`,
     });
 
     const effectiveTranscriptBudgetChars = planningCtxBudget.transcriptBudgetChars;
+    const canonicalPlanState: CanonicalPlanState = {
+      version: 0,
+      canonicalPlanText: '',
+      tokenEstimate: 0,
+      updatedByBranchId: 'B0',
+      updatedAtStep: 0,
+      deltaSummary: 'No canonical plan has been published yet.',
+    };
 
     const extractText = (content: any): string => {
       if (typeof content === 'string') {
@@ -3580,7 +3550,7 @@ ${sharedSkillReviewRules}`,
         { role: 'assistant' as const, content: `${loadedSkillMarker} Loaded skills: ${names}` },
         {
           role: 'user' as const,
-          content: `Skill Router loaded summary-first guidance for the requested skills.\nOnly the most relevant sections are included by default to conserve planner context.\nIf a later step truly needs the full skill text, inspect it explicitly via the semantic skills tools.\n\n${renderSkillRouterGuidance(skillsToInject, originalUserRequest)}\n\nContinue the current ReAct step by calling tool(s), not plain text. Use read/search/edit/bash/web directly for work, and use planner_final or planner_branch only for control flow.`
+          content: `Skill Router loaded summary-first guidance for the requested skills.\nOnly the most relevant sections are included by default to conserve planner context.\nIf a later step truly needs the full skill text, inspect it explicitly via the semantic skills tools.\n\n${renderSkillRouterGuidance(skillsToInject, originalUserRequest)}\n\nContinue the current ReAct step by calling tool(s), not plain text. Use read/search/edit/bash/web directly for work, and use planner_final or planner_subagent only for control flow.`
         },
       ];
     };
@@ -3621,7 +3591,10 @@ ${sharedSkillReviewRules}`,
       };
     };
 
-    const traceMeta = (branch: BranchState, extra: Record<string, unknown> = {}) => ({
+    const traceMeta = (
+      branch: Pick<BranchState, 'id' | 'parentId' | 'label' | 'depth' | 'steps'>,
+      extra: Record<string, unknown> = {},
+    ) => ({
       branchId: branch.id,
       parentBranchId: branch.parentId,
       branchLabel: branch.label,
@@ -3632,7 +3605,7 @@ ${sharedSkillReviewRules}`,
 
     const emitBranchTrace = (
       type: TraceEvent['type'],
-      branch: BranchState,
+      branch: Pick<BranchState, 'id' | 'parentId' | 'label' | 'depth' | 'steps'>,
       content: string,
       extra: Record<string, unknown> = {}
     ) => {
@@ -3649,8 +3622,11 @@ ${sharedSkillReviewRules}`,
       if (decision.kind === 'branch') {
         return `[planner] kind=branch branches=${decision.branches.length}`;
       }
+      if (decision.kind === 'subagent') {
+        return `[planner] kind=subagent subagent=${decision.subagent} task=${decision.task.slice(0, 50)}...`;
+      }
       if (decision.kind === 'skills') {
-        return `[planner] kind=skills skills=${decision.skills_to_load.join(',')}`;
+        return `[planner] kind=skills skills=${decision.skills.join(',')}`;
       }
       return '[planner] kind=final';
     };
@@ -3674,11 +3650,45 @@ ${sharedSkillReviewRules}`,
     ): PlannedBranch[] => branches.map((branch) => ({
       label: branch.label,
       goal: branch.goal,
-      why: branch.why,
-      priority: branch.priority,
-      executionGroup: branch.execution_group,
-      dependsOn: branch.depends_on,
+      group: branch.group,
+      depends: branch.depends,
     }));
+
+    const trimTextToTokenBudget = (text: string, maxTokens: number, fallbackChars = 12000): string => {
+      let normalized = String(text || '').trim();
+      if (!normalized) {
+        return '';
+      }
+      if (estimateTokens(normalized) <= maxTokens) {
+        return normalized;
+      }
+
+      let candidate = normalized.slice(0, Math.min(normalized.length, fallbackChars));
+      while (candidate.length > 200 && estimateTokens(candidate) > maxTokens) {
+        candidate = candidate.slice(0, Math.max(200, Math.floor(candidate.length * 0.8))).trim();
+      }
+      return candidate;
+    };
+
+    const renderPlanSubagentFocus = (
+      branch: BranchState,
+      kanbanSnapshot?: BranchKanbanSnapshot,
+    ): string => {
+      const currentCard = kanbanSnapshot?.cards?.find((card) => card.branchId === branch.id);
+      const blockerText = currentCard?.blockers?.length ? currentCard.blockers.join(' | ') : '(none)';
+      return [
+        `branch_id=${branch.id}`,
+        `label=${branch.label}`,
+        `goal=${branch.goal}`,
+        `plan_version_seen=${branch.planVersionSeen ?? canonicalPlanState.version}`,
+        `plan_excerpt=${branch.planExcerpt || '(none)'}`,
+        `alignment_checks=${branch.alignmentChecks?.join(' | ') || '(none)'}`,
+        `completion_summary=${branch.completionSummary || '(none)'}`,
+        `outcome_reason=${branch.outcomeReason || '(none)'}`,
+        `kanban_summary=${currentCard?.summary || '(none)'}`,
+        `blockers=${blockerText}`,
+      ].join('\n');
+    };
 
     const planWithSkillRouting = async (
       initialTranscript: ChatMessage[],
@@ -3693,12 +3703,13 @@ ${sharedSkillReviewRules}`,
         return buildLlmLimitFallbackDecision(activeCircuitReason);
       }
       let workingTranscript = initialTranscript;
-      for (let attempt = 0; attempt < 2; attempt += 1) {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
         let plannerResult: PlannerDecisionResult;
         try {
           plannerResult = normalizePlannerResult(await invoke(workingTranscript));
         } catch (error) {
           const detail = this.clipText(String((error as any)?.message || error || 'unknown planner error'), 400);
+          logError(this.projectRoot, error, 'planner_decision_generation_failed');
           emitTrace({
             type: 'error',
             content: `Planner decision generation failed: ${detail}`,
@@ -3711,13 +3722,9 @@ ${sharedSkillReviewRules}`,
             return {
               decision: {
                 kind: 'final',
-                thought: 'Planner timed out before selecting the next step.',
-                final_answer: 'Planner timed out; finalize from gathered evidence.',
-                completion_summary: 'Planner timed out; finalizing from gathered evidence.',
-                outcome: 'partial',
-                outcome_reason: detail,
-                disposition: 'planner_error',
-                finalization_mode: 'planner_fallback',
+                answer: 'Planner timed out; finalize from gathered evidence.',
+                status: 'partial',
+                reason: detail,
               },
             };
           }
@@ -3740,8 +3747,8 @@ ${sharedSkillReviewRules}`,
           return {
             decision: {
               kind: 'final',
-              thought: 'Planner decision generation failed.',
-              final_answer: '抱歉，内部规划步骤失败了，请重试一次。',
+              answer: '抱歉，内部规划步骤失败了，请重试一次。',
+              status: 'failed',
             },
           };
         }
@@ -3752,11 +3759,21 @@ ${sharedSkillReviewRules}`,
           return plannerResult as ExecutablePlannerDecisionResult;
         }
 
-        const requestedNames = decision.skills_to_load;
+        const requestedNames = decision.skills;
         const loadedSkillNames = getLoadedSkillNames(workingTranscript);
-        const skillsToInject = resolveSkillsByName(availableSkills, requestedNames, 2)
-          .filter((skill) => !loadedSkillNames.has(skill.name.toLowerCase()));
+        const resolvedSkills = resolveSkillsByName(availableSkills, requestedNames, 2);
+        const skillsToInject = resolvedSkills.filter((skill) => !loadedSkillNames.has(skill.name.toLowerCase()));
         if (skillsToInject.length === 0) {
+          if (resolvedSkills.length > 0) {
+            // All requested skills are already loaded — the LLM already has their
+            // guidance in the transcript. Continue so the next attempt re-plans
+            // without injecting anything new.
+            emitTrace({
+              type: 'observation',
+              content: `Skill router: requested skills already loaded (${requestedNames.join(', ')}); continuing without re-injection.`,
+            });
+            continue;
+          }
           emitTrace({
             type: 'observation',
             content: `Skill router could not resolve requested skills: ${requestedNames.join(', ') || '(none)'}.`,
@@ -3764,8 +3781,8 @@ ${sharedSkillReviewRules}`,
           return {
             decision: {
               kind: 'final',
-              thought: 'Skill router request could not be resolved to new skills; using fallback final answer.',
-              final_answer: '抱歉，当前请求的技能不可用。请重试或手动指定技能。',
+              answer: '抱歉，当前请求的技能不可用。请重试或手动指定技能。',
+              status: 'failed',
             },
           };
         }
@@ -3778,9 +3795,93 @@ ${sharedSkillReviewRules}`,
       return {
         decision: {
           kind: 'final',
-          thought: 'Skill router exceeded load attempts; using fallback final answer.',
-          final_answer: '抱歉，技能路由未能收敛为有效回答。请重试一次。',
+          answer: '抱歉，技能路由未能收敛为有效回答。请重试一次。',
+          status: 'failed',
         },
+      };
+    };
+
+    const executeSubagentDecision = async (
+      branch: BranchState,
+      kanbanSnapshot: BranchKanbanSnapshot | undefined,
+      decision: PlannerSubagentDecision,
+    ): Promise<AgentStep> => {
+      const invocation: SubagentInvocation = {
+        subagent: decision.subagent,
+        task: decision.task,
+        context: decision.context,
+      };
+
+      const result = await runSubagent(
+        this.subagentRegistry,
+        {
+          projectRoot: this.projectRoot,
+          branch,
+          kanbanSnapshot,
+          canonicalPlanState,
+          originalUserRequest,
+          input,
+          plannerTemperature: this.plannerTemperature,
+          planSubagentPrompt,
+          planSubagentMaxTokens: planSubagentMaxTokens ?? 1600,
+          clipText: (text, maxChars) => this.clipText(text, maxChars ?? 8000),
+          estimateTokens,
+          normalizePlannerBranches,
+          trimTextToTokenBudget,
+          renderPlanSubagentFocus,
+          generateToolCalls: async (options) => this.measure(
+            perfEntries,
+            options.timeoutLabel,
+            async () => this.llmRpmLimiter.run(() => this.withTimeout(
+              generateToolCalls({
+                model: this.openai,
+                messages: options.messages,
+                tools: options.tools,
+                temperature: options.temperature,
+                maxTokens: options.maxTokens,
+              }),
+              this.agentLlmTimeoutMs,
+              options.timeoutLabel,
+            )),
+          ),
+        },
+        invocation,
+      );
+
+      if (result.canonicalPlanUpdate) {
+        canonicalPlanState.version = result.canonicalPlanUpdate.planVersion;
+        canonicalPlanState.canonicalPlanText = result.canonicalPlanUpdate.canonicalPlan;
+        canonicalPlanState.tokenEstimate = estimateTokens(result.canonicalPlanUpdate.canonicalPlan);
+        canonicalPlanState.updatedByBranchId = branch.id;
+        canonicalPlanState.updatedAtStep = branch.steps + 1;
+        canonicalPlanState.deltaSummary = result.canonicalPlanUpdate.planDeltaSummary;
+        branch.planVersionSeen = canonicalPlanState.version;
+        emitTrace({
+          type: 'observation',
+          content: `Canonical plan updated to version ${canonicalPlanState.version} by ${branch.id}. ${canonicalPlanState.deltaSummary}`,
+        });
+      }
+
+      if (result.traceSummary) {
+        emitTrace({
+          type: 'observation',
+          content: result.traceSummary,
+        });
+      }
+
+      if (result.nextStep) {
+        return result.nextStep;
+      }
+
+      const error = new Error(`Subagent ${decision.subagent} produced no executable step: ${result.traceSummary}`);
+      logError(this.projectRoot, error, `subagent_no_nextstep_${decision.subagent}`);
+
+      return {
+        kind: 'final',
+        content: '抱歉，当前请求的子代理尚未启用。请改用直接工具或稍后再试。',
+        outcome: 'partial',
+        outcomeReason: result.traceSummary || `Subagent ${decision.subagent} produced no executable step.`,
+        disposition: 'planner_error',
       };
     };
 
@@ -3899,7 +4000,11 @@ ${sharedSkillReviewRules}`,
       };
     };
 
-    const buildPlannerMessages = (branch: BranchState, kanbanSnapshot?: BranchKanbanSnapshot): ChatMessage[] => {
+    const buildPlannerMessages = (
+      branch: BranchState,
+      planningTranscript: ChatMessage[],
+      kanbanSnapshot?: BranchKanbanSnapshot,
+    ): ChatMessage[] => {
       const compareKanbanCards = (left: BranchKanbanCard, right: BranchKanbanCard) =>
         left.branchId.localeCompare(right.branchId, undefined, { numeric: true, sensitivity: 'base' });
 
@@ -3919,29 +4024,33 @@ ${sharedSkillReviewRules}`,
         }
         const cards = snapshot.cards.slice();
         const currentCard = cards.find((card) => card.branchId === branch.id);
-        const parentCard = branch.parentId
-          ? cards.find((card) => card.branchId === branch.parentId)
-          : undefined;
+        // Only show sibling/child cards that have meaningful results (completed or errored).
         const siblingCards = cards
-          .filter((card) => card.parentBranchId === branch.parentId && card.branchId !== branch.id)
+          .filter((card) => card.parentBranchId === branch.parentId && card.branchId !== branch.id && (card.status === 'completed' || card.status === 'error'))
           .sort(compareKanbanCards)
-          .slice(0, 8);
+          .slice(0, 4);
         const childCards = cards
-          .filter((card) => card.parentBranchId === branch.id)
+          .filter((card) => card.parentBranchId === branch.id && (card.status === 'completed' || card.status === 'error'))
           .sort(compareKanbanCards)
-          .slice(0, 8);
-        return [
-          `snapshot_summary: total=${snapshot.summary.total}, queued=${snapshot.summary.queued}, active=${snapshot.summary.active}, finalizing=${snapshot.summary.finalizing}, completed=${snapshot.summary.completed}, error=${snapshot.summary.error}`,
-          `current_card:\n${currentCard ? renderPlannerKanbanCard(currentCard) : '(none)'}`,
-          `parent_card:\n${parentCard ? renderPlannerKanbanCard(parentCard) : '(none)'}`,
-          `sibling_branch_results:\n${siblingCards.length ? siblingCards.map((card) => renderPlannerKanbanCard(card)).join('\n') : '(none)'}`,
-          `child_branch_results:\n${childCards.length ? childCards.map((card) => renderPlannerKanbanCard(card)).join('\n') : '(none)'}`,
-        ].join('\n');
+          .slice(0, 4);
+        const lines = [
+          `total=${snapshot.summary.total} active=${snapshot.summary.active} completed=${snapshot.summary.completed} error=${snapshot.summary.error}`,
+        ];
+        if (currentCard) {
+          lines.push(`self: ${renderPlannerKanbanCard(currentCard)}`);
+        }
+        for (const card of siblingCards) {
+          lines.push(`sibling: ${renderPlannerKanbanCard(card)}`);
+        }
+        for (const card of childCards) {
+          lines.push(`child: ${renderPlannerKanbanCard(card)}`);
+        }
+        return lines.join('\n');
       };
 
       const renderStructuredBranchHandoff = (handoff?: BranchHandoff) => {
         if (!handoff) {
-          return '(none)';
+          return '';
         }
         const fields = [
           `canonical_task=${handoff.canonicalTaskId}`,
@@ -3950,32 +4059,14 @@ ${sharedSkillReviewRules}`,
           handoff.missingFields?.length ? `missing_fields=${handoff.missingFields.join(' | ')}` : '',
           handoff.blockedBy?.length ? `blocked_by=${handoff.blockedBy.join(' | ')}` : '',
           handoff.mustNotRepeat?.length ? `must_not_repeat=${handoff.mustNotRepeat.join(' | ')}` : '',
-          handoff.priorResultSnippet ? `prior_result=${handoff.priorResultSnippet}` : '',
         ].filter(Boolean);
         return fields.join('\n');
-      };
-
-      const renderSharedRetryContext = (sharedHandoff?: SynthesisSharedHandoff) => {
-        if (!sharedHandoff) {
-          return '(none)';
-        }
-        const successful = (sharedHandoff.successfulAttempts || [])
-          .map((attempt) => `[${attempt.branchId}] ${attempt.label}: ${attempt.summary}`)
-          .join('\n');
-        const unresolved = (sharedHandoff.unresolvedAttempts || [])
-          .map((attempt) => `[${attempt.retryOfBranchId || 'unknown'}] ${attempt.canonicalTaskId} (${attempt.disposition || 'unknown'})`)
-          .join('\n');
-        return [
-          `retry_round=${sharedHandoff.retryIndex}`,
-          successful ? `successful_attempts:\n${successful}` : '',
-          unresolved ? `unresolved_attempts:\n${unresolved}` : '',
-        ].filter(Boolean).join('\n');
       };
 
       const uniqueCompactLines = (values: Array<string | undefined | null>) => {
         const seen = new Set<string>();
         return values
-          .map((value) => this.clipText(String(value || '').replace(/\s+/g, ' ').trim(), 220))
+          .map((value) => this.clipText(String(value || '').replace(/\s+/g, ' ').trim(), 160))
           .filter((value) => {
             if (!value || seen.has(value)) {
               return false;
@@ -3987,9 +4078,9 @@ ${sharedSkillReviewRules}`,
 
       const renderBranchEvidenceDigest = () => {
         const currentCard = kanbanSnapshot?.cards?.find((card) => card.branchId === branch.id);
-        const recentMessages = branch.transcript.slice(-6);
+        const recentMessages = branch.transcript.slice(-4);
         const recentText = recentMessages
-          .map((message) => this.clipText(extractText(message.content).replace(/\s+/g, ' ').trim(), 220))
+          .map((message) => this.clipText(extractText(message.content).replace(/\s+/g, ' ').trim(), 160))
           .filter(Boolean);
         const lastObservation = [...recentText]
           .reverse()
@@ -3997,65 +4088,56 @@ ${sharedSkillReviewRules}`,
         const verifiedFacts = uniqueCompactLines([
           currentCard?.summary,
           branch.completionSummary,
-          branch.handoff?.priorResultSnippet,
-        ]).slice(0, 3);
+        ]).slice(0, 2);
         const blockers = uniqueCompactLines([
           ...(currentCard?.blockers || []),
-          ...(branch.handoff?.blockedBy || []),
           branch.outcomeReason,
-        ]).slice(0, 4);
-        const unresolvedQuestions = uniqueCompactLines([
-          ...(branch.handoff?.missingFields || []),
-          ...(branch.sharedHandoff?.unresolvedAttempts || []).flatMap((attempt) => attempt.missingFields || []),
-        ]).slice(0, 4);
-        const repeatedSearchLoop = recentText.find((line) => /near-duplicate web search loop/i.test(line));
+        ]).slice(0, 2);
         return [
-          `last_tool_outcome: ${lastObservation || '(none)'}`,
-          `verified_facts: ${verifiedFacts.length > 0 ? verifiedFacts.join(' | ') : '(none)'}`,
-          `blockers: ${blockers.length > 0 ? blockers.join(' | ') : '(none)'}`,
-          `produced_artifacts: ${currentCard?.artifacts?.length ? currentCard.artifacts.join(', ') : (branch.savedNodeIds.length ? branch.savedNodeIds.join(', ') : '(none)')}`,
-          `unresolved_questions: ${unresolvedQuestions.length > 0 ? unresolvedQuestions.join(' | ') : '(none)'}`,
-          `repeated_search_signal: ${repeatedSearchLoop || '(none)'}`,
-        ].join('\n');
+          `last_tool: ${lastObservation || '(none)'}`,
+          verifiedFacts.length > 0 ? `facts: ${verifiedFacts.join(' | ')}` : '',
+          blockers.length > 0 ? `blockers: ${blockers.join(' | ')}` : '',
+          currentCard?.artifacts?.length ? `artifacts: ${currentCard.artifacts.slice(0, 3).join(', ')}` : '',
+        ].filter(Boolean).join('\n');
       };
+
+      // ── Compact metadata message ──
+      const handoffBlock = renderStructuredBranchHandoff(branch.handoff);
+      const retryBlock = branch.sharedHandoff ? `retry_round=${branch.sharedHandoff.retryIndex}` : '';
+      const metadataContent = `branch=${branch.id} label=${branch.label} depth=${branch.depth} steps=${branch.steps}
+goal: ${branch.goal}
+plan_v${branch.planVersionSeen ?? canonicalPlanState.version}: ${branch.planExcerpt || '(none)'}
+${branch.alignmentChecks?.length ? `checks: ${branch.alignmentChecks.join(' | ')}` : ''}
+${handoffBlock}${retryBlock ? `\n${retryBlock}` : ''}
+evidence: ${renderBranchEvidenceDigest()}
+kanban: ${renderPlannerKanbanSummary(kanbanSnapshot)}
+${canonicalPlanState.canonicalPlanText ? `canonical_plan (v${canonicalPlanState.version}):\n${this.clipText(canonicalPlanState.canonicalPlanText, branch.depth > 0 ? 800 : 2000)}` : 'No canonical plan yet — call planner_subagent with subagent=plan if branching is needed.'}
+
+user_request: ${this.clipText(originalUserRequest || input, 500)}
+Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_subagent/planner_final/planner_skills for control. Never mix control + work tools.`.replace(/\n{3,}/g, '\n\n');
+
+      // ── Dynamic transcript windowing ──
+      // Child branches (depth > 0) omit recentConversationMessages: they execute a specific
+      // subgoal and do not need prior conversation history. Including it can push the combined
+      // context (conv history + canonical plan + tools) past the model's per-call limit.
+      const activeConversationMessages = branch.depth > 0 ? [] : recentConversationMessages;
+      // Calculate how many transcript tokens we can afford after envelope overhead.
+      const envelopeTokens = estimateTokens(plannerSystemPrompt)
+        + estimateTranscriptTokens(activeConversationMessages)
+        + estimateTokens(metadataContent)
+        + (plannerMaxTokens || 1600)
+        + 2048; // safety margin
+      const transcriptBudgetTokens = Math.max(0, planningCtxBudget.modelLimit - envelopeTokens);
+      const transcriptBudgetChars = Math.max(4000, transcriptBudgetTokens * 4);
+      const windowedTranscript = compressTranscript(planningTranscript, transcriptBudgetChars);
 
       return [
         { role: 'system', content: plannerSystemPrompt },
+        ...activeConversationMessages,
+        ...windowedTranscript,
         {
           role: 'user' as const,
-          content: `Planning view only.
-Do not use conversation transcript, prior tool observations, or recalled context as planner input for this step.
-Plan only from the user goal and the current kanban task state below.
-
-Original user request:
-${originalUserRequest || input}
-
-Current branch state:
-- branch_id: ${branch.id}
-- parent_branch_id: ${branch.parentId || 'none'}
-- depth: ${branch.depth}
-- label: ${branch.label}
-- goal: ${branch.goal}
-- steps_so_far: ${branch.steps}
-- branch_disposition: ${branch.disposition || 'unknown'}
-- branch_handoff:
-${renderStructuredBranchHandoff(branch.handoff)}
-- shared_retry_context:
-${renderSharedRetryContext(branch.sharedHandoff)}
-- branch_evidence_digest:
-${renderBranchEvidenceDigest()}
-- structured_branch_results:
-${renderPlannerKanbanSummary(kanbanSnapshot)}
-- run_phase: ${runPhase || 'normal'}
-
-Loop guard:
-- Treat structured handoff fields as binding: preserve known good facts, focus on missing fields, and obey must_not_repeat unless you have a materially new strategy.
-- Treat branch_evidence_digest as the compact factual memory of this branch. Reuse it before issuing more search or fetch work.
-- Treat structured_branch_results as the only allowed branch-progress context for this planner step. Use it to reuse completed sibling work and avoid redoing covered ground.
-- Use the branch state above to decide the next step. Do not restart sibling work, re-open already-covered avenues without concrete reason, or pull downstream integration work into this branch unless this branch explicitly owns that integration.
-- ${isPlanStage ? 'PLAN stage rule: finish by returning one executable plan through planner_final.' : isExecuteStage ? 'EXECUTE stage rule: follow the approved plan sequentially. Use exactly one direct work tool at a time and revise the plan only when direct evidence forces you to.' : 'Normal mode rule: preserve the coordination graph already implied by execution_group and depends_on.'}
-
-Respond by calling tool(s), not plain text. Call read/search/edit/bash/web directly for work. Use planner_branch/planner_final/planner_skills only for control flow, and never mix control tools with direct work-tool calls in the same response.`,
+          content: metadataContent,
         },
       ] as ChatMessage[];
     };
@@ -4620,6 +4702,8 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
           `Branch ${record.branch.id}`,
           `label: ${record.branch.label}`,
           `canonical_label: ${record.canonicalLabel}`,
+          `plan_version_seen: ${record.branch.planVersionSeen ?? canonicalPlanState.version}`,
+          `plan_excerpt: ${record.branch.planExcerpt || '(none)'}`,
           `disposition: ${record.disposition}`,
           `goal: ${record.branch.goal}`,
           `saved_nodes: ${record.branch.savedNodeIds.length ? record.branch.savedNodeIds.join(', ') : '(none)'}`,
@@ -4654,7 +4738,7 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
                 },
                 {
                   role: 'user',
-                  content: `User request:\n${input}\n\nShared context:\n${this.clipText(context || '(no shared context)', 2400)}\n\nGoal assessment:\n${goalAssessment.summaryText}${archivedBranchSummary ? `\n\nArchived completed branch summaries:\n${this.clipText(archivedBranchSummary, 1800)}` : ''}\n\nCompleted branches:\n${branchSummary}`,
+                  content: `User request:\n${input}\n\nCanonical plan version: ${canonicalPlanState.version}\nCanonical plan delta summary: ${canonicalPlanState.deltaSummary || '(none)'}\n\nShared context:\n${this.clipText(context || '(no shared context)', 2400)}\n\nGoal assessment:\n${goalAssessment.summaryText}${archivedBranchSummary ? `\n\nArchived completed branch summaries:\n${this.clipText(archivedBranchSummary, 1800)}` : ''}\n\nCompleted branches:\n${branchSummary}`,
                 },
               ],
             }),
@@ -4703,9 +4787,24 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
         transcriptBudgetChars: effectiveTranscriptBudgetChars,
         modelLimit: planningCtxBudget.modelLimit,
         committedTokens: planningCtxBudget.committedTokens,
+        plannerEnvelopeTokens: estimateTokens(plannerSystemPrompt) + estimateTranscriptTokens(recentConversationMessages) + (plannerMaxTokens || 1600) + 2048,
         planBranch: async ({ branch, planningTranscript, kanbanSnapshot }) => {
+        const effectivePlanningTranscript = planningTranscript ?? (branch as BranchState).transcript;
+        const plannerMessages = buildPlannerMessages(branch as BranchState, effectivePlanningTranscript, kanbanSnapshot);
+        // Pre-flight token check: if input already exceeds model limit, force-finalize
+        // instead of sending a doomed LLM call that will fail and pollute the transcript.
+        const preflightTokens = estimateTranscriptTokens(plannerMessages);
+        if (planningCtxBudget.modelLimit > 0 && preflightTokens > planningCtxBudget.modelLimit - 2048) {
+          emitBranchTrace('observation', branch, `Pre-flight: planner input ${preflightTokens} tokens exceeds model limit ${planningCtxBudget.modelLimit}. Force-finalizing branch.`);
+          return {
+            kind: 'final' as const,
+            content: `Branch ${branch.id} stopped: planner input exceeded context window.`,
+            outcome: 'partial' as const,
+            disposition: 'missing_evidence' as const,
+          };
+        }
         const plannerResult = await planWithSkillRouting(
-            buildPlannerMessages(branch as BranchState, kanbanSnapshot),
+            plannerMessages,
             async (workingTranscript) => {
               return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
                 this.generatePlannerDecision({
@@ -4733,17 +4832,22 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
               role: 'user' as const,
               content: 'Branching is not available in classic ReAct mode. Please call exactly one direct work tool to proceed step by step, or call planner_final to finish.',
             });
-            return { kind: 'tool' as const, thought: decision.thought, toolCalls: [] };
+            return { kind: 'tool' as const, thought: 'Branching not available', toolCalls: [] };
+          }
+          if (decision.kind === 'subagent') {
+            clearPendingProviderToolState(branch as BranchState);
+            branch.transcript.push({
+              role: 'user' as const,
+              content: 'planner_subagent is not available in classic ReAct mode. Continue with exactly one direct work tool or call planner_final.',
+            });
+            return { kind: 'tool' as const, thought: 'Subagent not available', toolCalls: [] };
           }
           return {
             kind: 'final' as const,
-            thought: decision.thought,
-            content: decision.final_answer,
-            completionSummary: decision.completion_summary,
-            outcome: (decision as any).outcome,
-            outcomeReason: (decision as any).outcome_reason,
-            disposition: (decision as any).disposition,
-            finalizationMode: (decision as any).finalization_mode,
+            content: decision.answer,
+            outcome: decision.status === 'success' ? 'success' : decision.status === 'partial' ? 'partial' : 'failed',
+            outcomeReason: decision.reason,
+            disposition: decision.status === 'blocked' ? 'blocked_external' : decision.status === 'failed' ? 'planner_error' : 'resolved',
           };
         },
         buildToolTranscript: ({ branch, observations }) => buildProviderToolTranscript(branch as BranchState, observations),
@@ -4760,6 +4864,7 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
           if (event.type === 'final') return;
           emitTrace({ type: event.type, content: event.content, metadata: event.metadata });
         },
+        workspaceManager: this.workspaceManager,
       });
       finalAnswer = await runtime.run(`Original user request:\n${input}\n\nThink step by step. Use one tool at a time, observe the result, then decide the next action.`);
     } else {
@@ -4776,9 +4881,24 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
       transcriptBudgetChars: effectiveTranscriptBudgetChars,
       modelLimit: planningCtxBudget.modelLimit,
       committedTokens: planningCtxBudget.committedTokens,
+      plannerEnvelopeTokens: estimateTokens(plannerSystemPrompt) + estimateTranscriptTokens(recentConversationMessages) + (plannerMaxTokens || 1600) + 2048,
       planBranch: async ({ branch, planningTranscript, kanbanSnapshot }) => {
+        const effectivePlanningTranscript = planningTranscript ?? (branch as BranchState).transcript;
+        const plannerMessages = buildPlannerMessages(branch as BranchState, effectivePlanningTranscript, kanbanSnapshot);
+        // Pre-flight token check: if input already exceeds model limit, force-finalize
+        // instead of sending a doomed LLM call that will fail and pollute the transcript.
+        const preflightTokens = estimateTranscriptTokens(plannerMessages);
+        if (planningCtxBudget.modelLimit > 0 && preflightTokens > planningCtxBudget.modelLimit - 2048) {
+          emitBranchTrace('observation', branch, `Pre-flight: planner input ${preflightTokens} tokens exceeds model limit ${planningCtxBudget.modelLimit}. Force-finalizing branch.`);
+          return {
+            kind: 'final' as const,
+            content: `Branch ${branch.id} stopped: planner input exceeded context window.`,
+            outcome: 'partial' as const,
+            disposition: 'missing_evidence' as const,
+          };
+        }
         const plannerResult = await planWithSkillRouting(
-          buildPlannerMessages(branch as BranchState, kanbanSnapshot),
+          plannerMessages,
           async (workingTranscript) => {
             return this.measure(perfEntries, `llm_${branch.id}_step_${branch.steps + 1}`, async () =>
               this.generatePlannerDecision({
@@ -4797,6 +4917,9 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
         if (decision.kind === 'tool') {
           return { kind: 'tool' as const, thought: decision.thought, toolCalls: decision.tool_calls };
         }
+        if (decision.kind === 'subagent') {
+          return executeSubagentDecision(branch as BranchState, kanbanSnapshot, decision);
+        }
         if (decision.kind === 'branch') {
           return {
             kind: 'branch' as const,
@@ -4806,13 +4929,10 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
         }
         return {
           kind: 'final' as const,
-          thought: decision.thought,
-          content: decision.final_answer,
-          completionSummary: decision.completion_summary,
-          outcome: (decision as any).outcome,
-          outcomeReason: (decision as any).outcome_reason,
-          disposition: (decision as any).disposition,
-          finalizationMode: (decision as any).finalization_mode,
+          content: decision.answer,
+          outcome: decision.status === 'success' ? 'success' : decision.status === 'partial' ? 'partial' : 'failed',
+          outcomeReason: decision.reason,
+          disposition: decision.status === 'blocked' ? 'blocked_external' : decision.status === 'failed' ? 'planner_error' : 'resolved',
         };
       },
       buildToolTranscript: ({ branch, observations }) => buildProviderToolTranscript(branch as BranchState, observations),
@@ -4844,6 +4964,9 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
           outcomeReason: branch.outcomeReason,
           disposition: branch.disposition,
           finalizationMode: branch.finalizationMode,
+          planVersionSeen: branch.planVersionSeen,
+          planExcerpt: branch.planExcerpt,
+          alignmentChecks: branch.alignmentChecks,
           ancestorBranchIds: branch.ancestorBranchIds,
           ancestorBranchLabels: branch.ancestorBranchLabels,
         })) as BranchState[];
@@ -4863,9 +4986,10 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
           content: event.content,
           metadata: event.metadata,
         });
-      }
+      },
+      workspaceManager: this.workspaceManager,
     });
-    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. First plan the execution structure: decide whether the work should stay as one ordered execution thread or become a small coordination graph of genuinely independent branches. Raise the priority of execution-structure planning over immediate tool use. In both cases, plan before gathering more evidence. Branch only when each branch can make useful progress without waiting for sibling outputs. If the task mainly produces one integrated artifact, prefer one owner or an ordered plan over parallel siblings. Call planner_final when you are ready to answer.`);
+    finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. Use the current canonical plan if one already exists. If the task needs initial branching or a major plan refresh, call planner_subagent with subagent=plan and a concrete proposed plan instead of inventing a sibling graph locally. Otherwise continue with local branch execution. Call planner_final when you are ready to answer.`);
     }
 
     finalAnswer = this.sanitizeUserFacingAnswer(
@@ -5004,13 +5128,9 @@ Respond by calling tool(s), not plain text. Call read/search/edit/bash/web direc
       tool_findings: this.deriveToolFindings(traceBuffer, 4),
     });
     // Defer the large conversation-log write off the answer-return critical path.
+    // Uses the runId generated at run start so the in-progress placeholder is overwritten.
     setImmediate(() => {
-      this.appendConversationLog(
-        `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        input,
-        traceBuffer,
-        finalAnswer,
-      );
+      this.appendConversationLog(runId, input, traceBuffer, finalAnswer);
     });
     if (perfEntries && perfEntries.length > 0) {
       const totalMs = perfEntries.reduce((sum, item) => sum + item.ms, 0);

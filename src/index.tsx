@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { App } from './components/App.js';
 import { importDocCommand } from './import-doc.js';
 import { resolveProjectRoot } from './config/projectPaths.js';
+import { logError } from './utils/errorLogger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,9 +21,11 @@ console.log(`[CodeCLI] Using projectRoot: ${projectRoot}`);
 // Prevent unhandled promise rejections from silently killing the process.
 process.on('unhandledRejection', (reason) => {
   console.error('[CodeCLI] Unhandled rejection:', reason);
+  logError(projectRoot, reason, 'unhandledRejection');
 });
 process.on('uncaughtException', (err) => {
   console.error('[CodeCLI] Uncaught exception:', err);
+  logError(projectRoot, err, 'uncaughtException');
 });
 
 // ── import-doc sub-command ────────────────────────────────────────────────────

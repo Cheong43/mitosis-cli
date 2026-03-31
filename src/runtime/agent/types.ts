@@ -24,6 +24,7 @@ export type BranchDisposition =
   | 'blocked_external'
   | 'exhausted_search'
   | 'planner_error'
+  | 'tool_failure'
   | 'superseded'
   | 'unknown';
 
@@ -87,6 +88,15 @@ export interface BranchKanbanSnapshot {
   cards: BranchKanbanCard[];
 }
 
+export interface CanonicalPlanState {
+  version: number;
+  canonicalPlanText: string;
+  tokenEstimate: number;
+  updatedByBranchId: string;
+  updatedAtStep: number;
+  deltaSummary: string;
+}
+
 interface AgentStepBase {
   /** Optional planner thought for tracing/debugging. */
   thought?: string;
@@ -118,6 +128,23 @@ export interface PlannedBranch {
    */
   dependsOn?: string[];
   handoff?: BranchHandoff;
+  planExcerpt?: string;
+  alignmentChecks?: string[];
+  planVersion?: number;
+}
+
+export interface PlanBranchAlignment {
+  label: string;
+  planExcerpt: string;
+  alignmentChecks?: string[];
+}
+
+export interface PlanSubagentDecision {
+  planVersion: number;
+  canonicalPlan: string;
+  planDeltaSummary: string;
+  branches: PlannedBranch[];
+  branchAlignments: PlanBranchAlignment[];
 }
 
 /** A finalized answer produced by the agent. */

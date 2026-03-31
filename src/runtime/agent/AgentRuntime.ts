@@ -1,4 +1,5 @@
 import {
+  AgentStep,
   AgentTraceEvent,
   BranchKanbanCard,
   BranchKanbanSnapshot,
@@ -21,6 +22,7 @@ import {
   checkContextAndCompress,
   estimateTranscriptTokens,
 } from '../../agent/contextBudget.js';
+import { WorkspaceManager } from '../../persistence/WorkspaceManager.js';
 
 interface AgentToolRuntime {
   execute(toolName: string, args: Record<string, unknown>): Promise<ToolExecutionResult>;
@@ -54,10 +56,20 @@ export interface AgentBranchState {
   handoff?: BranchHandoff;
   /** Structured shared retry context for a remediation round. */
   sharedHandoff?: SynthesisSharedHandoff;
+  /** Canonical plan version last seen by this branch. */
+  planVersionSeen?: number;
+  /** Branch-local excerpt extracted from the canonical plan. */
+  planExcerpt?: string;
+  /** Alignment checks that the branch should satisfy while executing. */
+  alignmentChecks?: string[];
   /** Full branch ancestry ids, excluding this branch id. */
   ancestorBranchIds?: string[];
   /** Full branch ancestry labels, excluding this branch label. */
   ancestorBranchLabels?: string[];
+  /** File paths created by this branch. */
+  artifacts?: string[];
+  /** Consecutive tool execution failures count. */
+  consecutiveFailures?: number;
 }
 
 export interface BranchPlanInput {
@@ -81,6 +93,7 @@ export interface BranchSynthesisInput {
   userMessage: string;
   priorTranscript: TranscriptMessage[];
   archivedBranchSummary?: string;
+  canonicalPlanVersion?: number;
   branches: Array<{
     id: string;
     label: string;
@@ -92,6 +105,9 @@ export interface BranchSynthesisInput {
     outcomeReason?: string;
     disposition?: BranchDisposition;
     finalizationMode?: 'natural' | 'planner_fallback';
+    planVersionSeen?: number;
+    planExcerpt?: string;
+    alignmentChecks?: string[];
     ancestorBranchIds?: string[];
     ancestorBranchLabels?: string[];
   }>;
@@ -128,6 +144,13 @@ export interface AgentRuntimeOptions {
   modelLimit?: number;
   /** Tokens already committed (system prompt + conversation + memory + margin). */
   committedTokens?: number;
+  /**
+   * Additional token overhead per planner call (system prompt envelope,
+   * metadata message, output reserve) that sits on top of the branch
+   * transcript.  Used by the context gate so branches stop before the
+   * planner input can overflow the model context window.
+   */
+  plannerEnvelopeTokens?: number;
   /** Optional branch-aware planner override. */
   planBranch?: (input: BranchPlanInput) => Promise<import('./types.js').AgentStep>;
   /** Optional branch-aware tool execution override. */
@@ -147,6 +170,8 @@ export interface AgentRuntimeOptions {
   maxSynthesisRetries?: number;
   /** Trace callback invoked after each loop step. */
   onTrace?: (event: AgentTraceEvent) => void;
+  /** Optional workspace manager for persisting branch work. */
+  workspaceManager?: WorkspaceManager;
 }
 
 function formatPlannerToolDecisionMessage(toolCalls: PlannedToolCall[]): string {
@@ -540,6 +565,7 @@ export class AgentRuntime {
   private readonly transcriptBudgetChars: number;
   private readonly modelLimit: number;
   private readonly committedTokens: number;
+  private readonly plannerEnvelopeTokens: number;
   private readonly planBranch?: (input: BranchPlanInput) => Promise<import('./types.js').AgentStep>;
   private readonly executeToolCall?: (input: BranchToolExecutionInput) => Promise<ToolObservation>;
   private readonly buildToolTranscript?: (input: BranchToolTranscriptInput) => TranscriptMessage[] | null | undefined;
@@ -547,6 +573,7 @@ export class AgentRuntime {
   private readonly synthesizeFinal?: (input: BranchSynthesisInput) => Promise<string | SynthesisResult>;
   private readonly maxSynthesisRetries: number;
   private readonly onTrace: (event: AgentTraceEvent) => void;
+  private readonly workspaceManager?: WorkspaceManager;
 
   constructor(options: AgentRuntimeOptions) {
     this.planner = options.planner;
@@ -562,6 +589,7 @@ export class AgentRuntime {
     this.transcriptBudgetChars = options.transcriptBudgetChars ?? 80_000;
     this.modelLimit = options.modelLimit ?? 0;
     this.committedTokens = options.committedTokens ?? 0;
+    this.plannerEnvelopeTokens = options.plannerEnvelopeTokens ?? 0;
     this.planBranch = options.planBranch;
     this.executeToolCall = options.executeToolCall;
     this.buildToolTranscript = options.buildToolTranscript;
@@ -569,6 +597,7 @@ export class AgentRuntime {
     this.synthesizeFinal = options.synthesizeFinal;
     this.maxSynthesisRetries = options.maxSynthesisRetries ?? 2;
     this.onTrace = options.onTrace ?? (() => undefined);
+    this.workspaceManager = options.workspaceManager;
   }
 
   /**
@@ -710,16 +739,17 @@ export class AgentRuntime {
       if (!syncMessage) {
         return branch.transcript;
       }
-      if (branch.transcript.length === 0) {
-        return [{ role: 'system', content: syncMessage }];
-      }
-      const [head, ...rest] = branch.transcript;
-      if (head?.role === 'system') {
+      // Merge the kanban sync into the leading system message so there is always
+      // exactly ONE system-role entry in the transcript.  Models such as MiniMax
+      // reject requests that contain more than one system role (error 2013).
+      const [first, ...rest] = branch.transcript;
+      if (first?.role === 'system') {
         return [
-          { role: 'system', content: `${head.content}\n\n${syncMessage}` },
+          { role: 'system', content: `${syncMessage}\n\n${String(first.content)}` },
           ...rest,
         ];
       }
+      // No leading system message — create one so the sync always lands at index 0.
       return [
         { role: 'system', content: syncMessage },
         ...branch.transcript,
@@ -756,6 +786,12 @@ export class AgentRuntime {
     const addCompletedBranch = (branch: AgentBranchState) => {
       if (!completed.includes(branch)) {
         completed.push(branch);
+        // Persist branch work if workspace manager is available
+        if (this.workspaceManager) {
+          this.workspaceManager.saveBranchWork(branch.id, branch).catch((err) => {
+            console.error(`Failed to persist branch ${branch.id}:`, err);
+          });
+        }
       }
     };
 
@@ -991,6 +1027,14 @@ export class AgentRuntime {
       if (shouldRuntimeTraceTool()) {
         observations.forEach((observation) => emitObservationTrace(branch, observation));
       }
+
+      // Track consecutive failures
+      const allFailed = observations.length > 0 && observations.every((o) => !o.success);
+      if (allFailed) {
+        branch.consecutiveFailures = (branch.consecutiveFailures || 0) + 1;
+      } else if (observations.some((o) => o.success)) {
+        branch.consecutiveFailures = 0;
+      }
     };
 
     const buildChildBranches = (
@@ -1023,7 +1067,7 @@ export class AgentRuntime {
           },
           {
             role: 'user',
-            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nExecution group: ${executionGroup}\nDepends on sibling labels: ${dependsOn.length ? dependsOn.join(', ') : 'none'}\nThis branch owns only its local sub-problem.\nSibling branches in the same execution group may run in parallel. Higher execution groups wait until all lower groups under the same parent finish.\nIf depends_on is set, this branch should not start until those sibling labels have already finished.\nTreat execution_group and depends_on as binding coordination constraints, not hints.\nOnly do work that can make useful progress within this branch's scope. Do not perform downstream integration early if that integration mainly depends on sibling outputs that are still being produced elsewhere.\nRe-branch only if this branch still contains multiple genuinely independent substreams with low coordination risk. Do not branch again by default.\nUse web only in mode=fetch and only when you already have a trustworthy URL.\nYou may use tool calls, branch further if the goal truly benefits from independent sub-work, or return a final answer. Avoid repeating sibling work.${structuredHandoffBlock ? `\n\nStructured remediation handoff:\n${structuredHandoffBlock}` : ''}${kanbanSyncMessage ? `\n\n${kanbanSyncMessage}` : ''}`,
+            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nExecution group: ${executionGroup}\nDepends on sibling labels: ${dependsOn.length ? dependsOn.join(', ') : 'none'}\nCanonical plan version: ${child.planVersion ?? branch.planVersionSeen ?? 0}\nBranch plan excerpt:\n${child.planExcerpt || branch.planExcerpt || '(none)'}\nAlignment checks: ${child.alignmentChecks?.length ? child.alignmentChecks.join(' | ') : '(none)'}\nThis branch owns only its local sub-problem.\nSibling branches in the same execution group may run in parallel. Higher execution groups wait until all lower groups under the same parent finish.\nIf depends_on is set, this branch should not start until those sibling labels have already finished.\nTreat execution_group and depends_on as binding coordination constraints, not hints.\nOnly do work that can make useful progress within this branch's scope. Do not perform downstream integration early if that integration mainly depends on sibling outputs that are still being produced elsewhere.\nRe-branch only if this branch still contains multiple genuinely independent substreams with low coordination risk. Do not branch again by default.\nUse web only in mode=fetch and only when you already have a trustworthy URL.\nYou may use tool calls, branch further if the goal truly benefits from independent sub-work, or return a final answer. Avoid repeating sibling work.${structuredHandoffBlock ? `\n\nStructured remediation handoff:\n${structuredHandoffBlock}` : ''}${kanbanSyncMessage ? `\n\n${kanbanSyncMessage}` : ''}`,
           },
         ];
 
@@ -1042,6 +1086,9 @@ export class AgentRuntime {
           transcript,
           handoff: child.handoff,
           sharedHandoff: branch.sharedHandoff,
+          planVersionSeen: child.planVersion ?? branch.planVersionSeen,
+          planExcerpt: child.planExcerpt ?? branch.planExcerpt,
+          alignmentChecks: child.alignmentChecks ?? [],
           ancestorBranchIds: [...(branch.ancestorBranchIds || []), branch.id],
           ancestorBranchLabels: [...(branch.ancestorBranchLabels || []), branch.label],
         };
@@ -1061,7 +1108,26 @@ export class AgentRuntime {
     };
 
     const runBranch = async (branch: AgentBranchState): Promise<AgentBranchState[]> => {
+      const MAX_CONSECUTIVE_FAILURES = 5;
+
       while (true) {
+        // Check consecutive failures limit
+        if ((branch.consecutiveFailures || 0) >= MAX_CONSECUTIVE_FAILURES) {
+          const reason = `${MAX_CONSECUTIVE_FAILURES} consecutive tool failures`;
+          branch.finalAnswer = await finalizeBranchSafely(
+            branch,
+            reason,
+            `Branch ${branch.id} stopped: all tool calls failed ${MAX_CONSECUTIVE_FAILURES} times in a row.`,
+          );
+          branch.outcome = 'failed';
+          branch.outcomeReason = reason;
+          branch.disposition = 'tool_failure';
+          markBranchCompleted(branch, reason, [reason]);
+          addCompletedBranch(branch);
+          emitBranchTrace('observation', branch, `Branch stopped after ${MAX_CONSECUTIVE_FAILURES} consecutive failures.`);
+          return [];
+        }
+
         // ── Context gate ───────────────────────────────────────────────
         // Each branch's ONLY hard limit is its context window. When the
         // transcript approaches the model context limit, compress it.
@@ -1072,7 +1138,7 @@ export class AgentRuntime {
           const check = checkContextAndCompress(
             localTranscript,
             this.modelLimit,
-            this.committedTokens + inheritedTokens,
+            this.committedTokens + this.plannerEnvelopeTokens + inheritedTokens,
           );
           if (check.compressed) {
             setBranchLocalTranscript(branch, check.transcript as TranscriptMessage[], inheritedTranscript);
@@ -1125,9 +1191,22 @@ export class AgentRuntime {
 
         const planningTranscript = buildPlanningTranscript(branch);
         const kanbanSnapshot = buildKanbanSnapshot();
-        const agentStep = this.planBranch
-          ? await this.planBranch({ branch, planningTranscript, kanbanSnapshot })
-          : await this.planner.plan(planningTranscript);
+        let agentStep: AgentStep;
+        try {
+          agentStep = this.planBranch
+            ? await this.planBranch({ branch, planningTranscript, kanbanSnapshot })
+            : await this.planner.plan(planningTranscript);
+        } catch (error: unknown) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          emitBranchTrace('error', branch, `Planner failed: ${errorMessage}`);
+          branch.finalAnswer = await finalizeBranchSafely(branch, 'planner error', `Planner failed: ${errorMessage}`);
+          branch.outcome = 'failed';
+          branch.outcomeReason = `planner error: ${errorMessage}`;
+          branch.disposition = 'planner_error';
+          markBranchCompleted(branch, 'Planner error.', [errorMessage]);
+          addCompletedBranch(branch);
+          return [];
+        }
         if (agentStep.thought) {
           emitBranchTrace('thought', branch, agentStep.thought);
         }
@@ -1537,6 +1616,9 @@ export class AgentRuntime {
           outcomeReason: branch.outcomeReason,
           disposition: branch.disposition,
           finalizationMode: branch.finalizationMode,
+          planVersionSeen: branch.planVersionSeen,
+          planExcerpt: branch.planExcerpt,
+          alignmentChecks: branch.alignmentChecks,
           ancestorBranchIds: branch.ancestorBranchIds,
           ancestorBranchLabels: branch.ancestorBranchLabels,
         })),

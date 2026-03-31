@@ -19,11 +19,16 @@ function createTempProjectRoot(prefix: string): string {
 }
 
 function promptIncludesBranchLabel(prompt: string, label: string): boolean {
-  return prompt.includes(`- label: ${label}`) || prompt.includes(`child branch "${label}"`);
+  return prompt.includes(`- label: ${label}`)
+    || prompt.includes(`label: ${label}`)
+    || prompt.includes(`label=${label}`)
+    || prompt.includes(`child branch "${label}"`);
 }
 
 function promptIncludesBranchId(prompt: string, branchId: string): boolean {
-  return prompt.includes(`- branch_id: ${branchId}`) || prompt.includes(`branch_id: ${branchId}`);
+  return prompt.includes(`- branch_id: ${branchId}`)
+    || prompt.includes(`branch_id: ${branchId}`)
+    || prompt.includes(`branch=${branchId}`);
 }
 
 function promptIncludesToolOutcome(prompt: string, toolName: string): boolean {
@@ -808,34 +813,147 @@ test('planner prompt keeps branching guidance principle-based without root coerc
 
   const answer = await agent.run('竭尽所能收集中英今天的盘前信源', () => {}, { conversationId: 'thread-branch-guidance' });
   assert.equal(answer, 'ok');
-  assert.match(capturedPrompt, /Optimize for correct end-to-end completion of the user's deliverable/i);
-  assert.match(capturedPrompt, /classify candidate workstreams as one of four relationships/i);
-  assert.match(capturedPrompt, /If work is inseparable, or if dependency is unclear, prefer fewer branches/i);
-  assert.match(capturedPrompt, /Branch only when genuine independent progress is available/i);
-  assert.match(capturedPrompt, /For integrated artifacts such as websites, reports, refactors, or single deliverables/i);
-  assert.match(capturedPrompt, /Raise the priority of execution-structure planning over immediate tool use/i);
-  assert.match(capturedPrompt, /Treat branching as parallel task planning/i);
-  assert.match(capturedPrompt, /call read\/search\/edit\/bash\/web directly for work/i);
-  assert.match(capturedPrompt, /Skill: brave-search/i);
-  assert.match(capturedPrompt, /web\s+-> fetch a known web page URL/i);
-  assert.match(capturedPrompt, /Use web only in mode=fetch/i);
-  assert.match(capturedPrompt, /Claude-compatible project agents under \.\/\.claude\/agents\/\*\.md/i);
-  assert.match(capturedPrompt, /Branches may share the same execution_group only when each branch can make useful progress without waiting for sibling outputs/i);
-  assert.match(capturedPrompt, /Re-branch only when the current branch still contains multiple independent workstreams with low coordination cost/i);
-  assert.match(capturedPrompt, /Keep every `goal` concise and comfortably under the 240-character schema limit/i);
-  assert.match(capturedPrompt, /Planning view only/i);
-  assert.match(capturedPrompt, /structured_branch_results:/i);
-  assert.match(capturedPrompt, /snapshot_summary:/i);
+  assert.match(capturedPrompt, /Control tools: planner_subagent/i);
+  assert.match(capturedPrompt, /Execute your branch excerpt faithfully/i);
+  assert.match(capturedPrompt, /planner_subagent/i);
+  assert.match(capturedPrompt, /Request planner_subagent with subagent=plan when: no canonical plan exists/i);
+  assert.match(capturedPrompt, /current plan is wrong, or a local gap needs remediation rebranch/i);
+  assert.match(capturedPrompt, /For work, call read\/search\/edit\/bash\/web directly/i);
+  assert.match(capturedPrompt, /web -> fetch a trusted URL only; do not invent URLs/i);
+  assert.match(capturedPrompt, /Tools: read, search, edit, bash, web \(mode=fetch only, requires concrete URL\)/i);
+  assert.match(capturedPrompt, /Never mix control \+ work tools/i);
+  assert.match(capturedPrompt, /No canonical plan yet — call planner_subagent with subagent=plan if branching is needed\./i);
   assert.doesNotMatch(capturedPrompt, /Shared context for this request:/i);
   assert.doesNotMatch(capturedPrompt, /Always provide at least 2 branches/i);
   assert.doesNotMatch(capturedPrompt, /NEVER branch on the first step/i);
   assert.doesNotMatch(capturedPrompt, /default to one `web` tool call before branching/i);
   assert.doesNotMatch(capturedPrompt, /Return exactly one JSON object/i);
   assert.doesNotMatch(capturedPrompt, /planner_tool/i);
+  assert.doesNotMatch(capturedPrompt, /planner_plan/i);
+  assert.doesNotMatch(capturedPrompt, /planner_branch: express the current step as a small coordination graph/i);
   assert.doesNotMatch(capturedPrompt, /web mode=search/i);
   assert.doesNotMatch(capturedPrompt, /Prefer materially diverse search strategies/i);
   assert.doesNotMatch(capturedPrompt, /After 2-3 consecutive web\/search rounds without clear new information/i);
 
+  agent.stop();
+});
+
+test('planner_subagent with subagent=plan publishes a canonical plan and aligns child branch prompts to it', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-plan-subagent-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+
+  const originalLimiterRun = anyAgent.llmRpmLimiter.run.bind(anyAgent.llmRpmLimiter);
+  try {
+    anyAgent.llmRpmLimiter.run = async () => ({
+      calls: [{
+        input: {
+          kind: 'plan_subagent_result',
+          decision: {
+            planVersion: 1,
+            canonicalPlan: '1. Gather evidence.\n2. Verify the risky claim.\n3. Merge the branch results.',
+            planDeltaSummary: 'Created the first canonical plan.',
+            branches: [{
+              label: 'Evidence path',
+              goal: 'Collect the source evidence for the claim.',
+              priority: 1,
+              planExcerpt: 'Collect the source evidence for the claim.',
+              alignmentChecks: ['Cite the exact source file or command output.'],
+              planVersion: 1,
+            }],
+            branchAlignments: [{
+              label: 'Evidence path',
+              planExcerpt: 'Collect the source evidence for the claim.',
+              alignmentChecks: ['Cite the exact source file or command output.'],
+            }],
+          },
+        },
+      }],
+      text: '',
+    });
+
+    const capturedPrompts: string[] = [];
+    anyAgent.generatePlannerDecision = async ({ messages }: { messages: Array<{ content?: string }> }) => {
+      const joined = Array.isArray(messages)
+        ? messages.map((message) => String(message?.content || '')).join('\n\n')
+        : '';
+      capturedPrompts.push(joined);
+
+      if (joined.includes('No canonical plan yet — call planner_subagent with subagent=plan if branching is needed.')) {
+        return {
+          kind: 'subagent',
+          subagent: 'plan',
+          thought: 'Need a canonical branching plan before acting.',
+          trigger: 'initial_branching',
+          proposed_plan: 'Split into one evidence-gathering branch, then integrate.',
+          focus: 'Design the initial branch graph.',
+          reason: 'No canonical plan exists yet.',
+        };
+      }
+
+      return {
+        kind: 'final',
+        thought: 'Done.',
+        final_answer: 'ok',
+        completion_summary: 'ok',
+      };
+    };
+
+    const answer = await agent.run('为这个请求建立规范的分枝计划', () => {}, {
+      conversationId: 'thread-plan-subagent',
+    });
+
+    assert.equal(answer, 'ok');
+    const childPrompt = capturedPrompts.find((prompt) => /canonical_plan \(v1\):/i.test(prompt) && /plan_v1:/i.test(prompt))
+      || capturedPrompts.find((prompt) => /checks:\s*Cite the exact source file or command output\./i.test(prompt))
+      || capturedPrompts.at(-1);
+    assert.ok(childPrompt);
+    assert.match(childPrompt!, /canonical_plan \(v1\):/i);
+    assert.match(childPrompt!, /Gather evidence\./i);
+    assert.match(childPrompt!, /plan_v1:/i);
+    assert.match(childPrompt!, /Collect the source evidence for the claim\./i);
+    assert.match(childPrompt!, /checks:\s*Cite the exact source file or command output\./i);
+  } finally {
+    anyAgent.llmRpmLimiter.run = originalLimiterRun;
+    agent.stop();
+  }
+});
+
+test('planner_subagent with subagent=research falls back deterministically while disabled', async () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-research-subagent-disabled-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+  anyAgent.retrieveRelevantContext = async () => ({
+    contextText: '',
+    recalledNodeIds: [],
+    selectedNodeIds: [],
+    rationale: 'test',
+  });
+
+  const traces: Array<{ type: string; content: string }> = [];
+  anyAgent.generatePlannerDecision = async () => ({
+    kind: 'subagent',
+    subagent: 'research',
+    thought: 'Need the reserved research subagent.',
+    query: 'Collect evidence about the topic.',
+    focus: 'Research the claim.',
+    deliverable: 'Return a structured summary.',
+  });
+
+  const answer = await agent.run('请用 research subagent 调查这个问题', (event) => {
+    traces.push({ type: event.type, content: event.content });
+  }, {
+    conversationId: 'thread-research-subagent-disabled',
+  });
+
+  assert.equal(answer, '抱歉，当前请求的子代理尚未启用。请改用直接工具或稍后再试。');
+  assert.ok(traces.some((event) => event.content.includes('research subagent is registered but not enabled')));
   agent.stop();
 });
 
@@ -943,8 +1061,8 @@ test('planner prompt includes compact branch evidence digest after tool observat
     conversationId: 'thread-branch-digest',
   });
   assert.equal(answer, 'ok');
-  assert.match(secondPrompt, /branch_evidence_digest:/i);
-  assert.match(secondPrompt, /last_tool_outcome:/i);
+  assert.match(secondPrompt, /evidence:/i);
+  assert.match(secondPrompt, /last_tool:/i);
   assert.match(secondPrompt, /verification complete/i);
 
   agent.stop();
@@ -1002,7 +1120,7 @@ test('sequential execution-discipline decisions use strict plan-and-execute inst
   assert.ok(executionPrompt);
   assert.match(planningPrompt!, /You are a branching ReAct agent/i);
   assert.match(planningPrompt!, /PLAN stage/i);
-  assert.match(planningPrompt!, /Raise the priority of execution-structure planning over immediate tool use/i);
+  assert.match(planningPrompt!, /planner_subagent/i);
   assert.doesNotMatch(planningPrompt!, /Planning is strictly read-only/i);
   assert.match(executionPrompt!, /You are a classic ReAct agent/i);
   assert.match(executionPrompt!, /EXECUTE stage/i);
@@ -1196,9 +1314,7 @@ test('child branch prompts stay on direct work tools instead of inheriting legac
       };
     }
 
-    assert.match(joined, /Call read\/search\/edit\/bash\/web directly for work/i);
-    assert.match(joined, /Planning view only/i);
-    assert.match(joined, /structured_branch_results:/i);
+    assert.match(joined, /For work, call read\/search\/edit\/bash\/web directly/i);
     assert.doesNotMatch(joined, /Return exactly one JSON object/i);
     assert.doesNotMatch(joined, /\{"kind":"branch"/);
     assert.doesNotMatch(joined, /planner_tool/i);
@@ -1206,8 +1322,9 @@ test('child branch prompts stay on direct work tools instead of inheriting legac
 
     if (sawChildPrompt) {
       sawPostToolPrompt = true;
-      assert.match(joined, /branch_evidence_digest:/i);
-      assert.match(joined, /last_tool_outcome:\s*TOOL OBSERVATION for read:/i);
+      assert.match(joined, /evidence:/i);
+      assert.match(joined, /last_tool:\s*TOOL OBSERVATION for read:/i);
+      assert.match(joined, /evidence from note/i);
       assert.doesNotMatch(joined, /\{"kind":"tool"/);
       return {
         kind: 'final',
