@@ -309,18 +309,16 @@ function parseJsonObjectText(text: string): unknown {
   } catch (error) {
     const firstBrace = trimmed.indexOf('{');
     const lastBrace = trimmed.lastIndexOf('}');
-    if (firstBrace >= 0 && lastBrace > firstBrace) {
-      let extracted = trimmed.slice(firstBrace, lastBrace + 1);
+    if (firstBrace >= 0) {
+      // Extract JSON, even if incomplete
+      let extracted = lastBrace > firstBrace
+        ? trimmed.slice(firstBrace, lastBrace + 1)
+        : trimmed.slice(firstBrace);
+
       try {
         return JSON.parse(extracted);
       } catch {
-        // Try to fix common array formatting issues
-        extracted = fixArrayFormatting(extracted);
-        try {
-          return JSON.parse(extracted);
-        } catch {
-          // If still fails, return original error
-        }
+        // Last attempt failed
       }
     }
     const errorMsg = error instanceof Error ? error.message : String(error);
@@ -328,7 +326,7 @@ function parseJsonObjectText(text: string): unknown {
   }
 }
 
-function fixArrayFormatting(json: string): string {
+export function fixArrayFormatting(json: string): string {
   // Fix missing commas between array elements
   let fixed = json.replace(/\}\s*\{/g, '},{');
   // Fix trailing commas before closing brackets
@@ -340,6 +338,43 @@ function fixArrayFormatting(json: string): string {
     fixed += ']'.repeat(openBrackets - closeBrackets);
   }
   return fixed;
+}
+
+export function fixUnterminatedStrings(json: string): string {
+  // Count quotes to detect unterminated strings
+  let inString = false;
+  let escaped = false;
+  let lastQuotePos = -1;
+
+  for (let i = 0; i < json.length; i++) {
+    const char = json[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      lastQuotePos = i;
+    }
+  }
+
+  // If still in string at end, close it
+  if (inString && lastQuotePos >= 0) {
+    json += '"';
+  }
+
+  // Fix missing closing braces
+  const openBraces = (json.match(/\{/g) || []).length;
+  const closeBraces = (json.match(/\}/g) || []).length;
+  if (openBraces > closeBraces) {
+    json += '}'.repeat(openBraces - closeBraces);
+  }
+
+  return json;
 }
 
 function clipPreview(text: string, maxChars = 240): string {

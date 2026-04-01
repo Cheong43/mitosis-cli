@@ -7,7 +7,7 @@ import type {
 
 export const researchSubagentHandler: SubagentHandler<ResearchSubagentInvocation> = {
   kind: 'research',
-  enabled: true,
+  enabled: false,
   buildPlannerHint: () => 'Use research subagent for information gathering, exploration, and analysis tasks.',
   async run(
     ctx: SubagentRunContext,

@@ -1110,7 +1110,8 @@ export class AgentRuntime {
     const runBranch = async (branch: AgentBranchState): Promise<AgentBranchState[]> => {
       const MAX_CONSECUTIVE_FAILURES = 5;
 
-      while (true) {
+      try {
+        while (true) {
         // Check consecutive failures limit
         if ((branch.consecutiveFailures || 0) >= MAX_CONSECUTIVE_FAILURES) {
           const reason = `${MAX_CONSECUTIVE_FAILURES} consecutive tool failures`;
@@ -1315,11 +1316,11 @@ export class AgentRuntime {
         }
 
         const childBranches = buildChildBranches(branch, validatedChildPlanSet.normalizedBranches);
-        upsertKanbanCard(branch, {
-          status: 'completed',
-          summary: `Delegated to ${validatedChildPlanSet.normalizedBranches.length} child branch${validatedChildPlanSet.normalizedBranches.length === 1 ? '' : 'es'}.`,
-          blockers: [],
-        });
+        markBranchCompleted(
+          branch,
+          `Delegated to ${validatedChildPlanSet.normalizedBranches.length} child branch${validatedChildPlanSet.normalizedBranches.length === 1 ? '' : 'es'}.`,
+        );
+        addCompletedBranch(branch);
         emitBranchTrace('action', branch, `Spawning ${validatedChildPlanSet.normalizedBranches.length} child branches.`, { childCount: validatedChildPlanSet.normalizedBranches.length });
         for (const childBranch of childBranches) {
           this.emit({
@@ -1329,6 +1330,22 @@ export class AgentRuntime {
           });
         }
         return childBranches;
+      }
+      } catch (error: unknown) {
+        // Catch-all to prevent branch Promise from never resolving
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        emitBranchTrace('error', branch, `Branch execution failed with unhandled error: ${errorMessage}`);
+        branch.finalAnswer = await finalizeBranchSafely(
+          branch,
+          'unhandled error',
+          `Branch ${branch.id} failed: ${errorMessage}`,
+        );
+        branch.outcome = 'failed';
+        branch.outcomeReason = `unhandled error: ${errorMessage}`;
+        branch.disposition = 'planner_error';
+        markBranchCompleted(branch, 'Unhandled error.', [errorMessage]);
+        addCompletedBranch(branch);
+        return [];
       }
     };
 
@@ -1445,7 +1462,14 @@ export class AgentRuntime {
         });
         let task: Promise<void>;
         activeBranches.set(branch.id, branch);
-        task = runBranch(branch)
+
+        // Wrap with timeout protection to prevent deadlock
+        const BRANCH_TIMEOUT_MS = 600000; // 10 minutes
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error(`Branch ${branch.id} timeout after ${BRANCH_TIMEOUT_MS}ms`)), BRANCH_TIMEOUT_MS);
+        });
+
+        task = Promise.race([runBranch(branch), timeoutPromise])
           .then((childBranches) => {
             active.delete(task);
             activeBranches.delete(branch.id);
@@ -1467,9 +1491,35 @@ export class AgentRuntime {
     };
 
     launchQueuedBranches();
-    while (active.size > 0) {
-      await Promise.race(active);
-    }
+
+    // Global timeout protection to prevent infinite deadlock
+    const GLOBAL_TIMEOUT_MS = 1800000; // 30 minutes
+    const globalTimeoutPromise = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        if (active.size > 0) {
+          this.emit({
+            type: 'error',
+            content: `Global timeout: ${active.size} branch(es) still active after ${GLOBAL_TIMEOUT_MS}ms. Forcing completion.`,
+          });
+          // Force complete all stuck branches
+          for (const branch of activeBranches.values()) {
+            completeErroredBranch(branch, new Error('Global timeout'), 'Branch forced to complete due to global timeout');
+          }
+          active.clear();
+          activeBranches.clear();
+        }
+        resolve();
+      }, GLOBAL_TIMEOUT_MS);
+    });
+
+    await Promise.race([
+      (async () => {
+        while (active.size > 0) {
+          await Promise.race(active);
+        }
+      })(),
+      globalTimeoutPromise,
+    ]);
 
     if (completed.length === 0 && lastTouchedBranch) {
       emitBranchTrace('thought', lastTouchedBranch, `No branch reached a natural final answer; explicitly finalizing ${lastTouchedBranch.id}.`);

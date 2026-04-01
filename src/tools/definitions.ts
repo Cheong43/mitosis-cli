@@ -95,12 +95,14 @@ export const TOOLS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'web',
-      description: 'Fetch a specific web page into a citation summary with highlights and a short preview. Use for external/current information when you already have a trusted URL.',
+      description: 'Search the web or fetch a specific page. Use mode=search for web search (tries Brave if configured, falls back to DuckDuckGo), or mode=fetch for known URLs.',
       parameters: {
         type: 'object',
         properties: {
-          mode: { type: 'string', enum: ['fetch'], description: 'Fetch a page by URL.' },
+          mode: { type: 'string', enum: ['fetch', 'search'], description: 'Operation mode: search the web or fetch a specific URL.' },
           url: { type: 'string', description: 'URL to fetch when mode=fetch.' },
+          query: { type: 'string', description: 'Search query when mode=search.' },
+          limit: { type: 'number', description: 'Maximum number of search results when mode=search (default: 10).' },
           allowed_domains: {
             type: 'array',
             items: { type: 'string' },

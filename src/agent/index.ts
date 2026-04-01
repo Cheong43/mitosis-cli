@@ -87,8 +87,9 @@ const PlannerToolCallSchema = z.object({
 const PlannerBranchSchema = z.object({
   label: z.string().trim().min(1).max(80),
   goal: z.string().trim().min(1).max(240),
-  group: z.number().int().min(1).max(8).optional().default(1),
-  depends: z.array(z.string().trim().min(1).max(80)).min(0).max(7).optional(),
+  group: z.number().int().min(1).max(8).describe('Execution group (required): 1=first wave, 2=second wave, etc.'),
+  priority: z.number().int().min(1).max(100).default(50).describe('Priority within group (required): higher=more urgent'),
+  depends: z.array(z.string().trim().min(1).max(80)).min(0).max(7).optional().describe('Labels of sibling branches this depends on'),
 });
 
 const PlannerThoughtSchema = z.string().trim().min(1);
@@ -208,8 +209,13 @@ const PlannerSkillsDecisionSchema = z.object({
 const PlannerSubagentDecisionSchema = z.object({
   kind: z.literal('subagent'),
   subagent: z.enum(['plan', 'research', 'crawler']),
-  task: z.string().trim().min(1).max(800),
-  context: z.string().trim().max(400).optional(),
+  task: z.string().trim().min(1).max(1500),
+  context: z.string().trim().max(600).optional(),
+});
+
+const PlannerWorkDecisionSchema = z.object({
+  kind: z.literal('work'),
+  thought: z.string().trim().min(1).max(400),
 });
 
 const PlannerDecisionSchema = z.union([
@@ -218,6 +224,7 @@ const PlannerDecisionSchema = z.union([
   PlannerFinalDecisionSchema,
   PlannerSkillsDecisionSchema,
   PlannerSubagentDecisionSchema,
+  PlannerWorkDecisionSchema,
 ]);
 
 type PlannerDecision = z.infer<typeof PlannerDecisionSchema>;
@@ -451,6 +458,7 @@ export class Agent {
   private readonly rebranchEnabled: boolean;
   private readonly llmRpmLimiter: RpmLimiter;
   private readonly agentLlmTimeoutMs: number;
+  private readonly finalizeLlmTimeoutMs: number;
   private readonly plannerTemperature: number;
   private readonly responseTemperature: number;
   private readonly memoryClassifier: MemoryClassifierAgent;
@@ -564,6 +572,8 @@ export class Agent {
     this.llmRpmLimiter = getGlobalRpmLimiter('llm', normalizedLlmRpm);
     const rawAgentLlmTimeoutMs = Number(process.env.AGENT_LLM_TIMEOUT_MS ?? 120000);
     this.agentLlmTimeoutMs = Number.isFinite(rawAgentLlmTimeoutMs) ? Math.max(5000, Math.floor(rawAgentLlmTimeoutMs)) : 120000;
+    const rawFinalizeLlmTimeoutMs = Number(process.env.FINALIZE_LLM_TIMEOUT_MS ?? 240000);
+    this.finalizeLlmTimeoutMs = Number.isFinite(rawFinalizeLlmTimeoutMs) ? Math.max(5000, Math.floor(rawFinalizeLlmTimeoutMs)) : 240000;
     const rawLlmCircuitCooldownMs = Number(process.env.LLM_LIMIT_CIRCUIT_COOLDOWN_MS ?? 120000);
     this.llmLimiterCircuitCooldownMs = Number.isFinite(rawLlmCircuitCooldownMs)
       ? Math.max(1000, Math.floor(rawLlmCircuitCooldownMs))
@@ -708,18 +718,25 @@ export class Agent {
     return `Continue with ${toolCalls.map((toolCall) => toolCall.name).join(', ')}.`;
   }
 
-  private buildPlannerDecisionTools(allowBranching: boolean): Array<ParseableFunctionTool<PlannerInvocation>> {
-    const tools: Array<ParseableFunctionTool<PlannerInvocation>> = TOOLS.map((tool) => {
-      const toolName = tool.function.name as z.infer<typeof PlannerToolNameSchema>;
-      return {
-        name: toolName,
-        description: tool.function.description,
-        parameters: this.buildPlannerWorkToolParameters(tool.function.parameters),
-        parse: (input) => this.parsePlannerWorkToolInvocation(toolName, input),
-      };
-    });
+  private buildPlannerDecisionTools(allowBranching: boolean, toolsMode: 'control' | 'work' | 'all' = 'all'): Array<ParseableFunctionTool<PlannerInvocation>> {
+    const tools: Array<ParseableFunctionTool<PlannerInvocation>> = [];
 
-    tools.push(
+    // Add work tools
+    if (toolsMode === 'work' || toolsMode === 'all') {
+      tools.push(...TOOLS.map((tool) => {
+        const toolName = tool.function.name as z.infer<typeof PlannerToolNameSchema>;
+        return {
+          name: toolName,
+          description: tool.function.description,
+          parameters: this.buildPlannerWorkToolParameters(tool.function.parameters),
+          parse: (input: unknown) => this.parsePlannerWorkToolInvocation(toolName, input),
+        };
+      }));
+    }
+
+    // Add control tools
+    if (toolsMode === 'control' || toolsMode === 'all') {
+      tools.push(
       {
         name: 'planner_final',
         description: 'Finish the run with a direct user-facing answer.',
@@ -788,6 +805,27 @@ export class Agent {
           decision: PlannerSkillsDecisionSchema.parse({ kind: 'skills', ...(input as Record<string, unknown>) }),
         }),
       },
+      {
+        name: 'planner_work',
+        description: 'Indicate that work tools (read/search/edit/bash/web) are needed. The system will then prompt for specific tool calls with a larger token budget.',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            thought: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 400,
+              description: 'Brief description of what work needs to be done.',
+            },
+          },
+          required: ['thought'],
+        },
+        parse: (input) => ({
+          kind: 'control',
+          decision: PlannerWorkDecisionSchema.parse({ kind: 'work', ...(input as Record<string, unknown>) }),
+        }),
+      },
     );
 
     if (allowBranching) {
@@ -822,6 +860,7 @@ export class Agent {
         }),
       });
     }
+    }
 
     return tools;
   }
@@ -833,12 +872,13 @@ export class Agent {
     temperature?: number;
     allowBranching: boolean;
     maxTokens?: number;
+    toolsMode?: 'control' | 'work' | 'all';
   }): Promise<PlannerDecisionResult> {
     const { calls, text, providerMessage } = await this.llmRpmLimiter.run(() => this.withTimeout(
       generateToolCalls({
         model: this.openai,
         messages: options.messages,
-        tools: this.buildPlannerDecisionTools(options.allowBranching),
+        tools: this.buildPlannerDecisionTools(options.allowBranching, options.toolsMode ?? 'all'),
         temperature: options.temperature,
         maxTokens: options.maxTokens ?? 1600,
       }),
@@ -853,7 +893,13 @@ export class Agent {
       .map((call) => call.input.tool_call);
 
     if (controlDecisions.length > 0 && workToolCalls.length > 0) {
-      throw new Error('Planner mixed control tools with direct work tools in one response.');
+      // Auto-fix: prioritize control decisions over work tools
+      console.warn('Warning: LLM mixed control and work tools. Using control decision only.');
+      return {
+        decision: controlDecisions[0],
+        anthropicAssistantContent: providerMessage?.anthropicAssistantContent,
+        openaiAssistantMessage: providerMessage?.openaiAssistantMessage,
+      };
     }
     if (controlDecisions.length > 1) {
       throw new Error('Planner emitted multiple control tools in one response.');
@@ -3240,7 +3286,16 @@ Decide the safer execution discipline for this turn.`,
     // ── Compact planner rules (shared between branching and sequential) ──
     const compactToolGuidance = `Tools: read, search, edit, bash, web (mode=fetch only, requires concrete URL).
 Targets: workspace (files), memory (Mempedia), preferences, skills.
-Never use edit target=workspace to write into raw .mempedia storage. Use semantic targets.`;
+Never use edit target=workspace to write into raw .mempedia storage. Use semantic targets.
+
+LARGE FILES: For files >100 lines or >3KB, use bash with heredoc instead of edit. Example:
+bash command="cat > path/file.html << 'EOF'\\n<content>\\nEOF"
+This avoids JSON truncation issues with large content in tool call arguments.
+
+WORKSPACE: Current working directory is ${this.projectRoot}
+For project files, prefer workspace-relative paths. For temporary files, you may use /tmp or ./tmp/
+
+CURRENT TIME: ${new Date().toISOString()}`;
     const compactSkillGuidance = localSkillsIndex
       ? `Skills: ${localSkillsIndex}\nSkills are policy, not tool names. Pre-loaded always-active skills are binding; do not re-request them.`
       : 'Skills are guidance documents, not tool names. Pre-loaded always-active skills are binding.';
@@ -3284,6 +3339,11 @@ ${compactSkillGuidance}
 
 Control tools: planner_subagent (subagent=plan for initial branching / plan refresh / remediation), planner_final (finish), planner_skills (load skill guidance).
 For work, call read/search/edit/bash/web directly. Never mix control + work tools. Never reply with plain text. Never output <think> tags or reasoning text - always call tools directly.
+
+BRANCHING: When calling planner_subagent with subagent=plan, ALWAYS specify for each branch:
+- group (execution_group): 1=first wave, 2=second wave, etc. Parallel branches use same group.
+- priority: 1-100, higher=more urgent. Use to order branches within same group.
+- depends: array of sibling branch labels this depends on (empty array if no dependencies).
 
 Execute your branch excerpt faithfully. Do not design sibling graphs — that belongs to planner_subagent with subagent=plan.
 Request planner_subagent with subagent=plan when: no canonical plan exists, current plan is wrong, or a local gap needs remediation rebranch.
@@ -3389,6 +3449,7 @@ ${renderPromptList([
     const planSubagentCtxBudget = buildStageBudget(planSubagentPrompt, 0, 0, 3072);
     const synthesisCtxBudget = buildStageBudget(synthesisBasePrompt, 0, 0, 3072);
     const plannerMaxTokens = deriveMaxOutputTokens(planningCtxBudget, 500, 1600, 0.08);
+    const workMaxTokens = deriveMaxOutputTokens(planningCtxBudget, 2000, 32768, 0.2);
     const planSubagentMaxTokens = deriveMaxOutputTokens(planSubagentCtxBudget, 1000, 2600, 0.14);
     const finalizeMaxTokens = deriveMaxOutputTokens(finalizeCtxBudget, 500, 1400, 0.1);
     const synthesisMaxTokens = deriveMaxOutputTokens(synthesisCtxBudget, 700, 1800, 0.12);
@@ -4194,37 +4255,42 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
 
     const finalizeFromBranch = async (branch: BranchState, reason: string, fallbackAnswer?: string): Promise<string> => {
       emitBranchTrace('thought', branch, `Forcing finalization for ${branch.id}: ${reason}`);
-      const activeCircuitReason = getActiveLlmCircuitReason();
-      if (activeCircuitReason) {
-        emitBranchTrace(
-          'observation',
-          branch,
-          `Skipping branch finalization model call because the LLM queue is in degraded mode: ${activeCircuitReason}`,
-        );
-        return this.sanitizeUserFacingAnswer(fallbackAnswer || '', buildSafeBranchDisplayFallback(branch))
-          || buildSafeBranchDisplayFallback(branch);
-      }
-      const compressedTranscript = compressBranchTranscript(branch.transcript, { tailKeep: 6, maxSummaryChars: 2000 });
-      const { text: _finalizeText } = await this.measure(perfEntries, `finalize_${branch.id}`, async () => {
-        return this.llmRpmLimiter.run(() => this.withTimeout(
-          generateText({
-            model: this.openai,
-            temperature: this.responseTemperature,
-            maxTokens: finalizeMaxTokens,
-            messages: ([
-              { role: 'system', content: `${systemPrompt}\nYou must now finish. Do not branch. Do not call tools. ${plainTextOnlyRule}` },
-              ...recentConversationMessages,
-              ...compressedTranscript,
-              { role: 'user', content: `Finalize branch ${branch.id}. User request:\n${input}\n\nReason: ${reason}` },
-            ] as any),
-          }),
-          this.agentLlmTimeoutMs,
-          `finalize_${branch.id} llm`
-        ));
-      });
       const fallback = buildSafeBranchDisplayFallback(branch);
-      return this.sanitizeUserFacingAnswer(extractText(_finalizeText).trim(), fallback)
-        || fallback;
+
+      try {
+        const activeCircuitReason = getActiveLlmCircuitReason();
+        if (activeCircuitReason) {
+          emitBranchTrace(
+            'observation',
+            branch,
+            `Skipping branch finalization model call because the LLM queue is in degraded mode: ${activeCircuitReason}`,
+          );
+          return this.sanitizeUserFacingAnswer(fallbackAnswer || '', fallback) || fallback;
+        }
+
+        const compressedTranscript = compressBranchTranscript(branch.transcript, { tailKeep: 6, maxSummaryChars: 2000 });
+        const { text: _finalizeText } = await this.measure(perfEntries, `finalize_${branch.id}`, async () => {
+          return this.llmRpmLimiter.run(() => this.withTimeout(
+            generateText({
+              model: this.openai,
+              temperature: this.responseTemperature,
+              maxTokens: finalizeMaxTokens,
+              messages: ([
+                { role: 'system', content: `${systemPrompt}\nYou must now finish. Do not branch. Do not call tools. ${plainTextOnlyRule}` },
+                ...recentConversationMessages,
+                ...compressedTranscript,
+                { role: 'user', content: `Finalize branch ${branch.id}. User request:\n${input}\n\nReason: ${reason}` },
+              ] as any),
+            }),
+            this.finalizeLlmTimeoutMs,
+            `finalize_${branch.id} llm`
+          ));
+        });
+        return this.sanitizeUserFacingAnswer(extractText(_finalizeText).trim(), fallback) || fallback;
+      } catch (error) {
+        emitBranchTrace('error', branch, `Finalization failed: ${error instanceof Error ? error.message : String(error)}`);
+        return fallback;
+      }
     };
 
     const buildDeterministicSynthesisFallback = (branches: BranchState[]): string => {
@@ -4292,7 +4358,7 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
     const extractPriorResultSnippet = (branch: BranchState): string =>
       this.clipText(
         this.sanitizeUserFacingAnswer(branch.finalAnswer || '', branch.completionSummary || '') || '(none)',
-        260,
+        800,
       );
 
     const hasNegativeSynthesisSignal = (branch: BranchState): boolean => {
@@ -4575,7 +4641,7 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
         retryOfBranchId: branch.id,
         priorAttemptIds: priorAttempts,
         disposition: record.disposition,
-        priorIssue: this.clipText(branch.outcomeReason || branch.completionSummary || 'unknown reason', 180),
+        priorIssue: this.clipText(branch.outcomeReason || branch.completionSummary || 'unknown reason', 600),
         priorResultSnippet: extractPriorResultSnippet(branch),
         knownGoodFacts: extractKnownGoodFacts(branch),
         missingFields: extractMissingFields(branch),
@@ -4813,13 +4879,15 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
                   timeoutLabel: `planBranch_${branch.id} llm`,
                   temperature: this.plannerTemperature,
                   allowBranching: false,
-                  maxTokens: plannerMaxTokens,
+                  maxTokens: workMaxTokens,
+                  toolsMode: 'all',
                 })
               );
             }
           );
           applyPlannerResultToBranch(branch as BranchState, plannerResult);
           const decision = plannerResult.decision;
+
           if (decision.kind === 'tool') {
             // In classic react, limit to one tool call at a time
             const toolCalls = decision.tool_calls.slice(0, 1);
@@ -4842,12 +4910,21 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
             });
             return { kind: 'tool' as const, thought: 'Subagent not available', toolCalls: [] };
           }
+          if (decision.kind === 'final') {
+            return {
+              kind: 'final' as const,
+              content: decision.answer,
+              outcome: decision.status === 'success' ? 'success' : decision.status === 'partial' ? 'partial' : 'failed',
+              outcomeReason: decision.reason,
+              disposition: decision.status === 'blocked' ? 'blocked_external' : decision.status === 'failed' ? 'planner_error' : 'resolved',
+            };
+          }
+          // Unexpected decision type
           return {
             kind: 'final' as const,
-            content: decision.answer,
-            outcome: decision.status === 'success' ? 'success' : decision.status === 'partial' ? 'partial' : 'failed',
-            outcomeReason: decision.reason,
-            disposition: decision.status === 'blocked' ? 'blocked_external' : decision.status === 'failed' ? 'planner_error' : 'resolved',
+            content: `Unexpected decision type in classic ReAct: ${(decision as any).kind}`,
+            outcome: 'failed' as const,
+            disposition: 'planner_error' as const,
           };
         },
         buildToolTranscript: ({ branch, observations }) => buildProviderToolTranscript(branch as BranchState, observations),
@@ -4907,13 +4984,15 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
                 timeoutLabel: `planBranch_${branch.id} llm`,
                 temperature: this.plannerTemperature,
                 allowBranching: true,
-                maxTokens: plannerMaxTokens,
+                maxTokens: workMaxTokens,
+                toolsMode: 'all',
               })
             );
           }
         );
         applyPlannerResultToBranch(branch as BranchState, plannerResult);
         const decision = plannerResult.decision;
+
         if (decision.kind === 'tool') {
           return { kind: 'tool' as const, thought: decision.thought, toolCalls: decision.tool_calls };
         }
@@ -4927,12 +5006,21 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
             branches: normalizePlannerBranches(decision.branches),
           };
         }
+        if (decision.kind === 'final') {
+          return {
+            kind: 'final' as const,
+            content: decision.answer,
+            outcome: decision.status === 'success' ? 'success' : decision.status === 'partial' ? 'partial' : 'failed',
+            outcomeReason: decision.reason,
+            disposition: decision.status === 'blocked' ? 'blocked_external' : decision.status === 'failed' ? 'planner_error' : 'resolved',
+          };
+        }
+        // Unexpected decision type
         return {
           kind: 'final' as const,
-          content: decision.answer,
-          outcome: decision.status === 'success' ? 'success' : decision.status === 'partial' ? 'partial' : 'failed',
-          outcomeReason: decision.reason,
-          disposition: decision.status === 'blocked' ? 'blocked_external' : decision.status === 'failed' ? 'planner_error' : 'resolved',
+          content: `Unexpected decision type: ${(decision as any).kind}`,
+          outcome: 'failed' as const,
+          disposition: 'planner_error' as const,
         };
       },
       buildToolTranscript: ({ branch, observations }) => buildProviderToolTranscript(branch as BranchState, observations),

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { ChatMessage, ParseableFunctionTool } from '../llm.js';
+import { fixUnterminatedStrings, fixArrayFormatting } from '../llm.js';
 import type {
   PlanSubagentInvocation,
   SubagentHandler,
@@ -32,7 +33,7 @@ const PlanBranchSchema = z.object({
 const PlanBranchAlignmentSchema = z.object({
   label: z.string().trim().min(1).max(80),
   plan_excerpt: z.string().trim().min(1).max(4000),
-  alignment_checks: z.array(z.string().trim().min(1).max(240)).max(6).optional(),
+  alignment_checks: z.array(z.string().trim().min(1).max(240)).max(12).optional(),
 });
 
 const PlanSubagentDecisionSchema = z.object({
@@ -132,7 +133,7 @@ export const planSubagentHandler: SubagentHandler<PlanSubagentInvocation> = {
                   type: 'array',
                   items: { type: 'string', minLength: 1, maxLength: 240 },
                   minItems: 1,
-                  maxItems: 6,
+                  maxItems: 12,
                 },
               },
               required: ['label', 'plan_excerpt'],
@@ -150,7 +151,9 @@ export const planSubagentHandler: SubagentHandler<PlanSubagentInvocation> = {
         // instead of a real array.  Coerce it so Zod validation doesn't throw.
         if (typeof record['branch_alignments'] === 'string') {
           try {
-            record['branch_alignments'] = JSON.parse(record['branch_alignments'] as string);
+            let fixed = fixUnterminatedStrings(record['branch_alignments'] as string);
+            fixed = fixArrayFormatting(fixed);
+            record['branch_alignments'] = JSON.parse(fixed);
           } catch (e) {
             logError(ctx.projectRoot, e, 'plan_subagent_parse_branch_alignments');
             console.warn('Failed to parse branch_alignments JSON, will auto-generate');
@@ -159,7 +162,9 @@ export const planSubagentHandler: SubagentHandler<PlanSubagentInvocation> = {
         }
         if (typeof record['branches'] === 'string') {
           try {
-            record['branches'] = JSON.parse(record['branches'] as string);
+            let fixed = fixUnterminatedStrings(record['branches'] as string);
+            fixed = fixArrayFormatting(fixed);
+            record['branches'] = JSON.parse(fixed);
           } catch {
             logError(ctx.projectRoot, new Error('Failed to parse branches JSON'), 'plan_subagent_parse_branches');
             record['branches'] = [];

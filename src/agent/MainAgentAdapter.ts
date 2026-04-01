@@ -8,6 +8,7 @@ import {
   loadWorkspaceSkills,
   type SkillRecord,
 } from '../skills/router.js';
+import { logError } from '../utils/errorLogger.js';
 
 type MainAgentToolName = 'read' | 'search' | 'edit' | 'bash' | 'web';
 
@@ -238,7 +239,9 @@ export class MainAgentAdapter {
   private async executeBash(args: Record<string, unknown>): Promise<string> {
     const command = typeof args.command === 'string' ? args.command.trim() : '';
     if (!command) {
-      return 'Error: bash requires a non-empty command parameter';
+      const error = new Error(`bash command is empty. Received args: ${JSON.stringify(args)}`);
+      logError(this.projectRoot, error, 'bash_empty_command');
+      return `Error: bash requires a non-empty command parameter. Received: ${JSON.stringify(args)}`;
     }
     const toolRes = await this.runtimeHandle.executeTool('run_shell', { command });
     if (!toolRes.success) {
@@ -336,6 +339,30 @@ export class MainAgentAdapter {
       }
       const limit = Math.min(Math.max(1, Number(args.limit || 10)), 20);
 
+      // Try Brave Search first if API key is configured
+      const braveApiKey = process.env.BRAVE_API_KEY;
+      if (braveApiKey) {
+        try {
+          const braveUrl = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${limit}`;
+          const braveResponse = await fetch(braveUrl, {
+            headers: { 'X-Subscription-Token': braveApiKey, Accept: 'application/json' },
+            signal: AbortSignal.timeout(safeWebTimeout),
+          });
+          if (braveResponse.ok) {
+            const braveData = await braveResponse.json();
+            const results = (braveData.web?.results || []).slice(0, limit).map((r: any) => ({
+              title: r.title,
+              url: r.url,
+              snippet: r.description,
+            }));
+            return JSON.stringify({ kind: 'search_results', query, count: results.length, results, source: 'brave' });
+          }
+        } catch (err) {
+          // Fall through to DuckDuckGo
+        }
+      }
+
+      // Fallback to DuckDuckGo
       try {
         const searchResults = await duckDuckGoSearch(query, { safeSearch: 0 });
         const results = searchResults.results.slice(0, limit).map((result) => ({
@@ -349,6 +376,7 @@ export class MainAgentAdapter {
           query,
           count: results.length,
           results,
+          source: 'duckduckgo',
         });
       } catch (err: any) {
         return JSON.stringify({
@@ -359,7 +387,7 @@ export class MainAgentAdapter {
     }
     return JSON.stringify({
       kind: 'error',
-      message: 'web only supports mode=fetch.',
+      message: 'web only supports mode=fetch or mode=search.',
     });
   }
 
