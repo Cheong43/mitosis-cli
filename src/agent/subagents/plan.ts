@@ -210,12 +210,15 @@ export const planSubagentHandler: SubagentHandler<PlanSubagentInvocation> = {
 
     // Build task state object - structured, not prose
     const buildTaskState = (): string => {
-      const maxPlanTokens = 1500;
-      const planText = ctx.trimTextToTokenBudget(
-        ctx.canonicalPlanState.canonicalPlanText || 'none',
-        maxPlanTokens,
-        maxPlanTokens * 4
-      );
+      // Prefer the plan text passed explicitly through the tool call (bounded to 2000 chars)
+      // to avoid large canonical plan state inflating the subagent context.
+      const planText = invocation.plan
+        ? ctx.clipText(invocation.plan, 2000)
+        : ctx.trimTextToTokenBudget(
+            ctx.canonicalPlanState.canonicalPlanText || 'none',
+            1500,
+            1500 * 4,
+          );
 
       return JSON.stringify({
         user_goal: ctx.clipText(ctx.originalUserRequest || ctx.input, 400),
