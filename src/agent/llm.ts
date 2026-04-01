@@ -137,6 +137,8 @@ interface GenerateToolCallsOptions<TParsed> {
   tools: Array<ParseableFunctionTool<TParsed>>;
   temperature?: number;
   maxTokens?: number;
+  parallelToolCalls?: boolean;
+  toolChoice?: 'required' | 'auto' | { type: 'tool'; toolName: string };
 }
 
 interface JsonFallbackParseResult<TParsed> {
@@ -394,13 +396,24 @@ function shouldRetryToolCallsWithJsonFallback(error: unknown): boolean {
 function buildJsonFallbackPrompt<TParsed>(
   tools: Array<ParseableFunctionTool<TParsed>>,
   priorReplyPreview: string,
+  priorErrors?: Array<{ path: string; message: string }>,
 ): string {
   const toolSchemas = tools
     .map((entry) => `- ${entry.name}: ${JSON.stringify(entry.parameters)}`)
     .join('\n');
 
+  const errorSection = priorErrors && priorErrors.length > 0
+    ? [
+        '',
+        'Previous attempt had validation errors:',
+        ...priorErrors.map(e => `  • ${e.path}: ${e.message}`),
+        'Fix these specific issues.',
+      ].join('\n')
+    : '';
+
   return [
     'Your previous reply was invalid because it did not produce usable native tool calls.',
+    errorSection,
     'Reply again with exactly one JSON object and nothing else. No markdown fences. No prose before or after the JSON. Do not output raw shell commands or code unless they are escaped inside a JSON string value.',
     priorReplyPreview ? `Previous reply preview: ${priorReplyPreview}` : '',
     'Use this JSON object schema:',
@@ -432,8 +445,9 @@ function buildJsonFallbackMessages<TParsed>(
   messages: ChatMessage[],
   tools: Array<ParseableFunctionTool<TParsed>>,
   priorReplyPreview: string,
+  priorErrors?: Array<{ path: string; message: string }>,
 ): ChatMessage[] {
-  const fallbackPrompt = buildJsonFallbackPrompt(tools, priorReplyPreview);
+  const fallbackPrompt = buildJsonFallbackPrompt(tools, priorReplyPreview, priorErrors);
   const fallbackSystem = buildJsonFallbackModeInstruction();
   let injectedSystem = false;
   const nextMessages = messages.map((message) => {
@@ -609,12 +623,118 @@ function addJsonOnlyInstruction(messages: ChatMessage[]): ChatMessage[] {
   return nextMessages;
 }
 
-function buildOpenAICompatibleFetch(cfg: LLMEndpointConfig): typeof globalThis.fetch | undefined {
-  const upstreamFetch = cfg.fetch ?? fetch;
+/**
+ * Wraps a fetch function so that SSE (text/event-stream) responses to
+ * non-streaming requests are transparently assembled into a single JSON
+ * chat-completion object. This handles API gateways that always stream
+ * regardless of the `stream` field in the request body.
+ */
+function wrapFetchSseToJson(upstreamFetch: typeof globalThis.fetch): typeof globalThis.fetch {
+  return async (input, init) => {
+    const response = await upstreamFetch(input, init);
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('text/event-stream')) {
+      return response;
+    }
+
+    // Determine whether the original request asked for streaming.
+    let requestedStream = false;
+    try {
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+      requestedStream = body.stream === true;
+    } catch {
+      // ignore parse errors
+    }
+    // If the caller explicitly requested streaming, pass through as-is.
+    if (requestedStream) {
+      return response;
+    }
+
+    // Assemble SSE chunks into a single JSON response.
+    const text = await response.text();
+    let id = '';
+    let model = '';
+    let content = '';
+    let finishReason = 'stop';
+    const toolCallsMap = new Map<number, { id: string; name: string; arguments: string }>();
+
+    for (const line of text.split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (data === '[DONE]') break;
+      let chunk: Record<string, unknown>;
+      try {
+        chunk = JSON.parse(data) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (!id && typeof chunk.id === 'string') id = chunk.id;
+      if (!model && typeof chunk.model === 'string') model = chunk.model;
+      const choices = Array.isArray(chunk.choices) ? chunk.choices as Array<Record<string, unknown>> : [];
+      const choice = choices[0];
+      if (!choice) continue;
+      if (typeof choice.finish_reason === 'string' && choice.finish_reason) {
+        finishReason = choice.finish_reason;
+      }
+      const delta = choice.delta as Record<string, unknown> | undefined;
+      if (!delta) continue;
+      if (typeof delta.content === 'string') content += delta.content;
+      if (Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls as Array<Record<string, unknown>>) {
+          const idx = typeof tc.index === 'number' ? tc.index : 0;
+          if (!toolCallsMap.has(idx)) {
+            toolCallsMap.set(idx, { id: '', name: '', arguments: '' });
+          }
+          const entry = toolCallsMap.get(idx)!;
+          if (typeof tc.id === 'string') entry.id += tc.id;
+          const fn = tc.function as Record<string, unknown> | undefined;
+          if (fn) {
+            if (typeof fn.name === 'string') entry.name += fn.name;
+            if (typeof fn.arguments === 'string') entry.arguments += fn.arguments;
+          }
+        }
+      }
+    }
+
+    const toolCalls = toolCallsMap.size > 0
+      ? Array.from(toolCallsMap.entries())
+          .sort(([a], [b]) => a - b)
+          .map(([, tc]) => ({
+            id: tc.id,
+            type: 'function',
+            function: { name: tc.name, arguments: tc.arguments },
+          }))
+      : undefined;
+
+    const assembled = {
+      id,
+      object: 'chat.completion',
+      model,
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: content || null,
+          ...(toolCalls ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: finishReason,
+      }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    };
+
+    return new Response(JSON.stringify(assembled), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+}
+
+function buildOpenAICompatibleFetch(cfg: LLMEndpointConfig): typeof globalThis.fetch {
+  let upstreamFetch: typeof globalThis.fetch = cfg.fetch ?? fetch;
   if (cfg.hmacAccessKey && cfg.hmacSecretKey) {
-    return buildHmacFetch(cfg.hmacAccessKey, cfg.hmacSecretKey, upstreamFetch);
+    upstreamFetch = buildHmacFetch(cfg.hmacAccessKey, cfg.hmacSecretKey, upstreamFetch);
   }
-  return cfg.fetch;
+  return wrapFetchSseToJson(upstreamFetch);
 }
 
 function buildOpenAICompatibleHeaders(cfg: LLMEndpointConfig): Record<string, string> | undefined {
@@ -911,10 +1031,11 @@ async function generateToolCallsJsonFallback<TParsed>(
   options: GenerateToolCallsOptions<TParsed>,
   toolMap: Map<string, ParseableFunctionTool<TParsed>>,
   priorReplyPreview: string,
+  priorErrors?: Array<{ path: string; message: string }>,
 ): Promise<JsonFallbackParseResult<TParsed>> {
   const { text } = await generateText({
     model: options.model,
-    messages: buildJsonFallbackMessages(options.messages, options.tools, priorReplyPreview),
+    messages: buildJsonFallbackMessages(options.messages, options.tools, priorReplyPreview, priorErrors),
     temperature: options.temperature,
     maxTokens: options.maxTokens,
     providerOptions: {
@@ -928,20 +1049,23 @@ async function generateToolCallsJsonFallback<TParsed>(
 }
 
 export function buildLanguageModel(cfg: LLMEndpointConfig, chatSettings?: OpenAIChatSettings): LanguageModelV1 {
+  // Default to true: opt-out with structuredOutputs: false
+  const supportsStructuredOutputs = chatSettings?.structuredOutputs !== false;
+
   const provider = createOpenAICompatible({
     name: OPENAI_COMPAT_PROVIDER_NAME,
     apiKey: cfg.apiKey,
     baseURL: cfg.baseURL || 'https://api.openai.com/v1',
     headers: buildOpenAICompatibleHeaders(cfg),
     fetch: buildOpenAICompatibleFetch(cfg),
-    supportsStructuredOutputs: Boolean(chatSettings?.structuredOutputs),
+    supportsStructuredOutputs,
   });
 
   return {
     provider: 'openai',
     instance: provider.chatModel(cfg.model),
     model: cfg.model,
-    supportsStructuredOutputs: Boolean(chatSettings?.structuredOutputs),
+    supportsStructuredOutputs,
   };
 }
 
@@ -959,6 +1083,28 @@ export function buildAnthropicLanguageModel(cfg: AnthropicEndpointConfig): Langu
     model: cfg.model,
     supportsStructuredOutputs: false,
   };
+}
+
+export function detectProviderCapabilities(model: string, baseURL?: string): {
+  supportsStructuredOutputs: boolean;
+  supportsParallelTools: boolean;
+  requiresConstrainedDecoding: boolean;
+} {
+  const normalized = model.toLowerCase();
+
+  if (normalized.includes('gpt-4') || normalized.includes('gpt-3.5') || normalized.includes('o1') || normalized.includes('o3')) {
+    return { supportsStructuredOutputs: true, supportsParallelTools: true, requiresConstrainedDecoding: false };
+  }
+
+  if (normalized.includes('claude')) {
+    return { supportsStructuredOutputs: false, supportsParallelTools: false, requiresConstrainedDecoding: true };
+  }
+
+  if (normalized.includes('gemini')) {
+    return { supportsStructuredOutputs: false, supportsParallelTools: true, requiresConstrainedDecoding: true };
+  }
+
+  return { supportsStructuredOutputs: false, supportsParallelTools: false, requiresConstrainedDecoding: true };
 }
 
 export async function generateText(options: GenerateTextOptions): Promise<{ text: string }> {
@@ -1027,14 +1173,17 @@ export async function generateToolCalls<TParsed>(
     model: options.model.instance,
     messages: normalizeMessages(options.messages),
     tools: sdkTools,
-    toolChoice: 'required',
+    toolChoice: options.toolChoice || 'required',
     ...(typeof options.temperature === 'number' ? { temperature: options.temperature } : {}),
     ...(typeof options.maxTokens === 'number' ? { maxOutputTokens: options.maxTokens } : {}),
     ...(options.model.provider === 'openai'
       ? {
         providerOptions: buildOpenAIProviderOptions(
           options.model,
-          shouldUseMiniMaxReasoningSplit(options.model) ? { reasoning_split: true } : undefined,
+          {
+            ...(shouldUseMiniMaxReasoningSplit(options.model) ? { reasoning_split: true } : undefined),
+            parallel_tool_calls: options.parallelToolCalls ?? false,
+          },
         ),
       }
       : {}),
@@ -1067,8 +1216,13 @@ export async function generateToolCalls<TParsed>(
     return generateToolCallsJsonFallback(options, toolMap, clipPreview(text));
   }
 
+  // Enforce single tool call when parallel is disabled
+  const effectiveToolCalls = (options.parallelToolCalls ?? false)
+    ? result.toolCalls
+    : result.toolCalls.slice(0, 1);
+
   return {
-    calls: result.toolCalls.map((call) => {
+    calls: effectiveToolCalls.map((call) => {
       const entry = toolMap.get(call.toolName);
       if (!entry) {
         throw new NoToolCallGeneratedError(`Unknown tool call generated: ${call.toolName}`);

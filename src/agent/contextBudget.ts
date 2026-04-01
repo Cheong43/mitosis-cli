@@ -199,7 +199,7 @@ interface TranscriptMessage {
   content: any;
 }
 
-function extractTranscriptContentText(content: any): string {
+export function extractTranscriptContentText(content: any): string {
   if (typeof content === 'string') {
     return content;
   }
@@ -587,16 +587,20 @@ export function checkContextAndCompress(
   modelLimit: number,
   committedTokens: number,
   options: {
-    /** Usage ratio at which compression kicks in. Default 0.92 */
+    /** Usage ratio at which compression kicks in. Default 0.85 */
     compressThreshold?: number;
-    /** Target usage ratio after compression. Default 0.75 */
+    /** Target usage ratio after compression. Default 0.65 */
     targetRatio?: number;
     /** Recent messages to always keep verbatim. Default 6 */
     recentKeep?: number;
+    /** Enable earlier, more aggressive compression. Default false */
+    aggressiveMode?: boolean;
   } = {},
 ): ContextCheckResult {
-  const compressThreshold = options.compressThreshold ?? 0.92;
-  const targetRatio = options.targetRatio ?? 0.75;
+  const compressThreshold = options.aggressiveMode
+    ? 0.75
+    : (options.compressThreshold ?? 0.85);
+  const targetRatio = options.targetRatio ?? 0.65;
   const recentKeep = options.recentKeep ?? 6;
 
   const transcriptTokens = estimateTranscriptTokens(transcript);

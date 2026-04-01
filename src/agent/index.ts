@@ -56,6 +56,7 @@ import {
   getCompressionLevel,
   type ContextBudgetResult,
 } from './contextBudget.js';
+import { CompressionEngine } from './compressionEngine.js';
 import { SessionCompressor, isRunExhausted } from './sessionCompressor.js';
 import { PlannerToolAdapter } from './PlannerToolAdapter.js';
 import { RpmLimiter, getGlobalRpmLimiter } from '../utils/RpmLimiter.js';
@@ -619,7 +620,8 @@ export class Agent {
     if (/api\.minimaxi\.com/i.test(normalized) && /\/anthropic\/?$/i.test(normalized)) {
       return normalized.replace(/\/anthropic\/?$/i, '/v1');
     }
-    return undefined;
+    // Accept any non-empty URL as-is (strip trailing slashes)
+    return normalized.replace(/\/+$/g, '');
   }
 
   onBackgroundTask(callback: (task: string, status: 'started' | 'completed') => void) {
@@ -3394,7 +3396,9 @@ ${renderPromptList([
   'Reconcile user goal + current plan + branch status into coherent canonical_plan',
   'Compress aggressively: remove prose, deduplicate, stay under 4000 tokens',
   'Design only necessary branches for current scope',
-  'Use execution_group for waves, depends_on for prerequisites',
+  'Use execution_group for parallel waves; branches in the same group run concurrently',
+  'Set depends_on for every branch that needs results from another branch (e.g. a build/synthesis branch that depends on research branches MUST list those branch labels in depends_on)',
+  'A branch with depends_on will not start until all listed branches complete — omitting depends_on means it runs immediately in parallel',
   'Each branch needs alignment excerpt stating its responsibility',
   'Prefer one branch over many when scope is sequential',
 ], true)}`,
@@ -4387,8 +4391,18 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
     };
 
     const inferBranchDisposition = (branch: BranchState): BranchDisposition => {
-      if (branch.disposition && branch.disposition !== 'unknown') {
-        return branch.disposition;
+      // Never report 'resolved' when outcome explicitly indicates incomplete work.
+      // A stored disposition of 'resolved' combined with outcome 'partial'/'failed'
+      // means the disposition was set incorrectly (e.g. planner timeout mapped to
+      // 'resolved' before this guard existed). Fall through to signal-based inference.
+      const storedDisposition = branch.disposition;
+      if (storedDisposition && storedDisposition !== 'unknown' && storedDisposition !== 'resolved') {
+        return storedDisposition;
+      }
+      if (storedDisposition === 'resolved' && branch.outcome !== 'success' && branch.outcome !== undefined) {
+        // Outcome says it's not fully done — re-infer from signals rather than trusting the stored value.
+      } else if (storedDisposition && storedDisposition !== 'unknown') {
+        return storedDisposition;
       }
       if (isSuccessfulSynthesisBranch(branch)) {
         return 'resolved';
@@ -4835,6 +4849,25 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
     let completedBranchesForRun: Array<BranchSynthesisInput['branches'][number]> = [];
     let finalAnswer: string;
 
+    // Build a shared CompressionEngine for this agent run.
+    // The fourth-level autocompact uses a lightweight generateText call.
+    const runCompressionEngine = new CompressionEngine({
+      generateSummary: async (text: string, maxTokens: number): Promise<string> => {
+        const { text: summary } = await generateText({
+          model: this.openai,
+          messages: [
+            {
+              role: 'user',
+              content: `Summarize the following conversation history into a compact, action-focused summary of no more than ${maxTokens} tokens. Capture: completed work, key findings, current state, and open questions.\n\n${text}`,
+            },
+          ],
+          maxTokens,
+          temperature: 0.1,
+        });
+        return typeof summary === 'string' ? summary : String(summary || '');
+      },
+    });
+
     if (agentMode === 'react') {
       // ── Classic ReAct mode (sequential: think → act → observe → …) ────
       emitTrace({ type: 'thought', content: 'Using classic ReAct mode (sequential, no branching).' });
@@ -4916,7 +4949,7 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
               content: decision.answer,
               outcome: decision.status === 'success' ? 'success' : decision.status === 'partial' ? 'partial' : 'failed',
               outcomeReason: decision.reason,
-              disposition: decision.status === 'blocked' ? 'blocked_external' : decision.status === 'failed' ? 'planner_error' : 'resolved',
+              disposition: decision.status === 'blocked' ? 'blocked_external' : decision.status === 'failed' ? 'planner_error' : decision.status === 'partial' ? 'missing_evidence' : 'resolved',
             };
           }
           // Unexpected decision type
@@ -4941,6 +4974,7 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
           if (event.type === 'final') return;
           emitTrace({ type: event.type, content: event.content, metadata: event.metadata });
         },
+        compressionEngine: runCompressionEngine,
         workspaceManager: this.workspaceManager,
       });
       finalAnswer = await runtime.run(`Original user request:\n${input}\n\nThink step by step. Use one tool at a time, observe the result, then decide the next action.`);
@@ -5012,7 +5046,7 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
             content: decision.answer,
             outcome: decision.status === 'success' ? 'success' : decision.status === 'partial' ? 'partial' : 'failed',
             outcomeReason: decision.reason,
-            disposition: decision.status === 'blocked' ? 'blocked_external' : decision.status === 'failed' ? 'planner_error' : 'resolved',
+            disposition: decision.status === 'blocked' ? 'blocked_external' : decision.status === 'failed' ? 'planner_error' : decision.status === 'partial' ? 'missing_evidence' : 'resolved',
           };
         }
         // Unexpected decision type
@@ -5075,6 +5109,7 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
           metadata: event.metadata,
         });
       },
+      compressionEngine: runCompressionEngine,
       workspaceManager: this.workspaceManager,
     });
     finalAnswer = await runtime.run(`Original user request:\n${input}\n\nStart with the root loop. Use the current canonical plan if one already exists. If the task needs initial branching or a major plan refresh, call planner_subagent with subagent=plan and a concrete proposed plan instead of inventing a sibling graph locally. Otherwise continue with local branch execution. Call planner_final when you are ready to answer.`);

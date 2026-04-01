@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>昆虫学 | Entomology</title>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&family=Playfair+Display:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #1a1a2e;
+            --secondary: #16213e;
+            --accent: #e94560;
+            --gold: #d4af37;
+            --cream: #f5f5dc;
+        }
+
+        body {
+            font-family: 'Noto Serif SC', serif;
+            background: var(--primary);
+            color: var(--cream);
+            overflow-x: hidden;
+        }
+
+        /* Hero Section */
+        .hero {
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 50%, #0f3460 100%);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='0.5' fill='%23d4af37' opacity='0.3'/%3E%3C/svg%3E");
+            background-size: 50px 50px;
+            animation: sparkle 20s linear infinite;
+        }
+
+        @keyframes sparkle {
+            0% { transform: translateY(0); }
+            100% { transform: translateY(-50px); }
+        }
+
+        .hero-content {
+            text-align: center;
+            z-index: 1;
+            padding: 2rem;
+        }
+
+        .hero h1 {
+            font-family: 'Playfair Display', serif;
+            font-size: 5rem;
+            letter-spacing: 1rem;
+            margin-bottom: 1rem;
+            background: linear-gradient(45deg, var(--gold), var(--cream), var(--gold));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: shimmer 3s ease-in-out infinite;
+        }
+
+        @keyframes shimmer {
+            0%, 100% { filter: brightness(1); }
+            50% { filter: brightness(1.3); }
+        }
+
+        .hero p {
+            font-size: 1.5rem;
+            letter-spacing: 0.5rem;
+            color: rgba(245, 245, 220, 0.7);
+            margin-bottom: 2rem;
+        }
+
+        .hero-divider {
+            width: 200px;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, var(--gold), transparent);
+            margin: 2rem auto;
+        }
+
+        .motto {
+            font-style: italic;
+            font-size: 1.2rem;
+            color: rgba(245, 245, 220, 0.6);
+        }
+
+        /* Floating insects */
+        .floating-insect {
+            position: absolute;
+            font-size: 2rem;
+            opacity: 0.15;
+            animation: float 15s ease-in-out infinite;
+        }
+
+        .insect-1 { top: 20%; left: 10%; animation-delay: 0s; }
+        .insect-2 { top: 60%; right: 15%; animation-delay: -5s; }
+        .insect-3 { bottom: 25%; left: 20%; animation-delay: -10s; }
+
+        @keyframes float {
+            0%, 100% { transform: translate(0, 0) rotate(0deg); }
+            25% { transform: translate(20px, -30px) rotate(10deg); }
+            50% { transform: translate(-10px, -50px) rotate(-5deg); }
+            75% { transform: translate(30px, -20px) rotate(5deg); }
+        }
+
+        /* Navigation */
+        nav {
+            position: fixed;
+            top: 0;
+            width: 100%;
+            padding: 1.5rem 3rem;
+            background: rgba(26, 26, 46, 0.95);
+            backdrop-filter: blur(10px);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 1000;
+            border-bottom: 1px solid rgba(212, 175, 55, 0.2);
+        }
+
+        .nav-logo {
+            font-family: 'Playfair Display', serif;
+            font-size: 1.5rem;
+            color: var(--gold);
+            letter-spacing: 0.3rem;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 3rem;
+        }
+
+        .nav-links a {
+            color: var(--cream);
+            text-decoration: none;
+            font-size: 0.9rem;
+            letter-spacing: 0.2rem;
+            transition: color 0.3s;
+            position: relative;
+        }
+
+        .nav-links a::after {
+            content: '';
+            position: absolute;
+            bottom: -5px;
+            left: 0;
+            width: 0;
+            height: 1px;
+            background: var(--gold);
+            transition: width 0.3s;
+        }
+
+        .nav-links a:hover::after {
+            width: 100%;
+        }
+
+        .nav-links a:hover {
+            color: var(--gold);
+        }
+
+        /* Sections */
+        section {
+            padding: 8rem 2rem;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .section-title {
+            text-align: center;
+            margin-bottom: 5rem;
+        }
+
+        .section-title h2 {
+            font-family: 'Playfair Display', serif;
+            font-size: 3rem;
+            color: var(--gold);
+            margin-bottom: 1rem;
+        }
+
+        .section-title .underline {
+            width: 100px;
+            height: 2px;
+            background: var(--accent);
+            margin: 0 auto;
+        }
+
+        /* Introduction */
+        .intro {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4rem;
+            align-items: center;
+        }
+
+        .intro-text p {
+            font-size: 1.1rem;
+            line-height: 2;
+            margin-bottom: 1.5rem;
+            color: rgba(245, 245, 220, 0.85);
+        }
+
+        .intro-image {
+            position: relative;
+            height: 500px;
+            background: linear-gradient(135deg, var(--secondary), var(--primary));
+            border: 1px solid rgba(212, 175, 55, 0.3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .intro-image::before {
+            content: '🦋';
+            font-size: 15rem;
+            opacity: 0.2;
+            animation: wingBeat 2s ease-in-out infinite;
+        }
+
+        @keyframes wingBeat {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+
+        /* Orders Grid */
+        .orders-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+        }
+
+        .order-card {
+            background: linear-gradient(145deg, rgba(22, 33, 62, 0.8), rgba(26, 26, 46, 0.9));
+            border: 1px solid rgba(212, 175, 55, 0.2);
+            padding: 2.5rem;
+            transition: all 0.5s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .order-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 3px;
+            background: linear-gradient(90deg, var(--accent), var(--gold));
+            transform: scaleX(0);
+            transition: transform 0.5s;
+        }
+
+        .order-card:hover::before {
+            transform: scaleX(1);
+        }
+
+        .order-card:hover {
+            transform: translateY(-10px);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+            border-color: var(--gold);
+        }
+
+        .order-icon {
+            font-size: 3rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .order-card h3 {
+            font-family: 'Playfair Display', serif;
+            font-size: 1.5rem;
+            color: var(--gold);
+            margin-bottom: 1rem;
+        }
+
+        .order-card .latin {
+            font-style: italic;
+            color: rgba(245, 245, 220, 0.6);
+            font-size: 0.9rem;
+            margin-bottom: 1rem;
+        }
+
+        .order-card p {
+            color: rgba(245, 245, 220, 0.8);
+            line-height: 1.8;
+            font-size: 0.95rem;
+        }
+
+        .species-count {
+            margin-top: 1.5rem;
+            padding-top: 1rem;
+            border-top: 1px solid rgba(212, 175, 55, 0.2);
+            font-size: 0.85rem;
+            color: var(--accent);
+        }
+
+        /* Statistics */
+        .stats {
+            background: linear-gradient(135deg, var(--secondary), var(--primary));
+            padding: 6rem 2rem;
+            margin: 4rem 0;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 2rem;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-number {
+            font-family: 'Playfair Display', serif;
+            font-size: 4rem;
+            color: var(--gold);
+            display: block;
+        }
+
+        .stat-label {
+            font-size: 1rem;
+            letter-spacing: 0.2rem;
+            color: rgba(245, 245, 220, 0.7);
+            margin-top: 0.5rem;
+        }
+
+        /* Timeline */
+        .timeline {
+            position: relative;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .timeline::before {
+            content: '';
+            position: absolute;
+            left: 50%;
+            width: 2px;
+            height: 100%;
+            background: linear-gradient(to bottom, var(--gold), var(--accent));
+        }
+
+        .timeline-item {
+            margin-bottom: 4rem;
+            position: relative;
+        }
+
+        .timeline-item:nth-child(odd) {
+            padding-right: calc(50% + 3rem);
+            text-align: right;
+        }
+
+        .timeline-item:nth-child(even) {
+            padding-left: calc(50% + 3rem);
+        }
+
+        .timeline-dot {
+            position: absolute;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 20px;
+            height: 20px;
+            background: var(--accent);
+            border: 3px solid var(--gold);
+            border-radius: 50%;
+        }
+
+        .timeline-year {
+            font-family: 'Playfair Display', serif;
+            font-size: 2rem;
+            color: var(--gold);
+        }
+
+        .timeline-content h3 {
+            font-size: 1.3rem;
+            margin: 0.5rem 0;
+        }
+
+        .timeline-content p {
+            color: rgba(245, 245, 220, 0.7);
+            line-height: 1.8;
+        }
+
+        /* Quotes */
+        .quotes {
+            background: linear-gradient(135deg, var(--secondary), var(--primary));
+            padding: 6rem 2rem;
+            text-align: center;
+        }
+
+        .quote {
+            max-width: 800px;
+            margin: 0 auto 4rem;
+        }
+
+        .quote blockquote {
+            font-size: 1.5rem;
+            font-style: italic;
+            line-height: 2;
+            color: var(--cream);
+            margin-bottom: 1.5rem;
+        }
+
+        .quote cite {
+            color: var(--gold);
+            font-style: normal;
+        }
+
+        /* Footer */
+        footer {
+            background: var(--primary);
+            padding: 4rem 2rem;
+            text-align: center;
+            border-top: 1px solid rgba(212, 175, 55, 0.2);
+        }
+
+        .footer-logo {
+            font-family: 'Playfair Display', serif;
+            font-size: 2rem;
+            color: var(--gold);
+            letter-spacing: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .footer-text {
+            color: rgba(245, 245, 220, 0.5);
+            font-size: 0.9rem;
+        }
+
+        /* Scroll animations */
+        .fade-in {
+            opacity: 0;
+            transform: translateY(30px);
+            transition: opacity 0.8s ease, transform 0.8s ease;
+        }
+
+        .fade-in.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .hero h1 { font-size: 2.5rem; letter-spacing: 0.5rem; }
+            .hero p { font-size: 1rem; }
+            .intro { grid-template-columns: 1fr; }
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            nav { padding: 1rem; }
+            .nav-links { display: none; }
+            .timeline::before { left: 20px; }
+            .timeline-item:nth-child(odd),
+            .timeline-item:nth-child(even) {
+                padding-left: 60px;
+                padding-right: 0;
+                text-align: left;
+            }
+            .timeline-dot { left: 20px; }
+        }
+    </style>
+</head>
+<body>
+    <nav>
+        <div class="nav-logo">ENTOMOLOGY</div>
+        <div class="nav-links">
+            <a href="#intro">概述</a>
+            <a href="#orders">目科分类</a>
+            <a href="#history">发展历程</a>
+            <a href="#quotes">名人语录</a>
+        </div>
+    </nav>
+
+    <header class="hero">
+        <div class="floating-insect insect-1">🦗</div>
+        <div class="floating-insect insect-2">🐝</div>
+        <div class="floating-insect insect-3">🦟</div>
+        
+        <div class="hero-content">
+            <h1>ENTOMOLOGY</h1>
+            <p>昆虫学研究</p>
+            <div class="hero-divider"></div>
+            <p class="motto">"在微小世界中，探索生命的无限奥秘"</p>
+        </div>
+    </header>
+
+    <section id="intro" class="intro">
+        <div class="intro-text fade-in">
+            <h2 style="font-family: 'Playfair Display', serif; font-size: 2.5rem; color: var(--gold); margin-bottom: 2rem;">探索昆虫世界</h2>
+            <p>昆虫学（Entomology）是研究昆虫的科学，作为动物界中最大的类群，昆虫纲已知的物种超过100万种，占所有动物物种的80%以上。</p>
+            <p>从翩翩起舞的蝴蝶到辛勤采蜜的蜜蜂，从夜空中闪烁的萤火虫到神秘莫测的甲虫，昆虫世界以其惊人的多样性和精妙的适应性，展现着生命演化的无穷魅力。</p>
+            <p>昆虫学不仅揭示了自然界的奥秘，更在医学、农业、生态环境等领域发挥着至关重要的作用。</p>
+        </div>
+        <div class="intro-image fade-in"></div>
+    </section>
+
+    <div class="stats">
+        <div class="stats-grid">
+            <div class="stat-item fade-in">
+                <span class="stat-number">1,000,000+</span>
+                <span class="stat-label">已知物种</span>
+            </div>
+            <div class="stat-item fade-in">
+                <span class="stat-number">40亿</span>
+                <span class="stat-label">年进化历史</span>
+            </div>
+            <div class="stat-item fade-in">
+                <span class="stat-number">30%</span>
+                <span class="stat-label">陆地生物量</span>
+            </div>
+            <div class="stat-item fade-in">
+                <span class="stat-number">600万</span>
+                <span class="stat-label">潜在物种数</span>
+            </div>
+        </div>
+    </div>
+
+    <section id="orders">
+        <div class="section-title fade-in">
+            <h2>主要目科分类</h2>
+            <div class="underline"></div>
+        </div>
+        
+        <div class="orders-grid">
+            <div class="order-card fade-in">
+                <div class="order-icon">🦋</div>
+                <h3>鳞翅目</h3>
+                <div class="latin">Lepidoptera</div>
+                <p>包括蝴蝶与蛾类，以两对覆满鳞片的翅膀著称。完全变态发育，从卵、幼虫、蛹到成虫的生命周期展现着自然的神奇。</p>
+                <div class="species-count">已知物种：约180,000种</div>
+            </div>
+            
+            <div class="order-card fade-in">
+                <div class="order-icon">🐝</div>
+                <h3>膜翅目</h3>
+                <div class="latin">Hymenoptera</div>
+                <p>包含蜂类、蚂蚁和寄生蜂。社会性行为的进化使蜜蜂和蚂蚁成为昆虫界最成功的类群之一，对生态系统至关重要。</p>
+                <div class="species-count">已知物种：约150,000种</div>
+            </div>
+            
+            <div class="order-card fade-in">
+                <div class="order-icon">🪲</div>
+                <h3>鞘翅目</h3>
+                <div class="latin">Coleoptera</div>
+                <p>甲虫家族，动物界中物种最丰富的目。坚硬的前翅演化为鞘翅，保护脆弱的后翅和腹部，是进化的典范。</p>
+                <div class="species-count">已知物种：约400,000种</div>
+            </div>
+            
+            <div class="order-card fade-in">
+                <div class="order-icon">🦗</div>
+                <h3>直翅目</h3>
+                <div class="latin">Orthoptera</div>
+                <p>蝗虫、蟋蟀、螽斯等善跳跃的昆虫。摩擦发声的特性使其成为夏日交响乐的主角，完全变态发育的生命周期独特而精彩。</p>
+                <div class="species-count">已知物种：约23,000种</div>
+            </div>
+            
+            <div class="order-card fade-in">
+                <div class="order-icon">🪰</div>
+                <h3>双翅目</h3>
+                <div class="latin">Diptera</div>
+                <p>苍蝇、蚊子和蠓的王国。仅有一对膜质后翅，演化为平衡棒的感官器官，在医学和生态研究中具有重要价值。</p>
+                <div class="species-count">已知物种：约125,000种</div>
+            </div>
+            
+            <div class="order-card fade-in">
+                <div class="order-icon">🐜</div>
+                <h3>蜻蜓目</h3>
+                <div class="latin">Odonata</div>
+                <p>蜻蜓与豆娘的优雅世界。不完全变态的发育方式，稚虫水生、成虫陆生的双栖生命，以及卓越的飞行能力令人赞叹。</p>
+                <div class="species-count">已知物种：约7,000种</div>
+            </div>
+        </div>
+    </section>
+
+    <section id="history">
+        <div class="section-title fade-in">
+            <h2>发展历程</h2>
+            <div class="underline"></div>
+        </div>
+        
+        <div class="timeline">
+            <div class="timeline-item fade-in">
+                <div class="timeline-dot"></div>
+                <div class="timeline-content">
+                    <span class="timeline-year">4000 BC</span>
+                    <h3>远古时期的昆虫利用</h3>
+                    <p>人类最早记录蚕的饲养与蜂蜜的采集，开启昆虫学知识的萌芽。</p>
+                </div>
+            </div>
+            
+            <div class="timeline-item fade-in">
+                <div class="timeline-dot"></div>
+                <div class="timeline-content">
+                    <span class="timeline-year">384 BC</span>
+                    <h3>亚里士多德的昆虫研究</h3>
+                    <p>古希腊哲学家亚里士多德系统记录昆虫形态与行为，开创科学观察的先河。</p>
+                </div>
+            </div>
+            
+            <div class="timeline-item fade-in">
+                <div class="timeline-dot"></div>
+                <div class="timeline-content">
+                    <span class="timeline-year">1705</span>
+                    <h3>林奈分类系统</h3>
+                    <p>卡尔·林奈在《自然系统》中建立双名法，为昆虫分类学奠定现代基础。</p>
+                </div>
+            </div>
+            
+            <div class="timeline-item fade-in">
+                <div class="timeline-dot"></div>
+                <div class="timeline-content">
+                    <span class="timeline-year">1859</span>
+                    <h3>达尔文与昆虫学</h3>
+                    <p>《物种起源》发表后，昆虫研究成为理解进化论的重要窗口，尤其是拟态现象的发现。</p>
+                </div>
+            </div>
+            
+            <div class="timeline-item fade-in">
+                <div class="timeline-dot"></div>
+                <div class="timeline-content">
+                    <span class="timeline-year">20世纪</span>
+                    <h3>现代昆虫学的兴起</h3>
+                    <p>电子显微镜、分子生物学和基因技术的应用，使昆虫学研究进入全新纪元。</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="quotes">
+        <div class="section-title fade-in">
+            <h2>名人语录</h2>
+            <div class="underline"></div>
+        </div>
+        
+        <div class="quote fade-in">
+            <blockquote>"如果昆虫消失，生态系统将在几年内崩溃。"</blockquote>
+            <cite>— E.O. Wilson，进化生物学家</cite>
+        </div>
+        
+        <div class="quote fade-in">
+            <blockquote>"在广阔的生命织锦中，每一根丝线都同样重要。"</blockquote>
+            <cite>— 查尔斯·达尔文</cite>
+        </div>
+    </section>
+
+    <footer>
+        <div class="footer-logo">ENTOMOLOGY</div>
+        <p class="footer-text">探索微小世界 · 揭示生命奥秘<br>© 2026 昆虫学专题</p>
+    </footer>
+
+    <script>
+        // Scroll animations
+        const observerOptions = {
+            threshold: 0.1,
+            rootMargin: '0px 0px -50px 0px'
+        };
+
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.classList.add('visible');
+                }
+            });
+        }, observerOptions);
+
+        document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+
+        // Smooth scroll
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function(e) {
+                e.preventDefault();
+                document.querySelector(this.getAttribute('href')).scrollIntoView({
+                    behavior: 'smooth'
+                });
+            });
+        });
+    </script>
+</body>
+</html>

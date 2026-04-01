@@ -25,7 +25,7 @@ const PlanBranchSchema = z.object({
   label: z.string().trim().min(1).max(80),
   goal: z.string().trim().min(1).max(240),
   why: z.string().trim().min(1).max(240).optional(),
-  priority: z.number().min(0).max(10),
+  priority: z.number().transform((v) => Math.min(10, Math.max(0, v))),
   execution_group: z.number().int().min(1).max(8),
   depends_on: z.array(z.string().trim().min(1).max(80)).min(0).max(7).optional(),
 });

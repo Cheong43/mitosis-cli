@@ -24,6 +24,12 @@ process.on('unhandledRejection', (reason) => {
   logError(projectRoot, reason, 'unhandledRejection');
 });
 process.on('uncaughtException', (err) => {
+  // EPIPE means the pipe consumer (e.g. `head`, `tail`, pager) closed stdin.
+  // Writing to console.error on a broken pipe would re-raise EPIPE, creating
+  // an infinite uncaughtException loop that fills the error log.
+  if ((err as NodeJS.ErrnoException).code === 'EPIPE') {
+    process.exit(0);
+  }
   console.error('[CodeCLI] Uncaught exception:', err);
   logError(projectRoot, err, 'uncaughtException');
 });

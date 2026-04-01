@@ -22,6 +22,9 @@ import {
   checkContextAndCompress,
   estimateTranscriptTokens,
 } from '../../agent/contextBudget.js';
+import { compressToolResult } from '../../agent/toolResultCompression.js';
+import { CompressionEngine } from '../../agent/compressionEngine.js';
+import { MetricsCollector } from '../../evaluation/metrics.js';
 import { WorkspaceManager } from '../../persistence/WorkspaceManager.js';
 
 interface AgentToolRuntime {
@@ -172,6 +175,10 @@ export interface AgentRuntimeOptions {
   onTrace?: (event: AgentTraceEvent) => void;
   /** Optional workspace manager for persisting branch work. */
   workspaceManager?: WorkspaceManager;
+  /** Enable metrics collection for evaluation. */
+  enableMetrics?: boolean;
+  /** Optional four-level compression engine. When provided, replaces the legacy checkContextAndCompress call. */
+  compressionEngine?: CompressionEngine;
 }
 
 function formatPlannerToolDecisionMessage(toolCalls: PlannedToolCall[]): string {
@@ -574,6 +581,8 @@ export class AgentRuntime {
   private readonly maxSynthesisRetries: number;
   private readonly onTrace: (event: AgentTraceEvent) => void;
   private readonly workspaceManager?: WorkspaceManager;
+  private readonly metricsCollector?: MetricsCollector;
+  private readonly compressionEngine?: CompressionEngine;
 
   constructor(options: AgentRuntimeOptions) {
     this.planner = options.planner;
@@ -598,6 +607,8 @@ export class AgentRuntime {
     this.maxSynthesisRetries = options.maxSynthesisRetries ?? 2;
     this.onTrace = options.onTrace ?? (() => undefined);
     this.workspaceManager = options.workspaceManager;
+    this.metricsCollector = options.enableMetrics ? new MetricsCollector() : undefined;
+    this.compressionEngine = options.compressionEngine;
   }
 
   /**
@@ -735,14 +746,19 @@ export class AgentRuntime {
     };
 
     const buildPlanningTranscript = (branch: AgentBranchState): TranscriptMessage[] => {
+      // Apply collapse-level projection (Level 3 read-time, non-destructive) when engine is available.
+      const baseTranscript = this.compressionEngine
+        ? this.compressionEngine.collapse(branch.transcript)
+        : branch.transcript;
+
       const syncMessage = renderKanbanSyncMessage(branch);
       if (!syncMessage) {
-        return branch.transcript;
+        return baseTranscript;
       }
       // Merge the kanban sync into the leading system message so there is always
       // exactly ONE system-role entry in the transcript.  Models such as MiniMax
       // reject requests that contain more than one system role (error 2013).
-      const [first, ...rest] = branch.transcript;
+      const [first, ...rest] = baseTranscript;
       if (first?.role === 'system') {
         return [
           { role: 'system', content: `${syncMessage}\n\n${String(first.content)}` },
@@ -752,7 +768,7 @@ export class AgentRuntime {
       // No leading system message — create one so the sync always lands at index 0.
       return [
         { role: 'system', content: syncMessage },
-        ...branch.transcript,
+        ...baseTranscript,
       ];
     };
 
@@ -1000,9 +1016,16 @@ export class AgentRuntime {
           role: 'assistant',
           content: formatPlannerToolDecisionMessage(toolCalls),
         });
+
+        // Compress tool results before adding to transcript
+        const compressedObservations = observations.map((o) => ({
+          ...o,
+          result: compressToolResult(o.toolName, o.result, 800),
+        }));
+
         branch.transcript.push({
           role: 'user',
-          content: observations
+          content: compressedObservations
             .map((o, index) =>
               `${formatToolObservationHeader(toolCalls[index] || { name: o.toolName, arguments: {} }, o.toolName)}\n${o.result}`)
             .join('\n\n'),
@@ -1041,12 +1064,20 @@ export class AgentRuntime {
       branch: AgentBranchState,
       branches: PlannedBranch[],
     ): AgentBranchState[] => {
-      // Compress the parent transcript before inheriting \u2014 this is the key
+      // Compress the parent transcript before inheriting — this is the key
       // strategy that allows deeper/wider branching without blowing the budget.
-      const compressedParentTranscript = compressBranchTranscript(branch.transcript, {
+      let compressedParentTranscript = compressBranchTranscript(branch.transcript, {
         tailKeep: 4,
         maxSummaryChars: 1500,
       }) as TranscriptMessage[];
+
+      // Apply snip + microcompact on top of the legacy compressBranchTranscript
+      // when the CompressionEngine is available for further size reduction.
+      if (this.compressionEngine) {
+        const { messages: sniped } = this.compressionEngine.snip(compressedParentTranscript);
+        compressedParentTranscript = this.compressionEngine.microcompact(sniped) as TranscriptMessage[];
+      }
+
       const siblingLabels = new Set(branches.map((candidate) => candidate.label));
 
       return branches.map((child, index) => {
@@ -1136,8 +1167,27 @@ export class AgentRuntime {
         if (this.modelLimit > 0) {
           const { inheritedTranscript, localTranscript } = splitBranchTranscript(branch);
           const inheritedTokens = estimateTranscriptTokens(inheritedTranscript);
+
+          // If a CompressionEngine is available, run the four-level pipeline
+          // BEFORE the legacy checkContextAndCompress so we free space cheaply.
+          if (this.compressionEngine) {
+            const transcriptTokens = estimateTranscriptTokens(localTranscript);
+            const totalUsed = this.committedTokens + this.plannerEnvelopeTokens + inheritedTokens + transcriptTokens;
+            const usageRatio = totalUsed / this.modelLimit;
+            if (usageRatio >= 0.80) {
+              const targetChars = Math.max(4000, Math.floor((this.modelLimit * 0.65 - this.committedTokens - this.plannerEnvelopeTokens - inheritedTokens) * 4));
+              const engineResult = await this.compressionEngine.compress(localTranscript, targetChars);
+              if (engineResult.level !== 'none') {
+                setBranchLocalTranscript(branch, engineResult.messages as TranscriptMessage[], inheritedTranscript);
+                emitBranchTrace('observation', branch,
+                  `Context ${(usageRatio * 100).toFixed(1)}% — engine compressed (${engineResult.level}, freed ${engineResult.freedChars} chars).`);
+              }
+            }
+          }
+
+          const { localTranscript: localAfterEngine } = splitBranchTranscript(branch);
           const check = checkContextAndCompress(
-            localTranscript,
+            localAfterEngine,
             this.modelLimit,
             this.committedTokens + this.plannerEnvelopeTokens + inheritedTokens,
           );
@@ -1146,6 +1196,7 @@ export class AgentRuntime {
             emitBranchTrace('observation', branch,
               `Context ${(check.usageRatio * 100).toFixed(1)}% — auto-compressed transcript.`);
           }
+          this.metricsCollector?.recordContextUsage(check.transcriptTokens, check.compressed, !check.canContinue);
           if (!check.canContinue) {
             const reason = 'context window exhausted after maximum compression';
             branch.finalAnswer = await finalizeBranchSafely(
@@ -1194,10 +1245,14 @@ export class AgentRuntime {
         const kanbanSnapshot = buildKanbanSnapshot();
         let agentStep: AgentStep;
         try {
+          const planStartTime = Date.now();
           agentStep = this.planBranch
             ? await this.planBranch({ branch, planningTranscript, kanbanSnapshot })
             : await this.planner.plan(planningTranscript);
+          this.metricsCollector?.recordLatency(Date.now() - planStartTime, 0);
+          this.metricsCollector?.recordJsonParse(true, 1);
         } catch (error: unknown) {
+          this.metricsCollector?.recordJsonParse(false, 3);
           const errorMessage = error instanceof Error ? error.message : String(error);
           emitBranchTrace('error', branch, `Planner failed: ${errorMessage}`);
           branch.finalAnswer = await finalizeBranchSafely(branch, 'planner error', `Planner failed: ${errorMessage}`);
@@ -1246,11 +1301,17 @@ export class AgentRuntime {
         }
 
         if (agentStep.kind === 'tool') {
-          const toolCalls = agentStep.toolCalls.slice(0, this.maxBranchWidth);
+          // Enforce single tool execution to prevent parallel call drift
+          const toolCalls = agentStep.toolCalls.slice(0, 1);
+          this.metricsCollector?.recordToolCall(
+            toolCalls.length > 0,
+            toolCalls[0]?.name || 'unknown',
+            agentStep.toolCalls.length > 1,
+          );
           if (toolCalls.length === 0) {
             branch.transcript.push({
               role: 'user',
-              content: 'You chose a tool step but did not include any usable tool calls. Continue with at least one tool call or finish this branch.',
+              content: 'You must provide exactly one tool call. Continue with one tool call or finish this branch.',
             });
             continue;
           }
