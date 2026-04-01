@@ -1,0 +1,659 @@
+# Instincts generated from https://github.com/Cheong43/mitosis-cli
+# Generated: 2026-04-01T11:25:20.640Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: mitosis-cli-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Commit Length
+
+## Action
+
+Write moderate-length commit messages (~72 characters)
+
+## Evidence
+
+- Average commit message length: 72 chars
+- Based on 30 commits
+
+---
+id: mitosis-cli-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Naming Files
+
+## Action
+
+Use PascalCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: PascalCase
+
+---
+id: mitosis-cli-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: mitosis-cli-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: mitosis-cli-arch-type-based
+trigger: "when adding new code"
+confidence: 0.8
+domain: architecture
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Arch Type Based
+
+## Action
+
+Place code in the appropriate type folder (components/, services/, utils/, etc.)
+
+## Evidence
+
+- Type-based module organization detected
+- Folders: agent, components, config, evaluation, mempedia
+
+---
+id: mitosis-cli-test-colocate
+trigger: "when writing tests"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Test Colocate
+
+## Action
+
+Place test file next to the source file (e.g., Button.test.tsx next to Button.tsx)
+
+## Evidence
+
+- Colocated test pattern detected
+- Tests live alongside source files
+
+---
+id: mitosis-cli-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.ts
+
+## Evidence
+
+- File pattern: *.test.ts
+- Consistent across test files
+
+---
+id: mitosis-cli-test-types
+trigger: "when planning tests for a feature"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Test Types
+
+## Action
+
+Write unit, integration tests to match project standards
+
+## Evidence
+
+- Test types detected: unit, integration
+- Coverage config: no
+
+---
+id: mitosis-cli-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~17x per month
+- Files: src/agent/*, src/runtime/agent/*, src/runtime/*
+
+---
+id: mitosis-cli-workflow-refactoring
+trigger: "when refactoring code"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Workflow Refactoring
+
+## Action
+
+Follow the refactoring workflow:
+1. Ensure tests pass before refactor
+2. Refactor code structure
+3. Verify tests still pass
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~8x per month
+- Files: src/**/*
+
+---
+id: mitosis-cli-workflow-add-or-enhance-agent-subagent-or-tool
+trigger: "when doing add or enhance agent subagent or tool"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Workflow Add Or Enhance Agent Subagent Or Tool
+
+## Action
+
+Follow the add-or-enhance-agent-subagent-or-tool workflow:
+1. Create or update subagent/tool implementation file(s) in src/agent/subagents/ or src/agent/
+2. Update types in src/agent/subagents/types.ts or src/agent/planning/types.ts
+3. Register or expose the new subagent/tool in src/agent/index.ts
+4. Add or update tests in src/agent/*.test.ts
+5. Optionally update src/runtime/agent/AgentRuntime.ts or src/runtime/agent/Planner.ts for runtime integration
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: src/agent/subagents/*.ts, src/agent/subagents/types.ts, src/agent/planning/types.ts
+
+---
+id: mitosis-cli-workflow-feature-development-with-tests-and-types
+trigger: "when doing feature development with tests and types"
+confidence: 0.7
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Workflow Feature Development With Tests And Types
+
+## Action
+
+Follow the feature-development-with-tests-and-types workflow:
+1. Implement feature logic in src/agent/ or src/runtime/agent/
+2. Update or add related type definitions in src/agent/planning/types.ts, src/agent/subagents/types.ts, or src/runtime/agent/types.ts
+3. Write or update automated tests (unit/integration) in src/agent/*.test.ts or src/runtime/agent/*.test.ts
+4. Update src/agent/index.ts to wire up new logic if needed
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~4x per month
+- Files: src/agent/*.ts, src/agent/*.test.ts, src/agent/planning/types.ts
+
+---
+id: mitosis-cli-workflow-add-or-enhance-skill
+trigger: "when doing add or enhance skill"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Workflow Add Or Enhance Skill
+
+## Action
+
+Follow the add-or-enhance-skill workflow:
+1. Create or update SKILL.md in skills/ directory
+2. Update src/skills/router.ts to parse or handle new skill attributes
+3. Write or update tests in src/skills/router.test.ts
+4. Optionally update src/config/projectPaths.ts or src/agent/index.ts for skill loading
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: skills/*/SKILL.md, src/skills/router.ts, src/skills/router.test.ts
+
+---
+id: mitosis-cli-workflow-refactor-or-remove-agent-runtime-or-planner-components
+trigger: "when doing refactor or remove agent runtime or planner components"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Workflow Refactor Or Remove Agent Runtime Or Planner Components
+
+## Action
+
+Follow the refactor-or-remove-agent-runtime-or-planner-components workflow:
+1. Delete or refactor files in src/runtime/agent/ (e.g., BeamSearchAgentRuntime, Planner, PathScorer)
+2. Update type definitions in src/runtime/agent/types.ts
+3. Update or remove related tests in src/runtime/agent/*.test.ts and src/agent/*.test.ts
+4. Update src/agent/index.ts and .env.example to reflect changes
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: src/runtime/agent/*.ts, src/runtime/agent/*.test.ts, src/runtime/agent/types.ts
+
+---
+id: mitosis-cli-workflow-improve-context-budget-or-transcript-compression
+trigger: "when doing improve context budget or transcript compression"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Workflow Improve Context Budget Or Transcript Compression
+
+## Action
+
+Follow the improve-context-budget-or-transcript-compression workflow:
+1. Update or create src/agent/contextBudget.ts and related test files
+2. Implement or update compression logic in src/agent/sessionCompressor.ts
+3. Update src/runtime/agent/AgentRuntime.ts to integrate new logic
+4. Update or add tests in src/agent/contextBudget.test.ts, src/agent/contextBudget.integration.test.ts, or src/agent/sessionCompressor.test.ts
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: src/agent/contextBudget.ts, src/agent/contextBudget.test.ts, src/agent/contextBudget.integration.test.ts
+
+---
+id: mitosis-cli-instinct-file-naming
+trigger: "When creating a new file"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct File Naming
+
+## Action
+
+Name the file using PascalCase (e.g., MyComponent.ts)
+
+## Evidence
+
+- Pattern in architecture.namingConventions.files
+- Observed in src/agent/index.ts
+
+---
+id: mitosis-cli-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Function Naming
+
+## Action
+
+Name the function using camelCase (e.g., parseSkill)
+
+## Evidence
+
+- Pattern in architecture.namingConventions.functions
+- Seen in src/skills/router.ts
+
+---
+id: mitosis-cli-instinct-class-naming
+trigger: "When defining a new class"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Class Naming
+
+## Action
+
+Name the class using PascalCase (e.g., AgentRuntime)
+
+## Evidence
+
+- Pattern in architecture.namingConventions.classes
+- Seen in src/runtime/agent/AgentRuntime.ts
+
+---
+id: mitosis-cli-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Constant Naming
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE (e.g., MAX_CONTEXT_LENGTH)
+
+## Evidence
+
+- Pattern in architecture.namingConventions.constants
+
+---
+id: mitosis-cli-instinct-relative-imports
+trigger: "When importing modules"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Relative Imports
+
+## Action
+
+Use relative import paths (e.g., './utils/helper')
+
+## Evidence
+
+- Pattern in codeStyle.importStyle
+- Seen in src/agent/index.ts
+
+---
+id: mitosis-cli-instinct-named-exports
+trigger: "When exporting functions, classes, or constants"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Named Exports
+
+## Action
+
+Use named exports (e.g., export { MyFunction })
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle
+- Seen in src/skills/router.ts
+
+---
+id: mitosis-cli-instinct-test-file-pattern
+trigger: "When creating a test file"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Test File Pattern
+
+## Action
+
+Name the file with the pattern *.test.ts
+
+## Evidence
+
+- Pattern in testing.filePattern
+- Seen in src/agent/contextBudget.test.ts
+
+---
+id: mitosis-cli-instinct-colocated-tests
+trigger: "When adding tests for a module"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Colocated Tests
+
+## Action
+
+Place the test file in the same directory as the module (colocated)
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation
+- Seen in src/agent/contextBudget.test.ts
+
+---
+id: mitosis-cli-instinct-add-tests-with-features
+trigger: "When implementing a new feature or refactoring code"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Add Tests With Features
+
+## Action
+
+Add or update automated tests (unit/integration) for the affected modules
+
+## Evidence
+
+- Workflow commit sequences: 'Add tests for feature', 'Write or update automated tests'
+- Seen in feature-development and refactoring workflows
+
+---
+id: mitosis-cli-instinct-git-commit-prefix
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Git Commit Prefix
+
+## Action
+
+Start the commit message with a prefix indicating the change type (feat, fix, refactor, style)
+
+## Evidence
+
+- Pattern in commits.prefixes
+- Seen in commit: 'feat: define plan subagent as tool-based with bounded plan input'
+
+---
+id: mitosis-cli-instinct-git-commit-length
+trigger: "When writing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Git Commit Length
+
+## Action
+
+Keep the commit message concise (average length ~72 characters)
+
+## Evidence
+
+- Pattern in commits.averageLength
+- Seen in commit examples
+
+---
+id: mitosis-cli-instinct-add-or-enhance-agent-subagent-or-tool
+trigger: "When introducing a new agent subagent, tool, or extending agent planning/decision logic"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Add Or Enhance Agent Subagent Or Tool
+
+## Action
+
+Create or update implementation in src/agent/subagents/, update types, register in src/agent/index.ts, add/update tests, and optionally update runtime integration
+
+## Evidence
+
+- Workflow: add-or-enhance-agent-subagent-or-tool
+- Commit sequences and files in workflow example
+
+---
+id: mitosis-cli-instinct-feature-development-with-tests-and-types
+trigger: "When developing a new feature or major capability in the agent or runtime"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Feature Development With Tests And Types
+
+## Action
+
+Implement feature logic, update/add type definitions, write/update automated tests, and update src/agent/index.ts if needed
+
+## Evidence
+
+- Workflow: feature-development-with-tests-and-types
+- Commit sequences and files in workflow example
+
+---
+id: mitosis-cli-instinct-add-or-enhance-skill
+trigger: "When introducing a new skill or modifying skill parsing/management"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Add Or Enhance Skill
+
+## Action
+
+Create or update SKILL.md in skills/, update src/skills/router.ts, write/update tests in src/skills/router.test.ts, and optionally update src/config/projectPaths.ts or src/agent/index.ts
+
+## Evidence
+
+- Workflow: add-or-enhance-skill
+- Commit sequences and files in workflow example
+
+---
+id: mitosis-cli-instinct-refactor-or-remove-agent-runtime-or-planner-components
+trigger: "When refactoring, replacing, or removing agent runtime or planner logic"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Refactor Or Remove Agent Runtime Or Planner Components
+
+## Action
+
+Delete/refactor files in src/runtime/agent/, update types, update/remove related tests, and update src/agent/index.ts and .env.example
+
+## Evidence
+
+- Workflow: refactor-or-remove-agent-runtime-or-planner-components
+- Commit sequences and files in workflow example
+
+---
+id: mitosis-cli-instinct-improve-context-budget-or-transcript-compression
+trigger: "When optimizing context usage or transcript management for agent operations"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: Cheong43/mitosis-cli
+---
+
+# Mitosis Cli Instinct Improve Context Budget Or Transcript Compression
+
+## Action
+
+Update/create src/agent/contextBudget.ts and tests, implement/update compression logic in src/agent/sessionCompressor.ts, update src/runtime/agent/AgentRuntime.ts, and add/update relevant tests
+
+## Evidence
+
+- Workflow: improve-context-budget-or-transcript-compression
+- Commit sequences and files in workflow example
+
