@@ -22,6 +22,10 @@ export interface PlanSubagentInvocation {
   subagent: 'plan';
   task: string;
   context?: string;
+  /** Compact plan text passed from the main agent (max 2000 chars). When provided,
+   *  the plan subagent uses this instead of reading the full canonical plan state,
+   *  keeping the planning context small and stable. */
+  plan?: string;
 }
 
 export interface ResearchSubagentInvocation {

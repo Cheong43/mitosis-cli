@@ -212,6 +212,9 @@ const PlannerSubagentDecisionSchema = z.object({
   subagent: z.enum(['plan', 'research', 'crawler']),
   task: z.string().trim().min(1).max(1500),
   context: z.string().trim().max(600).optional(),
+  /** Compact plan text forwarded to the plan subagent (max 2000 chars).
+   *  Recommended when subagent=plan. Pass the canonical_plan from your context. */
+  plan: z.string().trim().max(2000).optional(),
 });
 
 const PlannerWorkDecisionSchema = z.object({
@@ -852,6 +855,11 @@ export class Agent {
               type: 'string',
               maxLength: 400,
               description: 'Optional additional context for the subagent.',
+            },
+            plan: {
+              type: 'string',
+              maxLength: 2000,
+              description: 'Recommended when subagent=plan. Pass the canonical_plan text from your context (max 2000 chars). Providing this keeps the plan subagent context small and stable.',
             },
           },
           required: ['subagent', 'task'],
@@ -3871,11 +3879,9 @@ ${renderPromptList([
       kanbanSnapshot: BranchKanbanSnapshot | undefined,
       decision: PlannerSubagentDecision,
     ): Promise<AgentStep> => {
-      const invocation: SubagentInvocation = {
-        subagent: decision.subagent,
-        task: decision.task,
-        context: decision.context,
-      };
+      const invocation: SubagentInvocation = decision.subagent === 'plan'
+        ? { subagent: 'plan', task: decision.task, context: decision.context, plan: decision.plan }
+        : { subagent: decision.subagent, task: decision.task, context: decision.context };
 
       const result = await runSubagent(
         this.subagentRegistry,
@@ -4179,7 +4185,7 @@ kanban: ${renderPlannerKanbanSummary(kanbanSnapshot)}
 ${canonicalPlanState.canonicalPlanText ? `canonical_plan (v${canonicalPlanState.version}):\n${this.clipText(canonicalPlanState.canonicalPlanText, branch.depth > 0 ? 800 : 2000)}` : 'No canonical plan yet — call planner_subagent with subagent=plan if branching is needed.'}
 
 user_request: ${this.clipText(originalUserRequest || input, 500)}
-Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_subagent/planner_final/planner_skills for control. Never mix control + work tools.`.replace(/\n{3,}/g, '\n\n');
+Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_subagent/planner_final/planner_skills for control. Never mix control + work tools. When calling planner_subagent with subagent=plan, always pass the canonical_plan above in the plan field (max 2000 chars).`.replace(/\n{3,}/g, '\n\n');
 
       // ── Dynamic transcript windowing ──
       // Child branches (depth > 0) omit recentConversationMessages: they execute a specific
