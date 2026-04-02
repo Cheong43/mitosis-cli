@@ -73,6 +73,9 @@ export interface AgentBranchState {
   artifacts?: string[];
   /** Consecutive tool execution failures count. */
   consecutiveFailures?: number;
+  /** Most recent snip compression stats for planner-context observability. */
+  lastSnippedCount?: number;
+  lastSnipFreedChars?: number;
 }
 
 export interface BranchPlanInput {
@@ -1058,6 +1061,19 @@ export class AgentRuntime {
       } else if (observations.some((o) => o.success)) {
         branch.consecutiveFailures = 0;
       }
+
+      if (this.compressionEngine) {
+        const { inheritedTranscript, localTranscript } = splitBranchTranscript(branch);
+        const snipResult = this.compressionEngine.snip(localTranscript);
+        branch.lastSnippedCount = snipResult.snippedCount;
+        branch.lastSnipFreedChars = snipResult.freedChars;
+        if (snipResult.snippedCount > 0) {
+          setBranchLocalTranscript(branch, snipResult.messages as TranscriptMessage[], inheritedTranscript);
+        }
+      } else {
+        branch.lastSnippedCount = 0;
+        branch.lastSnipFreedChars = 0;
+      }
     };
 
     const buildChildBranches = (
@@ -1067,8 +1083,8 @@ export class AgentRuntime {
       // Compress the parent transcript before inheriting — this is the key
       // strategy that allows deeper/wider branching without blowing the budget.
       let compressedParentTranscript = compressBranchTranscript(branch.transcript, {
-        tailKeep: 4,
-        maxSummaryChars: 1500,
+        tailKeep: 2,
+        maxSummaryChars: 600,
       }) as TranscriptMessage[];
 
       // Apply snip + microcompact on top of the legacy compressBranchTranscript
@@ -1086,7 +1102,6 @@ export class AgentRuntime {
           .filter((label) => label !== child.label && siblingLabels.has(label));
         const sharedHandoffMessage = renderSharedHandoffMessage(branch.sharedHandoff);
         const branchHandoffMessage = renderBranchHandoffMessage(child.handoff);
-        const kanbanSyncMessage = renderKanbanSyncMessage(branch);
         const structuredHandoffBlock = [sharedHandoffMessage, branchHandoffMessage]
           .filter((section) => section.length > 0)
           .join('\n\n');
@@ -1098,7 +1113,7 @@ export class AgentRuntime {
           },
           {
             role: 'user',
-            content: `You are now working on child branch "${child.label}".\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nExecution group: ${executionGroup}\nDepends on sibling labels: ${dependsOn.length ? dependsOn.join(', ') : 'none'}\nCanonical plan version: ${child.planVersion ?? branch.planVersionSeen ?? 0}\nBranch plan excerpt:\n${child.planExcerpt || branch.planExcerpt || '(none)'}\nAlignment checks: ${child.alignmentChecks?.length ? child.alignmentChecks.join(' | ') : '(none)'}\nThis branch owns only its local sub-problem.\nSibling branches in the same execution group may run in parallel. Higher execution groups wait until all lower groups under the same parent finish.\nIf depends_on is set, this branch should not start until those sibling labels have already finished.\nTreat execution_group and depends_on as binding coordination constraints, not hints.\nOnly do work that can make useful progress within this branch's scope. Do not perform downstream integration early if that integration mainly depends on sibling outputs that are still being produced elsewhere.\nRe-branch only if this branch still contains multiple genuinely independent substreams with low coordination risk. Do not branch again by default.\nUse web only in mode=fetch and only when you already have a trustworthy URL.\nYou may use tool calls, branch further if the goal truly benefits from independent sub-work, or return a final answer. Avoid repeating sibling work.${structuredHandoffBlock ? `\n\nStructured remediation handoff:\n${structuredHandoffBlock}` : ''}${kanbanSyncMessage ? `\n\n${kanbanSyncMessage}` : ''}`,
+            content: `child branch "${child.label}"\nGoal: ${child.goal}\nWhy: ${child.why || 'Distinct strategy'}\nExecution group: ${executionGroup}\nDepends on sibling labels: ${dependsOn.length ? dependsOn.join(', ') : 'none'}\nCanonical plan version: ${child.planVersion ?? branch.planVersionSeen ?? 0}\nBranch plan excerpt:\n${child.planExcerpt || branch.planExcerpt || '(none)'}\nAlignment checks: ${child.alignmentChecks?.length ? child.alignmentChecks.join(' | ') : '(none)'}\nScope: only this branch's sub-problem. Avoid repeating sibling work or doing downstream integration early.${structuredHandoffBlock ? `\n\nStructured remediation handoff:\n${structuredHandoffBlock}` : ''}`,
           },
         ];
 

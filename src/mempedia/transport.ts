@@ -4,6 +4,7 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child
 import * as readline from 'node:readline';
 
 import type { ToolAction, ToolResponse } from './types.js';
+import { logError } from '../utils/errorLogger.js';
 
 type TransportMode = 'ndjson' | 'oneshot' | 'unavailable';
 
@@ -73,6 +74,14 @@ function isToolResponse(value: unknown): value is ToolResponse {
   return Boolean(value)
     && typeof value === 'object'
     && typeof (value as any).kind === 'string';
+}
+
+function summarizeAction(action: ToolAction | Record<string, unknown>): string {
+  const actionName = typeof action?.action === 'string' ? action.action : 'unknown';
+  const query = typeof (action as Record<string, unknown>)?.query === 'string'
+    ? String((action as Record<string, unknown>).query).slice(0, 120)
+    : '';
+  return query ? `${actionName} query=${query}` : actionName;
 }
 
 export class MempediaTransport {
@@ -222,12 +231,15 @@ export class MempediaTransport {
         return;
       }
       const timeoutMs = Number(process.env.MEMPEDIA_TRANSPORT_TIMEOUT_MS ?? 20000);
+      const actionSummary = summarizeAction(action);
       const timer = setTimeout(() => {
         const index = this.pending.findIndex((entry) => entry.resolve === resolve);
         if (index >= 0) {
           this.pending.splice(index, 1);
         }
-        reject(new Error(`mempedia transport timeout after ${timeoutMs}ms`));
+        const timeoutError = new Error(`mempedia transport timeout after ${timeoutMs}ms (${actionSummary})`);
+        logError(this.projectRoot, timeoutError, 'mempedia_transport_ndjson_timeout');
+        reject(timeoutError);
       }, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 20000);
       this.pending.push({ resolve, reject, timer });
       try {
@@ -235,6 +247,7 @@ export class MempediaTransport {
       } catch (error: any) {
         clearTimeout(timer);
         this.pending.pop();
+        logError(this.projectRoot, error, `mempedia_transport_ndjson_write_failed_${actionSummary}`);
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
@@ -244,6 +257,7 @@ export class MempediaTransport {
     const timeoutMs = Number(process.env.MEMPEDIA_TRANSPORT_TIMEOUT_MS ?? 20000);
     this.mode = 'oneshot';
     this.transportConnected = false;
+    const actionSummary = summarizeAction(action);
 
     return await new Promise((resolve) => {
       execFile(
@@ -258,6 +272,7 @@ export class MempediaTransport {
           if (error) {
             const message = String(stderr || error.message || 'mempedia binary execution failed').trim();
             this.lastError = message;
+            logError(this.projectRoot, new Error(`${message} (${actionSummary})`), 'mempedia_transport_oneshot_failed');
             resolve({ kind: 'error', message });
             return;
           }

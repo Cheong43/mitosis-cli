@@ -9,6 +9,7 @@ import {
   compressTranscript,
   getCompressionLevel,
   checkContextAndCompress,
+  extractTranscriptContentText,
 } from './contextBudget.js';
 
 // ── estimateTokens ─────────────────────────────────────────────────────────
@@ -258,6 +259,104 @@ test('compressBranchTranscript: preserves web search query in compressed observa
   const compressed = compressBranchTranscript(messages, { tailKeep: 3, maxSummaryChars: 600 });
   const summary = String(compressed[1]?.content || '');
   assert.match(summary, /web search query="Qin Shi Huang burning books historical debate"/);
+});
+
+test('extractTranscriptContentText: OpenAI replay content becomes snip-friendly tool markers without reasoning', () => {
+  const assistantReplay = {
+    type: 'openai_assistant_message',
+    message: {
+      role: 'assistant',
+      content: '',
+      tool_calls: [
+        {
+          id: 'call_prev',
+          type: 'function',
+          function: {
+            name: 'demo_tool',
+            arguments: '{"value":"previous"}',
+          },
+        },
+      ],
+      reasoning_details: [{ type: 'reasoning.text', text: 'private reasoning should not persist' }],
+    },
+  };
+  const toolReplay = {
+    type: 'openai_tool_result',
+    tool_call_id: 'call_prev',
+    tool_name: 'demo_tool',
+    content: 'previous tool output',
+  };
+
+  const assistantText = extractTranscriptContentText(assistantReplay);
+  const toolText = extractTranscriptContentText(toolReplay);
+
+  assert.match(assistantText, /^PLANNER TOOL DECISION:/);
+  assert.match(assistantText, /- demo_tool \| arguments: \{"value":"previous"\}/);
+  assert.doesNotMatch(assistantText, /private reasoning should not persist/);
+  assert.equal(toolText, 'TOOL OBSERVATION for demo_tool:\nprevious tool output');
+});
+
+test('extractTranscriptContentText: Anthropic replay content becomes snip-friendly tool markers without thinking', () => {
+  const assistantReplay = [
+    { type: 'text', text: 'Looking up evidence.' },
+    { type: 'thinking', thinking: 'private thinking should not persist' },
+    { type: 'tool_use', id: 'toolu_prev', name: 'search', input: { query: 'qin' } },
+  ];
+  const toolReplay = [
+    { type: 'tool_result', tool_use_id: 'toolu_prev', tool_name: 'search', content: 'search results' },
+  ];
+
+  const assistantText = extractTranscriptContentText(assistantReplay);
+  const toolText = extractTranscriptContentText(toolReplay);
+
+  assert.match(assistantText, /^PLANNER TOOL DECISION:/);
+  assert.match(assistantText, /- search \| arguments: \{"query":"qin"\}/);
+  assert.doesNotMatch(assistantText, /private thinking should not persist/);
+  assert.equal(toolText, 'TOOL OBSERVATION for search:\nsearch results');
+});
+
+test('compressBranchTranscript: summarizes provider replay tool history via projected tool markers', () => {
+  const messages = [
+    { role: 'user', content: 'Research the topic' },
+    {
+      role: 'assistant',
+      content: {
+        type: 'openai_assistant_message',
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_prev',
+              type: 'function',
+              function: {
+                name: 'web',
+                arguments: '{"mode":"search","query":"Qin Shi Huang historical debate"}',
+              },
+            },
+          ],
+        },
+      },
+    },
+    {
+      role: 'user',
+      content: {
+        type: 'openai_tool_result',
+        tool_call_id: 'call_prev',
+        tool_name: 'web',
+        content: 'historical results',
+      },
+    },
+    { role: 'assistant', content: 'Intermediate note about the results' },
+    { role: 'user', content: 'Recent observation A' },
+    { role: 'assistant', content: 'Recent observation B' },
+    { role: 'user', content: 'Recent observation C' },
+  ];
+
+  const compressed = compressBranchTranscript(messages, { tailKeep: 3, maxSummaryChars: 600 });
+  const summary = String(compressed[1]?.content || '');
+  assert.match(summary, /> web \| arguments: \{"mode":"search","query":"Qin Shi Huang historical debate"\}/);
+  assert.match(summary, /TOOL OBSERVATION for web: \[OK\]/);
 });
 
 // ── checkContextAndCompress ────────────────────────────────────────────────

@@ -242,7 +242,7 @@ test('generateToolCalls falls back to JSON repair when native tool calling is re
   }]);
 });
 
-test('generateToolCalls enables MiniMax reasoning_split and replays prior OpenAI tool messages', async () => {
+test('generateToolCalls enables MiniMax reasoning_split and replays prior OpenAI tool messages without replaying reasoning', async () => {
   const requests: any[] = [];
   const model = buildLanguageModel({
     model: 'MiniMax-M2.7',
@@ -329,12 +329,70 @@ test('generateToolCalls enables MiniMax reasoning_split and replays prior OpenAI
       },
     },
   ]);
-  assert.equal(requests[0].messages[0].reasoning_content, 'previous reasoning');
+  assert.equal(requests[0].messages[0].reasoning_content, undefined);
+  assert.equal(requests[0].messages[0].thinking_content, undefined);
+  assert.equal(requests[0].messages[0].reasoning_details, undefined);
   assert.deepEqual(requests[0].messages[1], {
     role: 'tool',
     tool_call_id: 'call_prev',
     content: 'previous tool output',
   });
+});
+
+test('generateToolCalls replays prior Anthropic tool messages without thinking blocks', async () => {
+  const requests: any[] = [];
+  const model = buildAnthropicLanguageModel({
+    model: 'fake-anthropic',
+    authToken: 'test-token',
+    baseURL: 'https://anthropic.example.test/v1',
+    fetch: async (_input, init) => {
+      const payload = await readJsonBody(init);
+      requests.push(payload);
+      return jsonResponse({
+        id: 'msg_test',
+        type: 'message',
+        role: 'assistant',
+        model: 'fake-anthropic',
+        content: [
+          { type: 'text', text: 'Using a native tool.' },
+          { type: 'tool_use', id: 'toolu_2', name: 'demo_tool', input: { value: 'native-anthropic' } },
+        ],
+        stop_reason: 'tool_use',
+        stop_sequence: null,
+        usage: { input_tokens: 1, output_tokens: 1 },
+      });
+    },
+  });
+
+  await generateToolCalls({
+    model,
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Previous assistant step.' },
+          { type: 'thinking', thinking: 'private thinking should not persist' },
+          { type: 'tool_use', id: 'toolu_prev', name: 'demo_tool', input: { value: 'previous' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_prev', tool_name: 'demo_tool', content: 'previous tool output' },
+        ],
+      },
+      { role: 'user', content: 'Use the demo tool again.' },
+    ],
+    tools: [DEMO_TOOL],
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].messages[0].role, 'assistant');
+  assert.equal(requests[0].messages[1].role, 'user');
+  assert.match(JSON.stringify(requests[0].messages[0].content), /tool_use/);
+  assert.match(JSON.stringify(requests[0].messages[1].content), /tool_result/);
+  assert.doesNotMatch(JSON.stringify(requests[0].messages[0].content), /private thinking should not persist/);
+  assert.doesNotMatch(JSON.stringify(requests[0].messages[0].content), /"thinking"/);
 });
 
 test('generateToolCalls parses native Anthropic tool_use blocks through AI SDK', async () => {

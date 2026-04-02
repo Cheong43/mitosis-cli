@@ -67,6 +67,52 @@ test('child branches get a fresh local step budget', async () => {
   assert.equal(answer, 'child-final-answer');
 });
 
+test('child branches inherit a compact parent transcript floor after multiple tool steps', async () => {
+  let inspectedChild = false;
+
+  const runtime = new AgentRuntime({
+    planner: new FakePlanner(async () => ({ kind: 'final', content: 'unused planner fallback' })),
+    toolRuntime: new FakeToolRuntime(async (_toolName, args) => `step-${String(args.step || '')}:${'x'.repeat(400)}`),
+    maxSteps: 6,
+    maxBranchDepth: 1,
+    maxCompletedBranches: 1,
+    branchConcurrency: 1,
+    planBranch: async ({ branch, planningTranscript }) => {
+      if (branch.depth === 1) {
+        const transcript = planningTranscript ?? branch.transcript;
+        const serialized = transcript.map((message) => String(message.content)).join('\n');
+        assert.ok(branch.inheritedMessageCount <= 6, `expected compact child base, got ${branch.inheritedMessageCount}`);
+        assert.match(serialized, /\[PARENT BRANCH CONTEXT/);
+        assert.doesNotMatch(serialized, /step-1:/);
+        assert.doesNotMatch(serialized, /step-2:/);
+        inspectedChild = true;
+        return {
+          kind: 'final',
+          content: 'child-compact',
+        };
+      }
+
+      if (branch.steps <= 4) {
+        return {
+          kind: 'tool',
+          toolCalls: [{ name: 'read', arguments: { step: branch.steps } }],
+        };
+      }
+
+      return {
+        kind: 'branch',
+        branches: [
+          { label: 'Compact child', goal: 'Inspect inherited context', priority: 1 },
+        ],
+      };
+    },
+  });
+
+  const answer = await runtime.run('inspect compact child inheritance');
+  assert.equal(answer, 'child-compact');
+  assert.equal(inspectedChild, true);
+});
+
 test('branch transcripts record planner decisions as text markers instead of legacy JSON blobs', async () => {
   const planner = new FakePlanner(async (transcript) => {
     const serialized = transcript.map((message) => message.content).join('\n');

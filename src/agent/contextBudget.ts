@@ -199,51 +199,151 @@ interface TranscriptMessage {
   content: any;
 }
 
+function stringifyTranscriptJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatToolDecisionText(toolCalls: Array<{ name?: unknown; arguments?: unknown }>): string {
+  const lines = toolCalls
+    .map((toolCall) => {
+      const name = String(toolCall?.name || '').trim() || 'tool';
+      const args = toolCall?.arguments;
+      const hasArgs = Boolean(
+        args != null
+        && (typeof args !== 'object'
+          || Array.isArray(args)
+          || Object.keys(args as Record<string, unknown>).length > 0),
+      );
+      return `- ${name}${hasArgs ? ` | arguments: ${typeof args === 'string' ? args : stringifyTranscriptJson(args)}` : ''}`;
+    })
+    .filter(Boolean);
+
+  return lines.length > 0
+    ? ['PLANNER TOOL DECISION:', ...lines].join('\n')
+    : '';
+}
+
+function formatToolObservationText(toolName: string | undefined, body: unknown): string {
+  const normalizedToolName = String(toolName || '').trim() || 'tool';
+  const payload = typeof body === 'string' ? body : stringifyTranscriptJson(body);
+  return `TOOL OBSERVATION for ${normalizedToolName}:\n${payload}`;
+}
+
+function extractOpenAIAssistantReplayText(message: Record<string, unknown>): string {
+  const toolCalls = Array.isArray(message.tool_calls)
+    ? message.tool_calls.reduce<Array<{ name?: unknown; arguments?: unknown }>>((entries, toolCall) => {
+      if (!toolCall || typeof toolCall !== 'object') {
+        return entries;
+      }
+      const record = toolCall as Record<string, unknown>;
+      const functionRecord = record.function && typeof record.function === 'object'
+        ? record.function as Record<string, unknown>
+        : {};
+      entries.push({
+        name: functionRecord.name,
+        arguments: typeof functionRecord.arguments === 'string'
+          ? functionRecord.arguments
+          : functionRecord.arguments ?? {},
+      });
+      return entries;
+    }, [])
+    : [];
+
+  if (toolCalls.length > 0) {
+    return formatToolDecisionText(toolCalls);
+  }
+
+  if (typeof message.content === 'string') {
+    return message.content;
+  }
+
+  if (Array.isArray(message.content)) {
+    return message.content
+      .map((item) => {
+        if (typeof item === 'string') {
+          return item;
+        }
+        if (item && typeof item === 'object' && typeof (item as { text?: unknown }).text === 'string') {
+          return (item as { text: string }).text;
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  return '';
+}
+
+function extractAnthropicReplayText(content: unknown[]): string {
+  const toolResults = content
+    .filter((item) => Boolean(item) && typeof item === 'object' && (item as { type?: unknown }).type === 'tool_result')
+    .map((item) => {
+      const block = item as { content?: unknown; tool_name?: unknown };
+      return formatToolObservationText(
+        typeof block.tool_name === 'string' ? block.tool_name : undefined,
+        typeof block.content === 'string' ? block.content : stringifyTranscriptJson(block.content),
+      );
+    });
+  if (toolResults.length > 0) {
+    return toolResults.join('\n\n');
+  }
+
+  const toolCalls = content
+    .filter((item) => Boolean(item) && typeof item === 'object' && (item as { type?: unknown }).type === 'tool_use')
+    .map((item) => {
+      const block = item as { name?: unknown; input?: unknown };
+      return {
+        name: block.name,
+        arguments: block.input ?? {},
+      };
+    });
+  if (toolCalls.length > 0) {
+    return formatToolDecisionText(toolCalls);
+  }
+
+  return content
+    .map((item) => {
+      if (typeof item === 'string') {
+        return item;
+      }
+      if (item && typeof item === 'object') {
+        if (typeof (item as { text?: unknown }).text === 'string') {
+          return (item as { text: string }).text;
+        }
+        if (typeof (item as { content?: unknown }).content === 'string') {
+          return (item as { content: string }).content;
+        }
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
 export function extractTranscriptContentText(content: any): string {
   if (typeof content === 'string') {
     return content;
   }
   if (content && typeof content === 'object') {
     if ((content as { type?: unknown }).type === 'openai_tool_result') {
-      return typeof (content as { content?: unknown }).content === 'string'
-        ? (content as { content: string }).content
-        : '';
+      const toolResult = content as { content?: unknown; tool_name?: unknown };
+      return formatToolObservationText(
+        typeof toolResult.tool_name === 'string' ? toolResult.tool_name : undefined,
+        typeof toolResult.content === 'string' ? toolResult.content : stringifyTranscriptJson(toolResult.content),
+      );
     }
     if ((content as { type?: unknown }).type === 'openai_assistant_message') {
       const message = (content as { message?: Record<string, unknown> }).message || {};
-      const parts: string[] = [];
-      if (typeof message.content === 'string') {
-        parts.push(message.content);
-      }
-      if (Array.isArray(message.reasoning_details)) {
-        parts.push(JSON.stringify(message.reasoning_details));
-      }
-      if (Array.isArray(message.tool_calls)) {
-        parts.push(JSON.stringify(message.tool_calls));
-      }
-      return parts.filter(Boolean).join('\n');
+      return extractOpenAIAssistantReplayText(message);
     }
   }
   if (Array.isArray(content)) {
-    return content
-      .map((item) => {
-        if (typeof item === 'string') {
-          return item;
-        }
-        if (item && typeof item === 'object') {
-          if (typeof (item as { text?: unknown }).text === 'string') {
-            return (item as { text: string }).text;
-          }
-          if (typeof (item as { thinking?: unknown }).thinking === 'string') {
-            return (item as { thinking: string }).thinking;
-          }
-          if (typeof (item as { content?: unknown }).content === 'string') {
-            return (item as { content: string }).content;
-          }
-        }
-        return JSON.stringify(item);
-      })
-      .join('\n');
+    return extractAnthropicReplayText(content);
   }
   if (content == null) {
     return '';
@@ -377,11 +477,12 @@ function extractPlannerToolLines(content: unknown): string[] {
     });
   }
 
-  if (typeof content !== 'string' || !content.startsWith(PLANNER_TOOL_DECISION_PREFIX)) {
+  const projected = typeof content === 'string' ? content : extractTranscriptContentText(content);
+  if (!projected.startsWith(PLANNER_TOOL_DECISION_PREFIX)) {
     return [];
   }
 
-  return content
+  return projected
     .split('\n')
     .slice(1)
     .map((line) => line.trim())
@@ -409,11 +510,12 @@ function extractPlannerBranchChildCount(content: unknown): number | null {
     return legacy.branches.length;
   }
 
-  if (typeof content !== 'string' || !content.startsWith(PLANNER_BRANCH_DECISION_PREFIX)) {
+  const projected = typeof content === 'string' ? content : extractTranscriptContentText(content);
+  if (!projected.startsWith(PLANNER_BRANCH_DECISION_PREFIX)) {
     return null;
   }
 
-  return content
+  return projected
     .split('\n')
     .slice(1)
     .map((line) => line.trim())

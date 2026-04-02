@@ -12,6 +12,7 @@ function createTempProjectRoot(prefix: string): string {
 
 function createAdapter(projectRoot: string) {
   const calls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const mempediaCalls: Array<Record<string, unknown>> = [];
   const runtimeHandle = {
     executeTool: async (toolName: string, args: Record<string, unknown>) => {
       calls.push({ toolName, args });
@@ -52,8 +53,15 @@ function createAdapter(projectRoot: string) {
       projectRoot,
       codeCliRoot: projectRoot,
       runtimeHandle,
+      mempediaClient: {
+        send: async (action: Record<string, unknown>) => {
+          mempediaCalls.push(action);
+          return { kind: 'search_results', results: [{ node_id: 'cap_rate', score: 1.5 }] };
+        },
+      },
     }),
     calls,
+    mempediaCalls,
   };
 }
 
@@ -134,9 +142,9 @@ test('PlannerToolAdapter reads local skills through semantic target', async () =
   assert.match(result, /Run smoke tests before tagging\./);
 });
 
-test('PlannerToolAdapter routes memory search through a Mempedia shell action', async () => {
+test('PlannerToolAdapter routes memory search through the Mempedia transport client', async () => {
   const projectRoot = createTempProjectRoot('planner-tool-adapter-memory-');
-  const { adapter, calls } = createAdapter(projectRoot);
+  const { adapter, calls, mempediaCalls } = createAdapter(projectRoot);
 
   const result = await adapter.execute('search', {
     target: 'memory',
@@ -146,9 +154,9 @@ test('PlannerToolAdapter routes memory search through a Mempedia shell action', 
   });
 
   assert.match(result, /"kind":"search_results"/);
-  assert.equal(calls[0]?.toolName, 'run_shell');
-  assert.match(String(calls[0]?.args.command || ''), /\\"action\\":\\"search_hybrid\\"/);
-  assert.match(String(calls[0]?.args.command || ''), /\\"query\\":\\"cap rate\\"/);
+  assert.equal(calls.length, 0);
+  assert.equal(String(mempediaCalls[0]?.action || ''), 'search_hybrid');
+  assert.equal(String(mempediaCalls[0]?.query || ''), 'cap rate');
 });
 
 test('PlannerToolAdapter rejects removed web search mode with an explicit error', async () => {

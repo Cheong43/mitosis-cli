@@ -45,6 +45,7 @@ export interface AnthropicToolResultContentBlock {
   tool_use_id: string;
   content: string;
   is_error?: boolean;
+  tool_name?: string;
 }
 
 export interface AnthropicThinkingContentBlock {
@@ -63,6 +64,7 @@ export interface OpenAIToolResultReplayContent {
   type: 'openai_tool_result';
   tool_call_id: string;
   content: string;
+  tool_name?: string;
 }
 
 export type AnthropicMessageContentBlock =
@@ -780,11 +782,6 @@ function normalizeOpenAIAssistantReplayContent(
     parts.push({ type: 'text', text });
   }
 
-  const reasoningText = extractReasoningTextFromReplayMessage(message);
-  if (reasoningText.trim()) {
-    parts.push({ type: 'reasoning', text: reasoningText });
-  }
-
   const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   for (const rawCall of toolCalls) {
     if (!rawCall || typeof rawCall !== 'object') {
@@ -833,15 +830,6 @@ function normalizeAnthropicArrayContent(
       const type = (block as { type?: unknown }).type;
       if (type === 'text' && typeof (block as { text?: unknown }).text === 'string') {
         parts.push({ type: 'text', text: (block as { text: string }).text });
-      } else if (type === 'thinking') {
-        const thinkingText = typeof (block as { thinking?: unknown }).thinking === 'string'
-          ? (block as { thinking: string }).thinking
-          : typeof (block as { text?: unknown }).text === 'string'
-            ? (block as { text: string }).text
-            : '';
-        if (thinkingText.trim()) {
-          parts.push({ type: 'reasoning', text: thinkingText });
-        }
       } else if (type === 'tool_use') {
         const toolUse = block as AnthropicToolUseContentBlock;
         anthropicToolNameById.set(toolUse.id, toolUse.name);
@@ -870,7 +858,7 @@ function normalizeAnthropicArrayContent(
     .map((block) => ({
       type: 'tool-result' as const,
       toolCallId: block.tool_use_id,
-      toolName: anthropicToolNameById.get(block.tool_use_id) || 'tool',
+      toolName: block.tool_name || anthropicToolNameById.get(block.tool_use_id) || 'tool',
       output: {
         type: block.is_error ? 'error-text' as const : 'text' as const,
         value: block.content,
@@ -979,10 +967,6 @@ function buildProviderMessage(
     .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
     .map((part) => part.text)
     .join('');
-  const reasoningText = contentArray
-    .filter((part): part is { type: 'reasoning'; text: string } => part.type === 'reasoning')
-    .map((part) => part.text)
-    .join('\n');
   const toolCalls = contentArray
     .filter((part): part is { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown } => part.type === 'tool-call')
     .map((part) => ({
@@ -999,9 +983,6 @@ function buildProviderMessage(
     if (text.trim()) {
       anthropicAssistantContent.push({ type: 'text', text });
     }
-    if (reasoningText.trim()) {
-      anthropicAssistantContent.push({ type: 'thinking', thinking: reasoningText });
-    }
     anthropicAssistantContent.push(...toolCalls.map((call) => ({
       type: 'tool_use' as const,
       id: call.id,
@@ -1017,11 +998,6 @@ function buildProviderMessage(
     openaiAssistantMessage: {
       role: 'assistant',
       content: text,
-      ...(reasoningText.trim()
-        ? {
-          reasoning_details: [{ type: 'reasoning.text', text: reasoningText }],
-        }
-        : {}),
       ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
     },
   };

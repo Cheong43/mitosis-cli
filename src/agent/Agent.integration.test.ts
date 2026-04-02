@@ -166,6 +166,22 @@ test('planner uses structured decision generation instead of raw JSON text repai
   agent.stop();
 });
 
+test('planner control tools do not expose planner_work', () => {
+  const projectRoot = createTempProjectRoot('mempedia-agent-no-planner-work-');
+  const agent = new Agent({ apiKey: 'test-key' }, projectRoot);
+  const anyAgent = agent as any;
+
+  const tools = anyAgent.buildPlannerDecisionTools(true, 'all');
+  const toolNames = tools.map((tool: { name: string }) => tool.name);
+
+  assert.ok(toolNames.includes('planner_final'));
+  assert.ok(toolNames.includes('planner_skills'));
+  assert.ok(toolNames.includes('planner_subagent'));
+  assert.ok(!toolNames.includes('planner_work'));
+
+  agent.stop();
+});
+
 test('unwraps raw planner JSON from final answer before returning to user', async () => {
   const projectRoot = createTempProjectRoot('mempedia-agent-final-unpack-');
   const agent = new Agent({ apiKey: 'test-key' }, projectRoot);

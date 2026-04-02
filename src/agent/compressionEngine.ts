@@ -103,31 +103,45 @@ export function snipStaleToolResults(
   let snippedCount = 0;
   let freedChars = 0;
 
-  const result = messages.map((m, index) => {
+  const result = [...messages];
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
     // Never snip the first message or recent messages
-    if (index === 0 || index >= cutoffIndex) return m;
+    if (index === 0 || index >= cutoffIndex) continue;
     // Only snip tool observations older than staleThreshold
-    if (index >= messages.length - staleThreshold) return m;
+    if (index >= messages.length - staleThreshold) continue;
 
-    const contentText = extractTranscriptContentText(m.content);
-    if (m.role !== 'user') return m;
-    if (!contentText.startsWith('TOOL OBSERVATION')) return m;
+    const contentText = extractTranscriptContentText(message.content);
+    if (message.role !== 'user') continue;
+    if (!contentText.startsWith('TOOL OBSERVATION')) continue;
 
     // Check if any active ref appears in this observation
     const lower = contentText.toLowerCase();
+    let shouldKeep = false;
     for (const ref of activeRefs) {
-      if (lower.includes(ref)) return m;
+      if (lower.includes(ref)) {
+        shouldKeep = true;
+        break;
+      }
+    }
+    if (shouldKeep) continue;
+
+    const previous = result[index - 1];
+    if (previous?.role === 'assistant') {
+      const previousText = extractTranscriptContentText(previous.content);
+      if (previousText.startsWith('PLANNER TOOL DECISION:')) {
+        result[index - 1] = { ...previous, content: previousText };
+      }
     }
 
-    // Snip it
     const firstLine = contentText.split('\n')[0];
     const toolName = firstLine.replace('TOOL OBSERVATION for ', '').replace(':', '').split(' ')[0] || 'tool';
     const charCount = contentText.length;
     const placeholder = `[snipped: ${toolName} result, ${charCount} chars, step ~${index}]`;
     snippedCount++;
     freedChars += charCount - placeholder.length;
-    return { ...m, content: placeholder };
-  });
+    result[index] = { ...message, content: placeholder };
+  }
 
   return { messages: result, snippedCount, freedChars };
 }
@@ -228,24 +242,32 @@ export function microcompactTranscript(
   const maxChars = options?.maxChars ?? 400;
   const recentKeep = options?.recentKeep ?? 6;
   const cutoffIndex = messages.length - recentKeep;
+  const result = [...messages];
 
-  return messages.map((m, index) => {
-    if (index === 0 || index >= cutoffIndex) return m;
-    const contentText = extractTranscriptContentText(m.content);
-    if (m.role !== 'user' || !contentText.startsWith('TOOL OBSERVATION')) return m;
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (index === 0 || index >= cutoffIndex) continue;
+    const contentText = extractTranscriptContentText(message.content);
+    if (message.role !== 'user' || !contentText.startsWith('TOOL OBSERVATION')) continue;
 
-    // Extract tool name from header line
+    const previous = result[index - 1];
+    if (previous?.role === 'assistant') {
+      const previousText = extractTranscriptContentText(previous.content);
+      if (previousText.startsWith('PLANNER TOOL DECISION:')) {
+        result[index - 1] = { ...previous, content: previousText };
+      }
+    }
+
     const headerLine = contentText.split('\n')[0];
     const toolNameMatch = headerLine.match(/TOOL OBSERVATION for ([^\s:]+)/);
     const toolName = toolNameMatch?.[1] ?? 'tool';
     const bodyStart = contentText.indexOf('\n') + 1;
     const body = bodyStart > 0 ? contentText.slice(bodyStart) : contentText;
     const compressedBody = microcompactToolResult(toolName, body, maxChars);
-    const newContent = typeof m.content === 'string'
-      ? `${headerLine}\n${compressedBody}`
-      : { ...m.content, text: `${headerLine}\n${compressedBody}` };
-    return { ...m, content: newContent };
-  });
+    result[index] = { ...message, content: `${headerLine}\n${compressedBody}` };
+  }
+
+  return result;
 }
 
 // ── Level 3: Context Collapse (read-time projection) ─────────────────────

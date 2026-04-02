@@ -50,6 +50,7 @@ import {
   computeContextBudget,
   estimateTokens,
   estimateTranscriptTokens,
+  extractTranscriptContentText,
   compressTranscript,
   compressBranchTranscript,
   checkContextAndCompress,
@@ -217,18 +218,12 @@ const PlannerSubagentDecisionSchema = z.object({
   plan: z.string().trim().max(2000).optional(),
 });
 
-const PlannerWorkDecisionSchema = z.object({
-  kind: z.literal('work'),
-  thought: z.string().trim().min(1).max(400),
-});
-
 const PlannerDecisionSchema = z.union([
   PlannerToolDecisionSchema,
   PlannerBranchDecisionBaseSchema,
   PlannerFinalDecisionSchema,
   PlannerSkillsDecisionSchema,
   PlannerSubagentDecisionSchema,
-  PlannerWorkDecisionSchema,
 ]);
 
 type PlannerDecision = z.infer<typeof PlannerDecisionSchema>;
@@ -300,6 +295,8 @@ interface BranchState {
   alignmentChecks?: string[];
   ancestorBranchIds?: string[];
   ancestorBranchLabels?: string[];
+  lastSnippedCount?: number;
+  lastSnipFreedChars?: number;
 }
 
 export interface TraceEvent {
@@ -808,27 +805,6 @@ export class Agent {
         parse: (input) => ({
           kind: 'control',
           decision: PlannerSkillsDecisionSchema.parse({ kind: 'skills', ...(input as Record<string, unknown>) }),
-        }),
-      },
-      {
-        name: 'planner_work',
-        description: 'Indicate that work tools (read/search/edit/bash/web) are needed. The system will then prompt for specific tool calls with a larger token budget.',
-        parameters: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            thought: {
-              type: 'string',
-              minLength: 1,
-              maxLength: 400,
-              description: 'Brief description of what work needs to be done.',
-            },
-          },
-          required: ['thought'],
-        },
-        parse: (input) => ({
-          kind: 'control',
-          decision: PlannerWorkDecisionSchema.parse({ kind: 'work', ...(input as Record<string, unknown>) }),
         }),
       },
     );
@@ -3128,6 +3104,7 @@ Decide the safer execution discipline for this turn.`,
       projectRoot: this.projectRoot,
       codeCliRoot: this.codeCliRoot,
       runtimeHandle: runRuntimeHandle,
+      mempediaClient: this.mempedia,
     });
     const emitTrace = (event: TraceEvent) => {
       traceBuffer.push(event);
@@ -3259,10 +3236,14 @@ Decide the safer execution discipline for this turn.`,
       });
     }
 
-    const recentConversationMessages = selectedConversationTurns.flatMap((turn) => [
-      { role: 'user', content: turn.user },
-      { role: 'assistant', content: turn.assistant }
-    ]);
+    const recentConversationMessages = selectedConversationTurns.flatMap((turn) => {
+      const compactUser = this.clipText(turn.user, 300);
+      const compactAssistant = this.clipText(turn.assistant, 500);
+      return [
+        ...(compactUser ? [{ role: 'user' as const, content: compactUser }] : []),
+        ...(compactAssistant ? [{ role: 'assistant' as const, content: compactAssistant }] : []),
+      ];
+    });
     const originalUserRequest = this.extractOriginalUserRequest(input);
     const asksAboutLocalSkills = /技能/.test(originalUserRequest) || /\bskills?\b/i.test(originalUserRequest);
     const asksAboutMempedia = /mempedia/i.test(originalUserRequest) || /记忆库|知识库/.test(originalUserRequest);
@@ -3480,54 +3461,91 @@ ${renderPromptList([
       deltaSummary: 'No canonical plan has been published yet.',
     };
 
-    const extractText = (content: any): string => {
-      if (typeof content === 'string') {
-        return content;
+    const extractText = (content: any): string => extractTranscriptContentText(content);
+    const stringifySafeJson = (value: unknown): string => {
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return String(value);
       }
-      if (content && typeof content === 'object') {
-        if ((content as { type?: unknown }).type === 'openai_tool_result') {
-          return typeof (content as OpenAIToolResultReplayContent).content === 'string'
-            ? (content as OpenAIToolResultReplayContent).content
-            : '';
-        }
-        if ((content as { type?: unknown }).type === 'openai_assistant_message') {
-          const message = (content as OpenAIAssistantReplayContent).message || {};
-          const parts: string[] = [];
-          if (typeof message.content === 'string') {
-            parts.push(message.content);
-          }
-          if (Array.isArray(message.reasoning_details)) {
-            parts.push(JSON.stringify(message.reasoning_details));
-          }
-          if (Array.isArray(message.tool_calls)) {
-            parts.push(JSON.stringify(message.tool_calls));
-          }
-          return parts.filter(Boolean).join('\n');
-        }
+    };
+
+    const estimateReplayReasoningChars = (content: ChatMessageContent): number => {
+      if (content && typeof content === 'object' && (content as { type?: unknown }).type === 'openai_assistant_message') {
+        const message = (content as OpenAIAssistantReplayContent).message || {};
+        const details = Array.isArray(message.reasoning_details) ? JSON.stringify(message.reasoning_details) : '';
+        const reasoning = typeof message.reasoning_content === 'string' ? message.reasoning_content : '';
+        const thinking = typeof message.thinking_content === 'string' ? message.thinking_content : '';
+        return `${details}${reasoning}${thinking}`.length;
       }
       if (Array.isArray(content)) {
-        return content.map((item) => {
-          if (typeof item === 'string') {
-            return item;
+        return content.reduce((sum, item) => {
+          if (!item || typeof item !== 'object') {
+            return sum;
           }
-          if (item && typeof item === 'object') {
-            if (typeof item.text === 'string') {
-              return item.text;
-            }
-            if (typeof item.thinking === 'string') {
-              return item.thinking;
-            }
-            if (typeof item.content === 'string') {
-              return item.content;
-            }
+          if ((item as { type?: unknown }).type !== 'thinking') {
+            return sum;
           }
-          return JSON.stringify(item);
-        }).join('\n');
+          const text = typeof (item as { thinking?: unknown }).thinking === 'string'
+            ? (item as { thinking: string }).thinking
+            : typeof (item as { text?: unknown }).text === 'string'
+              ? (item as { text: string }).text
+              : '';
+          return sum + text.length;
+        }, 0);
       }
-      if (content == null) {
-        return '';
+      return 0;
+    };
+
+    const estimateReplayToolHistoryChars = (content: ChatMessageContent): number => {
+      if (content && typeof content === 'object' && (content as { type?: unknown }).type === 'openai_assistant_message') {
+        const message = (content as OpenAIAssistantReplayContent).message || {};
+        return Array.isArray(message.tool_calls) ? JSON.stringify(message.tool_calls).length : 0;
       }
-      return String(content);
+      if (content && typeof content === 'object' && (content as { type?: unknown }).type === 'openai_tool_result') {
+        return String((content as OpenAIToolResultReplayContent).content || '').length;
+      }
+      if (Array.isArray(content)) {
+        return content.reduce((sum, item) => {
+          if (!item || typeof item !== 'object') {
+            return sum;
+          }
+          const type = (item as { type?: unknown }).type;
+          if (type === 'tool_use') {
+            return sum + stringifySafeJson((item as { input?: unknown }).input).length;
+          }
+          if (type === 'tool_result') {
+            return sum + String((item as AnthropicToolResultContentBlock).content || '').length;
+          }
+          return sum;
+        }, 0);
+      }
+      return 0;
+    };
+
+    const estimateReplayTranscriptStats = (messages: BranchTranscriptMessage[]) => messages.reduce((stats, message) => ({
+      reasoningChars: stats.reasoningChars + estimateReplayReasoningChars(message.content),
+      toolHistoryChars: stats.toolHistoryChars + estimateReplayToolHistoryChars(message.content),
+    }), { reasoningChars: 0, toolHistoryChars: 0 });
+
+    const estimateTranscriptChars = (messages: Array<{ content: ChatMessageContent }>): number =>
+      messages.reduce((sum, message) => sum + extractText(message.content).length, 0);
+
+    const emitPlannerContextBreakdown = (branch: BranchState, plannerMessages: ChatMessage[]) => {
+      const inheritedCount = Math.max(0, Math.min(branch.inheritedMessageCount, branch.transcript.length));
+      const inheritedTranscript = branch.transcript.slice(0, inheritedCount);
+      const localTranscript = branch.transcript.slice(inheritedCount);
+      const replayStats = estimateReplayTranscriptStats(branch.transcript);
+      const metadataChars = plannerMessages.length > 0
+        ? extractText(plannerMessages[plannerMessages.length - 1]?.content || '').length
+        : 0;
+      const recentConversationChars = branch.depth > 0 ? 0 : estimateTranscriptChars(recentConversationMessages);
+
+      emitBranchTrace(
+        'observation',
+        branch,
+        `Planner context breakdown: recentConversation=${recentConversationChars} inheritedTranscript=${estimateTranscriptChars(inheritedTranscript)} localTranscript=${estimateTranscriptChars(localTranscript)} metadata=${metadataChars} providerReplayReasoning=${replayStats.reasoningChars} providerReplayToolHistory=${replayStats.toolHistoryChars} snipFreedChars=${branch.lastSnipFreedChars ?? 0} snippedCount=${branch.lastSnippedCount ?? 0}`,
+      );
     };
 
     const loadedSkillMarker = 'SKILL ROUTER LOAD:';
@@ -3701,7 +3719,7 @@ ${renderPromptList([
       if (decision.kind === 'skills') {
         return `[planner] kind=skills skills=${decision.skills.join(',')}`;
       }
-      return '[planner] kind=final';
+      return `[planner] kind=${String((decision as { kind?: unknown }).kind || 'unknown')}`;
     };
 
     const isPlannerTimeoutDetail = (detail: string): boolean =>
@@ -3992,10 +4010,23 @@ ${renderPromptList([
         return null;
       }
 
+      const anthropicToolNameById = new Map(
+        assistantContent
+          .filter((block): block is { type: 'tool_use'; id: string; name: string } => (
+            Boolean(block)
+            && typeof block === 'object'
+            && (block as { type?: unknown }).type === 'tool_use'
+            && typeof (block as { id?: unknown }).id === 'string'
+            && typeof (block as { name?: unknown }).name === 'string'
+          ))
+          .map((block) => [block.id, block.name] as const),
+      );
+
       const toolResults: AnthropicToolResultContentBlock[] = observations.map((observation, index) => ({
         type: 'tool_result',
         tool_use_id: toolUseIds[index],
         content: observation.result,
+        tool_name: anthropicToolNameById.get(toolUseIds[index]) || 'tool',
         ...(observation.success ? {} : { is_error: true }),
       }));
 
@@ -4031,6 +4062,9 @@ ${renderPromptList([
         type: 'openai_tool_result',
         tool_call_id: toolCallIds[index],
         content: observation.result,
+        tool_name: Array.isArray(assistantMessage.tool_calls)
+          ? String(assistantMessage.tool_calls[index]?.function?.name || '').trim() || 'tool'
+          : 'tool',
       }));
 
       return [
@@ -4172,6 +4206,16 @@ ${renderPromptList([
         ].filter(Boolean).join('\n');
       };
 
+      const renderCanonicalPlanContext = () => {
+        if (!canonicalPlanState.canonicalPlanText) {
+          return 'No canonical plan yet — call planner_subagent with subagent=plan if branching is needed.';
+        }
+        if (branch.planExcerpt && branch.planVersionSeen === canonicalPlanState.version) {
+          return `canonical_plan_excerpt (v${canonicalPlanState.version}):\n${this.clipText(branch.planExcerpt, branch.depth > 0 ? 400 : 600)}`;
+        }
+        return `canonical_plan (v${canonicalPlanState.version}):\n${this.clipText(canonicalPlanState.canonicalPlanText, branch.depth > 0 ? 400 : 1000)}`;
+      };
+
       // ── Compact metadata message ──
       const handoffBlock = renderStructuredBranchHandoff(branch.handoff);
       const retryBlock = branch.sharedHandoff ? `retry_round=${branch.sharedHandoff.retryIndex}` : '';
@@ -4182,7 +4226,7 @@ ${branch.alignmentChecks?.length ? `checks: ${branch.alignmentChecks.join(' | ')
 ${handoffBlock}${retryBlock ? `\n${retryBlock}` : ''}
 evidence: ${renderBranchEvidenceDigest()}
 kanban: ${renderPlannerKanbanSummary(kanbanSnapshot)}
-${canonicalPlanState.canonicalPlanText ? `canonical_plan (v${canonicalPlanState.version}):\n${this.clipText(canonicalPlanState.canonicalPlanText, branch.depth > 0 ? 800 : 2000)}` : 'No canonical plan yet — call planner_subagent with subagent=plan if branching is needed.'}
+${renderCanonicalPlanContext()}
 
 user_request: ${this.clipText(originalUserRequest || input, 500)}
 Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_subagent/planner_final/planner_skills for control. Never mix control + work tools. When calling planner_subagent with subagent=plan, always pass the canonical_plan above in the plan field (max 2000 chars).`.replace(/\n{3,}/g, '\n\n');
@@ -4858,6 +4902,8 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
     // Build a shared CompressionEngine for this agent run.
     // The fourth-level autocompact uses a lightweight generateText call.
     const runCompressionEngine = new CompressionEngine({
+      snipStaleThreshold: 6,
+      snipRecentKeep: 4,
       generateSummary: async (text: string, maxTokens: number): Promise<string> => {
         const { text: summary } = await generateText({
           model: this.openai,
@@ -4896,6 +4942,7 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
         planBranch: async ({ branch, planningTranscript, kanbanSnapshot }) => {
         const effectivePlanningTranscript = planningTranscript ?? (branch as BranchState).transcript;
         const plannerMessages = buildPlannerMessages(branch as BranchState, effectivePlanningTranscript, kanbanSnapshot);
+        emitPlannerContextBreakdown(branch as BranchState, plannerMessages);
         // Pre-flight token check: if input already exceeds model limit, force-finalize
         // instead of sending a doomed LLM call that will fail and pollute the transcript.
         const preflightTokens = estimateTranscriptTokens(plannerMessages);
@@ -5002,6 +5049,7 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
       planBranch: async ({ branch, planningTranscript, kanbanSnapshot }) => {
         const effectivePlanningTranscript = planningTranscript ?? (branch as BranchState).transcript;
         const plannerMessages = buildPlannerMessages(branch as BranchState, effectivePlanningTranscript, kanbanSnapshot);
+        emitPlannerContextBreakdown(branch as BranchState, plannerMessages);
         // Pre-flight token check: if input already exceeds model limit, force-finalize
         // instead of sending a doomed LLM call that will fail and pollute the transcript.
         const preflightTokens = estimateTranscriptTokens(plannerMessages);

@@ -3,6 +3,8 @@ import * as path from 'node:path';
 import { search as duckDuckGoSearch } from 'duck-duck-scrape';
 
 import type { RuntimeHandle } from '../runtime/index.js';
+import { MempediaClient } from '../mempedia/client.js';
+import type { ToolAction, ToolResponse } from '../mempedia/types.js';
 import {
   findSkillByName,
   loadWorkspaceSkills,
@@ -16,6 +18,11 @@ interface MainAgentAdapterOptions {
   projectRoot: string;
   codeCliRoot: string;
   runtimeHandle: RuntimeHandle;
+  mempediaClient?: MempediaClientLike;
+}
+
+interface MempediaClientLike {
+  send(action: ToolAction): Promise<ToolResponse>;
 }
 
 interface WebPermissionPolicy {
@@ -64,11 +71,13 @@ export class MainAgentAdapter {
   private readonly codeCliRoot: string;
   private readonly runtimeHandle: RuntimeHandle;
   private readonly defaultWebPermissionPolicy: WebPermissionPolicy;
+  private readonly mempediaClient: MempediaClientLike;
 
   constructor(options: MainAgentAdapterOptions) {
     this.projectRoot = options.projectRoot;
     this.codeCliRoot = options.codeCliRoot;
     this.runtimeHandle = options.runtimeHandle;
+    this.mempediaClient = options.mempediaClient ?? new MempediaClient(options.projectRoot);
     this.defaultWebPermissionPolicy = {
       allowedDomains: parseDomainList(process.env.MITOSIS_WEB_ALLOWED_DOMAINS),
       blockedDomains: parseDomainList(process.env.MITOSIS_WEB_BLOCKED_DOMAINS),
@@ -818,31 +827,30 @@ export class MainAgentAdapter {
   private async executeMempediaAction(
     action: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    const payload = JSON.stringify(action);
-    const command =
-      `BIN="\${MEMPEDIA_BINARY_PATH:-./target/debug/mempedia}"\n` +
-      `[[ -x "$BIN" ]] || BIN=./target/release/mempedia\n` +
-      `printf '%s' ${JSON.stringify(payload)} | "$BIN" --project "$PWD" --stdin`;
-    const toolRes = await this.runtimeHandle.executeTool('run_shell', { command });
-    if (!toolRes.success) {
-      return {
-        kind: 'error',
-        message: toolRes.error ?? 'mempedia action failed',
-      };
-    }
-    const raw = typeof toolRes.result === 'string' ? toolRes.result.trim() : '';
-    if (!raw) {
-      return {
-        kind: 'error',
-        message: 'mempedia action returned no output',
-      };
-    }
+    const startedAt = Date.now();
+    const actionName = String(action.action || 'unknown');
     try {
-      return JSON.parse(raw) as Record<string, unknown>;
-    } catch {
+      const result = await this.mempediaClient.send(action as ToolAction);
+      const elapsedMs = Date.now() - startedAt;
+      if (result.kind === 'error' && /timeout|timed out/i.test(result.message || '')) {
+        logError(
+          this.projectRoot,
+          new Error(`Mempedia action ${actionName} timed out after ${elapsedMs}ms: ${result.message}`),
+          `mempedia_action_timeout_${actionName}`,
+        );
+      }
+      return result as Record<string, unknown>;
+    } catch (error) {
+      const elapsedMs = Date.now() - startedAt;
+      const message = error instanceof Error ? error.message : String(error);
+      logError(
+        this.projectRoot,
+        error,
+        `mempedia_action_failed_${actionName}_after_${elapsedMs}ms`,
+      );
       return {
         kind: 'error',
-        message: `could not parse mempedia output: ${raw.slice(0, 240)}`,
+        message: `mempedia action ${actionName} failed after ${elapsedMs}ms: ${message}`,
       };
     }
   }
