@@ -95,6 +95,8 @@ export interface SubagentRunContext {
   }>): PlannedBranch[];
   trimTextToTokenBudget(text: string, maxTokens: number, fallbackChars?: number): string;
   renderPlanSubagentFocus(branch: SubagentBranchState, kanbanSnapshot?: BranchKanbanSnapshot): string;
+  /** Compact digest of shared workspace facts and sibling outputs for the planning scope. */
+  sharedProgressDigest?: string;
   generateToolCalls<TParsed>(
     options: SubagentToolCallOptions<TParsed>,
   ): Promise<SubagentToolCallResult<TParsed>>;

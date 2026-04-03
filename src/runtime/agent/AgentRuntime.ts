@@ -21,6 +21,7 @@ import {
   progressiveCompressBranch,
   checkContextAndCompress,
   estimateTranscriptTokens,
+  extractTranscriptContentText,
 } from '../../agent/contextBudget.js';
 import { compressToolResult } from '../../agent/toolResultCompression.js';
 import { CompressionEngine } from '../../agent/compressionEngine.js';
@@ -664,6 +665,8 @@ export class AgentRuntime {
       dependsOn: [...(card.dependsOn || [])],
       blockers: [...(card.blockers || [])],
       artifacts: [...(card.artifacts || [])],
+      outputs: [...(card.outputs || [])],
+      workspaceFacts: [...(card.workspaceFacts || [])],
     });
 
     const summarizeKanban = () => {
@@ -713,6 +716,16 @@ export class AgentRuntime {
         artifacts: patch.artifacts !== undefined
           ? dedupeNonEmpty([...(current?.artifacts || []), ...patch.artifacts])
           : [...(current?.artifacts || [])],
+        outputs: patch.outputs !== undefined
+          ? dedupeNonEmpty([...(current?.outputs || []), ...patch.outputs])
+          : [...(current?.outputs || [])],
+        workspaceFacts: patch.workspaceFacts !== undefined
+          ? [...(current?.workspaceFacts || []), ...patch.workspaceFacts]
+            .sort((left, right) => right.updatedAt - left.updatedAt)
+            .filter((fact, index, facts) =>
+              index === facts.findIndex((candidate) =>
+                candidate.path === fact.path && candidate.factType === fact.factType && candidate.ownerBranchId === fact.ownerBranchId))
+          : [...(current?.workspaceFacts || [])],
         updatedAt: Date.now(),
       };
       kanbanCards.set(branch.id, next);
@@ -1041,13 +1054,24 @@ export class AgentRuntime {
           .join(' | '),
         180,
       );
+      const observationArtifacts = dedupeNonEmpty(observations.flatMap((observation) => observation.artifacts || []));
+      const observationOutputs = dedupeNonEmpty(observations.flatMap((observation) => observation.outputs || []));
+      const observationFacts = observations.flatMap((observation) => observation.workspaceFacts || []);
+      if (observationArtifacts.length > 0) {
+        branch.artifacts = dedupeNonEmpty([...(branch.artifacts || []), ...observationArtifacts]);
+      }
       upsertKanbanCard(branch, {
         status: 'active',
         summary: observationSummary || 'Tool observations recorded.',
         blockers: observations
           .filter((observation) => !observation.success)
-          .map((observation) => `${observation.toolName}: ${previewText(observation.result, 120)}`),
-        artifacts: extractArtifactPaths(toolCalls),
+          .map((observation) => `${observation.toolName}: ${previewText(observation.result, 120)}`)
+          .concat(observations
+            .map((observation) => observation.duplicateInspection)
+            .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)),
+        artifacts: dedupeNonEmpty([...extractArtifactPaths(toolCalls), ...observationArtifacts]),
+        outputs: observationOutputs,
+        workspaceFacts: observationFacts,
       });
 
       if (shouldRuntimeTraceTool()) {
@@ -1093,6 +1117,16 @@ export class AgentRuntime {
         const { messages: sniped } = this.compressionEngine.snip(compressedParentTranscript);
         compressedParentTranscript = this.compressionEngine.microcompact(sniped) as TranscriptMessage[];
       }
+      const inheritedParentSummary = compressedParentTranscript
+        .map((message) => {
+          const contentText = extractTranscriptContentText(message.content).replace(/\s+/g, ' ').trim();
+          if (!contentText) {
+            return '';
+          }
+          return `[${message.role}] ${previewText(contentText, 280)}`;
+        })
+        .filter(Boolean)
+        .join('\n');
 
       const siblingLabels = new Set(branches.map((candidate) => candidate.label));
 
@@ -1106,7 +1140,12 @@ export class AgentRuntime {
           .filter((section) => section.length > 0)
           .join('\n\n');
         const transcript: TranscriptMessage[] = [
-          ...compressedParentTranscript,
+          ...(inheritedParentSummary
+            ? [{
+              role: 'user' as const,
+              content: `Inherited parent context summary:\n${inheritedParentSummary}`,
+            }]
+            : []),
           {
             role: 'assistant',
             content: formatPlannerBranchDecisionMessage(branches),

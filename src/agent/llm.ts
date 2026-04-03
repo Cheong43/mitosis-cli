@@ -425,7 +425,7 @@ function buildJsonFallbackPrompt<TParsed>(
     '- Put every tool input inside the "input" object.',
     '- Return at least one tool call.',
     '- If you need a final answer, return planner_final inside the tool_calls array with its required input fields.',
-    '- If you need branching or skills loading, return planner_branch or planner_skills inside the tool_calls array with their required input fields.',
+    '- If you need branching or skills loading, return planner_subagent (subagent=plan) or planner_skills inside the tool_calls array with their required input fields.',
     '- Do not include markdown fences, XML, tags, or prose outside the JSON object.',
     'Allowed tools:',
     toolSchemas,
@@ -497,12 +497,14 @@ function parseToolCallsFromFallbackPayload<TParsed>(
         completion_summary: parsed.completion_summary,
       },
     }];
-  } else if (parsed.kind === 'branch' && toolMap.has('planner_branch')) {
+  } else if (parsed.kind === 'branch' && toolMap.has('planner_subagent')) {
+    // Legacy `kind: 'branch'` fallback — route to planner_subagent so branching
+    // always goes through the plan subagent path.
     rawCalls = [{
-      name: 'planner_branch',
+      name: 'planner_subagent',
       input: {
-        thought: parsed.thought,
-        branches: parsed.branches,
+        subagent: 'plan',
+        task: typeof parsed.thought === 'string' ? parsed.thought : 'Rebranch: create branch graph from current plan.',
       },
     }];
   } else if (parsed.kind === 'skills' && toolMap.has('planner_skills')) {

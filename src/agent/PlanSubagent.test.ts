@@ -193,3 +193,132 @@ test('plan subagent falls back to canonical plan state when invocation.plan is a
     `Task state should fall back to canonical plan state text. Got:\n${taskStateMsg}`,
   );
 });
+
+test('plan subagent rejects duplicate external workstreams and retries with explicit feedback', async () => {
+  const capturedMessages: string[] = [];
+  let attempt = 0;
+
+  const ctx = buildCtx({
+    branch: {
+      id: 'B0.2',
+      parentId: 'B0',
+      depth: 1,
+      label: 'design-system',
+      goal: 'Define modern design system with tokens, typography, and responsive patterns.',
+      steps: 0,
+    },
+    kanbanSnapshot: {
+      updatedAt: Date.now(),
+      summary: {
+        total: 3,
+        queued: 0,
+        active: 2,
+        finalizing: 0,
+        completed: 1,
+        error: 0,
+      },
+      cards: [
+        {
+          branchId: 'B0',
+          parentBranchId: null,
+          label: 'root',
+          goal: 'Build the final website.',
+          depth: 0,
+          step: 1,
+          status: 'completed',
+          updatedAt: Date.now(),
+        },
+        {
+          branchId: 'B0.1',
+          parentBranchId: 'B0',
+          label: 'tech-stack',
+          goal: 'Research and recommend optimal tech stack for loveconnect.us personal site.',
+          depth: 1,
+          step: 2,
+          status: 'active',
+          summary: 'Already researching the stack options.',
+          updatedAt: Date.now(),
+        },
+        {
+          branchId: 'B0.2',
+          parentBranchId: 'B0',
+          label: 'design-system',
+          goal: 'Define modern design system with tokens, typography, and responsive patterns.',
+          depth: 1,
+          step: 1,
+          status: 'active',
+          updatedAt: Date.now(),
+        },
+      ],
+    },
+    generateToolCalls: async <TParsed>(
+      options: SubagentToolCallOptions<TParsed>,
+    ): Promise<SubagentToolCallResult<TParsed>> => {
+      capturedMessages.push(options.messages.map((message) => String(message.content || '')).join('\n\n'));
+      attempt += 1;
+
+      if (attempt === 1) {
+        return {
+          calls: [{
+            name: 'plan_subagent_result',
+            input: {
+              kind: 'plan_subagent_result',
+              decision: {
+                planVersion: 1,
+                canonicalPlan: '1. Revisit the tech stack.\n2. Continue from there.',
+                planDeltaSummary: 'Retrying plan.',
+                branches: [{
+                  label: 'tech-stack',
+                  goal: 'Research and recommend optimal tech stack for loveconnect.us personal site.',
+                  priority: 5,
+                }],
+                branchAlignments: [{
+                  label: 'tech-stack',
+                  planExcerpt: 'Research and recommend optimal tech stack for loveconnect.us personal site.',
+                }],
+              },
+            } as TParsed,
+          }],
+          text: '',
+        };
+      }
+
+      return {
+        calls: [{
+          name: 'plan_subagent_result',
+          input: {
+            kind: 'plan_subagent_result',
+            decision: {
+              planVersion: 1,
+              canonicalPlan: '1. Define tokens.\n2. Specify typography.\n3. Lock responsive rules.',
+              planDeltaSummary: 'Scoped the design-system work.',
+              branches: [{
+                label: 'design-tokens',
+                goal: 'Define the color, spacing, and radius tokens for the site.',
+                priority: 6,
+              }],
+              branchAlignments: [{
+                label: 'design-tokens',
+                planExcerpt: 'Define the color, spacing, and radius tokens for the site.',
+              }],
+            },
+          } as TParsed,
+        }],
+        text: '',
+      };
+    },
+  });
+
+  const result = await planSubagentHandler.run(ctx, {
+    subagent: 'plan',
+    task: 'Break the design-system scope into child workstreams only.',
+    context: 'Do not reopen already-owned workstreams.',
+  });
+
+  assert.equal(attempt, 2);
+  assert.equal(result.canonicalPlanUpdate?.branches[0]?.label, 'design-tokens');
+  assert.match(capturedMessages[0] || '', /"existing_workstreams"/);
+  assert.match(capturedMessages[0] || '', /"relation": "sibling"/);
+  assert.match(capturedMessages[1] || '', /duplicates existing sibling workstream/i);
+  assert.match(capturedMessages[1] || '', /do not recreate existing workstreams/i);
+});

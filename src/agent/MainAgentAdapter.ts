@@ -11,6 +11,11 @@ import {
   type SkillRecord,
 } from '../skills/router.js';
 import { logError } from '../utils/errorLogger.js';
+import {
+  WorkspaceStateTracker,
+  type WorkspaceToolExecutionContext,
+  type WorkspaceToolExecutionMetadata,
+} from './workspaceState.js';
 
 type MainAgentToolName = 'read' | 'search' | 'edit' | 'bash' | 'web';
 
@@ -19,6 +24,7 @@ interface MainAgentAdapterOptions {
   codeCliRoot: string;
   runtimeHandle: RuntimeHandle;
   mempediaClient?: MempediaClientLike;
+  workspaceState?: WorkspaceStateTracker;
 }
 
 interface MempediaClientLike {
@@ -72,12 +78,14 @@ export class MainAgentAdapter {
   private readonly runtimeHandle: RuntimeHandle;
   private readonly defaultWebPermissionPolicy: WebPermissionPolicy;
   private readonly mempediaClient: MempediaClientLike;
+  private readonly workspaceState?: WorkspaceStateTracker;
 
   constructor(options: MainAgentAdapterOptions) {
     this.projectRoot = options.projectRoot;
     this.codeCliRoot = options.codeCliRoot;
     this.runtimeHandle = options.runtimeHandle;
     this.mempediaClient = options.mempediaClient ?? new MempediaClient(options.projectRoot);
+    this.workspaceState = options.workspaceState;
     this.defaultWebPermissionPolicy = {
       allowedDomains: parseDomainList(process.env.MITOSIS_WEB_ALLOWED_DOMAINS),
       blockedDomains: parseDomainList(process.env.MITOSIS_WEB_BLOCKED_DOMAINS),
@@ -85,19 +93,28 @@ export class MainAgentAdapter {
   }
 
   async execute(toolName: MainAgentToolName, args: Record<string, unknown>): Promise<string> {
+    const result = await this.executeDetailed(toolName, args);
+    return result.output;
+  }
+
+  async executeDetailed(
+    toolName: MainAgentToolName,
+    args: Record<string, unknown>,
+    context: WorkspaceToolExecutionContext = {},
+  ): Promise<{ output: string } & WorkspaceToolExecutionMetadata> {
     switch (toolName) {
       case 'read':
-        return this.executeRead(args);
+        return this.executeRead(args, context);
       case 'search':
-        return this.executeSearch(args);
+        return this.executeSearch(args, context);
       case 'edit':
-        return this.executeEdit(args);
+        return this.executeEdit(args, context);
       case 'bash':
-        return this.executeBash(args);
+        return this.executeBash(args, context);
       case 'web':
-        return this.executeWeb(args);
+        return { output: await this.executeWeb(args) };
       default:
-        return `Unknown tool: ${toolName}`;
+        return { output: `Unknown tool: ${toolName}` };
     }
   }
 
@@ -191,74 +208,90 @@ export class MainAgentAdapter {
     });
   }
 
-  private async executeRead(args: Record<string, unknown>): Promise<string> {
+  private async executeRead(
+    args: Record<string, unknown>,
+    context: WorkspaceToolExecutionContext,
+  ): Promise<{ output: string } & WorkspaceToolExecutionMetadata> {
     const target = this.normalizeTarget(args.target);
     switch (target) {
       case 'workspace':
-        return this.readWorkspaceFile(String(args.path || ''));
+        return this.readWorkspaceFile(String(args.path || ''), context);
       case 'memory':
-        return this.readMemoryNode(args);
+        return { output: await this.readMemoryNode(args) };
       case 'preferences':
-        return this.readPreferences();
+        return { output: await this.readPreferences() };
       case 'skills':
-        return this.readSkill(args);
+        return { output: await this.readSkill(args) };
       default:
-        return 'Error: read supports target=workspace|memory|preferences|skills.';
+        return { output: 'Error: read supports target=workspace|memory|preferences|skills.' };
     }
   }
 
-  private async executeSearch(args: Record<string, unknown>): Promise<string> {
+  private async executeSearch(
+    args: Record<string, unknown>,
+    context: WorkspaceToolExecutionContext,
+  ): Promise<{ output: string } & WorkspaceToolExecutionMetadata> {
     const target = this.normalizeTarget(args.target);
     switch (target) {
       case 'workspace':
-        return this.searchWorkspace(args);
+        return this.searchWorkspace(args, context);
       case 'memory':
-        return this.searchMemory(args);
+        return { output: await this.searchMemory(args) };
       case 'preferences':
-        return this.searchPreferences(args);
+        return { output: await this.searchPreferences(args) };
       case 'skills':
-        return this.searchSkills(args);
+        return { output: await this.searchSkills(args) };
       default:
-        return JSON.stringify({
+        return { output: JSON.stringify({
           kind: 'error',
           message: 'search supports target=workspace|memory|preferences|skills.',
-        });
+        }) };
     }
   }
 
-  private async executeEdit(args: Record<string, unknown>): Promise<string> {
+  private async executeEdit(
+    args: Record<string, unknown>,
+    context: WorkspaceToolExecutionContext,
+  ): Promise<{ output: string } & WorkspaceToolExecutionMetadata> {
     const target = this.normalizeTarget(args.target);
     switch (target) {
       case 'workspace':
-        return this.editWorkspaceFile(args);
+        return this.editWorkspaceFile(args, context);
       case 'memory':
-        return this.editMemoryNode(args);
+        return { output: await this.editMemoryNode(args) };
       case 'preferences':
-        return this.editPreferences(args);
+        return { output: await this.editPreferences(args) };
       case 'skills':
-        return this.editSkill(args);
+        return { output: await this.editSkill(args) };
       default:
-        return JSON.stringify({
+        return { output: JSON.stringify({
           kind: 'error',
           message: 'edit supports target=workspace|memory|preferences|skills.',
-        });
+        }) };
     }
   }
 
-  private async executeBash(args: Record<string, unknown>): Promise<string> {
+  private async executeBash(
+    args: Record<string, unknown>,
+    context: WorkspaceToolExecutionContext,
+  ): Promise<{ output: string } & WorkspaceToolExecutionMetadata> {
     const command = typeof args.command === 'string' ? args.command.trim() : '';
     if (!command) {
       const error = new Error(`bash command is empty. Received args: ${JSON.stringify(args)}`);
       logError(this.projectRoot, error, 'bash_empty_command');
-      return `Error: bash requires a non-empty command parameter. Received: ${JSON.stringify(args)}`;
+      return { output: `Error: bash requires a non-empty command parameter. Received: ${JSON.stringify(args)}` };
     }
     const toolRes = await this.runtimeHandle.executeTool('run_shell', { command });
     if (!toolRes.success) {
-      return `Error: ${toolRes.error ?? 'unknown tool error'}`;
+      return { output: `Error: ${toolRes.error ?? 'unknown tool error'}` };
     }
-    return typeof toolRes.result === 'string'
+    const output = typeof toolRes.result === 'string'
       ? toolRes.result
       : JSON.stringify(toolRes.result);
+    return {
+      output,
+      ...(this.workspaceState?.recordBashMutations(command, context) || {}),
+    };
   }
 
   private async executeWeb(args: Record<string, unknown>): Promise<string> {
@@ -400,17 +433,34 @@ export class MainAgentAdapter {
     });
   }
 
-  private async readWorkspaceFile(filePath: string): Promise<string> {
+  private async readWorkspaceFile(
+    filePath: string,
+    context: WorkspaceToolExecutionContext,
+  ): Promise<{ output: string } & WorkspaceToolExecutionMetadata> {
+    const cached = this.workspaceState?.getReadCache(filePath);
+    if (cached !== null && cached !== undefined) {
+      return {
+        output: cached,
+        ...(this.workspaceState?.buildReadCacheHitMetadata(filePath, context) || {}),
+      };
+    }
     const toolRes = await this.runtimeHandle.executeTool('read_file', { path: filePath });
     if (!toolRes.success) {
-      return `Error: ${toolRes.error ?? 'workspace read failed'}`;
+      return { output: `Error: ${toolRes.error ?? 'workspace read failed'}` };
     }
-    return typeof toolRes.result === 'string'
+    const output = typeof toolRes.result === 'string'
       ? toolRes.result
       : JSON.stringify(toolRes.result);
+    return {
+      output,
+      ...(this.workspaceState?.storeReadResult(filePath, output, context) || {}),
+    };
   }
 
-  private async searchWorkspace(args: Record<string, unknown>): Promise<string> {
+  private async searchWorkspace(
+    args: Record<string, unknown>,
+    context: WorkspaceToolExecutionContext,
+  ): Promise<{ output: string } & WorkspaceToolExecutionMetadata> {
     const mode = String(args.mode || '').trim();
     const limit = Math.max(
       1,
@@ -418,16 +468,38 @@ export class MainAgentAdapter {
     );
     if (mode === 'glob') {
       const pattern = String(args.pattern || '**/*').trim() || '**/*';
+      const scopeKey = this.workspaceState?.buildGlobScopeKey(pattern) || 'workspace';
+      const cacheKey = `glob:${pattern}:${limit}`;
+      const cached = this.workspaceState?.getSearchCache(cacheKey, scopeKey);
+      if (cached !== null && cached !== undefined) {
+        return {
+          output: cached,
+          ...(this.workspaceState?.buildSearchCacheHitMetadata('glob', cacheKey, cached, context, scopeKey) || {}),
+        };
+      }
       const matcher = this.globToRegExp(pattern);
       const files = this.listWorkspaceFiles()
         .filter((filePath) => matcher.test(filePath))
         .slice(0, limit);
-      return JSON.stringify({ kind: 'workspace_glob_results', pattern, results: files });
+      const output = JSON.stringify({ kind: 'workspace_glob_results', pattern, results: files });
+      return {
+        output,
+        ...(this.workspaceState?.storeSearchResult('glob', cacheKey, scopeKey, output, context) || {}),
+      };
     }
     if (mode === 'grep') {
       const query = String(args.query || '').trim();
       if (!query) {
-        return JSON.stringify({ kind: 'error', message: 'search grep requires query' });
+        return { output: JSON.stringify({ kind: 'error', message: 'search grep requires query' }) };
+      }
+      const scopeKey = this.workspaceState?.buildGrepScopeKey() || 'workspace';
+      const cacheKey = `grep:${query}:${limit}`;
+      const cached = this.workspaceState?.getSearchCache(cacheKey, scopeKey);
+      if (cached !== null && cached !== undefined) {
+        return {
+          output: cached,
+          ...(this.workspaceState?.buildSearchCacheHitMetadata('grep', cacheKey, cached, context, scopeKey) || {}),
+        };
       }
       const results: Array<{ path: string; line: number; text: string }> = [];
       const matcher = new RegExp(query, 'i');
@@ -451,34 +523,45 @@ export class MainAgentAdapter {
           if (results.length >= limit) break;
         }
       }
-      return JSON.stringify({ kind: 'workspace_grep_results', query, results });
+      const output = JSON.stringify({ kind: 'workspace_grep_results', query, results });
+      return {
+        output,
+        ...(this.workspaceState?.storeSearchResult('grep', cacheKey, scopeKey, output, context) || {}),
+      };
     }
-    return JSON.stringify({
+    return { output: JSON.stringify({
       kind: 'error',
       message: 'search target=workspace supports mode=grep|glob.',
-    });
+    }) };
   }
 
-  private async editWorkspaceFile(args: Record<string, unknown>): Promise<string> {
+  private async editWorkspaceFile(
+    args: Record<string, unknown>,
+    context: WorkspaceToolExecutionContext,
+  ): Promise<{ output: string } & WorkspaceToolExecutionMetadata> {
     const filePath = String(args.path || '').trim();
     const normalizedPath = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
     if (normalizedPath === '.mempedia' || normalizedPath.startsWith('.mempedia/')) {
-      return JSON.stringify({
+      return { output: JSON.stringify({
         kind: 'error',
         message:
           'edit target=workspace is blocked for raw .mempedia storage. Use target=memory|preferences instead.',
-      });
+      }) };
     }
     const toolRes = await this.runtimeHandle.executeTool('write_file', {
       path: filePath,
       content: String(args.content || ''),
     });
     if (!toolRes.success) {
-      return `Error: ${toolRes.error ?? 'workspace edit failed'}`;
+      return { output: `Error: ${toolRes.error ?? 'workspace edit failed'}` };
     }
-    return typeof toolRes.result === 'string'
+    const output = typeof toolRes.result === 'string'
       ? toolRes.result
       : JSON.stringify(toolRes.result);
+    return {
+      output,
+      ...(this.workspaceState?.recordWorkspaceEdit(filePath, context) || {}),
+    };
   }
 
   private async readMemoryNode(args: Record<string, unknown>): Promise<string> {

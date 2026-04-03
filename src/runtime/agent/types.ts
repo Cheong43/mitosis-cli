@@ -57,6 +57,18 @@ export interface SynthesisSharedHandoff {
 
 export type BranchKanbanStatus = 'queued' | 'active' | 'finalizing' | 'completed' | 'error';
 
+export type SharedWorkspaceFactType = 'exists' | 'created' | 'modified' | 'inspected';
+
+export interface SharedWorkspaceFact {
+  path: string;
+  factType: SharedWorkspaceFactType;
+  ownerBranchId: string;
+  step: number;
+  source: string;
+  confidence: number;
+  updatedAt: number;
+}
+
 export interface BranchKanbanCard {
   branchId: string;
   parentBranchId: string | null;
@@ -72,6 +84,8 @@ export interface BranchKanbanCard {
   summary?: string;
   blockers?: string[];
   artifacts?: string[];
+  outputs?: string[];
+  workspaceFacts?: SharedWorkspaceFact[];
   updatedAt: number;
 }
 
@@ -199,6 +213,11 @@ export interface ToolObservation {
   toolName: string;
   result: string;
   success: boolean;
+  cacheHit?: boolean;
+  artifacts?: string[];
+  outputs?: string[];
+  workspaceFacts?: SharedWorkspaceFact[];
+  duplicateInspection?: string;
 }
 
 export type TranscriptMessageContent = any;

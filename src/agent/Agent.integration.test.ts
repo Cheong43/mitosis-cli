@@ -834,6 +834,7 @@ test('planner prompt keeps branching guidance principle-based without root coerc
   assert.match(capturedPrompt, /planner_subagent/i);
   assert.match(capturedPrompt, /Request planner_subagent with subagent=plan when: no canonical plan exists/i);
   assert.match(capturedPrompt, /current plan is wrong, or a local gap needs remediation rebranch/i);
+  assert.match(capturedPrompt, /Keep branches orthogonal to already-assigned kanban lanes/i);
   assert.match(capturedPrompt, /For work, call read\/search\/edit\/bash\/web directly/i);
   assert.match(capturedPrompt, /web -> fetch a trusted URL only; do not invent URLs/i);
   assert.match(capturedPrompt, /Tools: read, search, edit, bash, web \(mode=fetch only, requires concrete URL\)/i);

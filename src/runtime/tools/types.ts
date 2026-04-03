@@ -36,6 +36,14 @@ export interface ToolDefinition<
   /** Human-readable description used in prompts / documentation. */
   description: string;
   /**
+   * JSON Schema (draft-07 object schema) describing the tool's input arguments.
+   * When present, the planner uses this to generate the LLM function-calling
+   * declaration so the model knows how to invoke the tool.
+   * Omitting this field is allowed — the planner will fall back to an empty
+   * object schema with no required properties.
+   */
+  parameters?: Record<string, unknown>;
+  /**
    * Execute the tool.
    *
    * Implementations must NOT throw — return a `ToolExecutionResult` with

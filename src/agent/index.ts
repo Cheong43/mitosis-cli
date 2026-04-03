@@ -21,6 +21,10 @@ import { z } from 'zod';
 import { resolveCodeCliRoot } from '../config/projectPaths.js';
 import { AgentRuntime, createRuntime, CallbackApprovalEngine } from '../runtime/index.js';
 import type { ApprovalCallback } from '../runtime/index.js';
+import { SubagentRegistry as EcosystemSubagentRegistry } from '../runtime/subagent/index.js';
+import { GovernanceRuntime } from '../runtime/governance/GovernanceRuntime.js';
+import { unNamespaceTool } from '../runtime/subagent/SubagentSandbox.js';
+import type { ToolDefinition as RuntimeToolDefinition } from '../runtime/tools/types.js';
 import type { AgentBranchState, BranchSynthesisInput } from '../runtime/agent/AgentRuntime.js';
 import type {
   AgentStep,
@@ -60,6 +64,7 @@ import {
 import { CompressionEngine } from './compressionEngine.js';
 import { SessionCompressor, isRunExhausted } from './sessionCompressor.js';
 import { PlannerToolAdapter } from './PlannerToolAdapter.js';
+import { WorkspaceStateTracker } from './workspaceState.js';
 import { RpmLimiter, getGlobalRpmLimiter } from '../utils/RpmLimiter.js';
 import { logError } from '../utils/errorLogger.js';
 import { SubagentRegistry } from './subagents/registry.js';
@@ -78,7 +83,10 @@ const __dirname = path.dirname(__filename);
 
 dotenv.config();
 
-const PlannerToolNameSchema = z.enum(TOOL_NAMES);
+// Ecosystem subagents may register tools with arbitrary names (including
+// namespaced names like "github-agent/search_issues"), so we accept any
+// non-empty string here.  Base tools still use their historic short names.
+const PlannerToolNameSchema = z.string().trim().min(1);
 
 const PlannerToolCallSchema = z.object({
   name: PlannerToolNameSchema,
@@ -86,13 +94,36 @@ const PlannerToolCallSchema = z.object({
   goal: z.string().trim().min(1).max(240).optional(),
 });
 
-const PlannerBranchSchema = z.object({
-  label: z.string().trim().min(1).max(80),
-  goal: z.string().trim().min(1).max(240),
-  group: z.number().int().min(1).max(8).describe('Execution group (required): 1=first wave, 2=second wave, etc.'),
-  priority: z.number().int().min(1).max(100).default(50).describe('Priority within group (required): higher=more urgent'),
-  depends: z.array(z.string().trim().min(1).max(80)).min(0).max(7).optional().describe('Labels of sibling branches this depends on'),
-});
+// Accept both current (execution_group/depends_on) and legacy (group/depends) field names.
+// Input is pre-processed to rename legacy fields before Zod parsing.
+function repairLegacyBranchFields(raw: unknown): unknown {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return raw;
+  }
+  const record = raw as Record<string, unknown>;
+  const repaired: Record<string, unknown> = { ...record };
+  // Rename legacy `group` → `execution_group` when the new field is absent
+  if (typeof repaired.group !== 'undefined' && typeof repaired.execution_group === 'undefined') {
+    repaired.execution_group = repaired.group;
+  }
+  // Rename legacy `depends` → `depends_on` when the new field is absent
+  if (typeof repaired.depends !== 'undefined' && typeof repaired.depends_on === 'undefined') {
+    repaired.depends_on = repaired.depends;
+  }
+  return repaired;
+}
+
+const PlannerBranchSchema = z.preprocess(
+  repairLegacyBranchFields,
+  z.object({
+    label: z.string().trim().min(1).max(80),
+    goal: z.string().trim().min(1).max(240),
+    why: z.string().trim().min(1).max(240).optional(),
+    execution_group: z.number().int().min(1).max(8).describe('Execution group (required): 1=first wave, 2=second wave, etc.'),
+    priority: z.number().int().min(1).max(100).default(50).describe('Priority within group (required): higher=more urgent'),
+    depends_on: z.array(z.string().trim().min(1).max(80)).min(0).max(7).optional().describe('Labels of sibling branches this depends on'),
+  }),
+);
 
 const PlannerThoughtSchema = z.string().trim().min(1);
 
@@ -115,7 +146,7 @@ const PlannerBranchDecisionBaseSchema = z.object({
 
 const PlannerBranchDecisionSchema = PlannerBranchDecisionBaseSchema.superRefine((decision, ctx) => {
   const labelToIndex = new Map<string, number>();
-  const normalizedGroups = decision.branches.map((branch) => branch.group || 1);
+  const normalizedGroups = decision.branches.map((branch) => branch.execution_group || 1);
 
   decision.branches.forEach((branch, index) => {
     if (labelToIndex.has(branch.label)) {
@@ -133,12 +164,12 @@ const PlannerBranchDecisionSchema = PlannerBranchDecisionBaseSchema.superRefine(
   const indegree = Array.from({ length: decision.branches.length }, () => 0);
 
   decision.branches.forEach((branch, index) => {
-    const dependencies = [...new Set((branch.depends || []).map((label) => label.trim()).filter(Boolean))];
+    const dependencies = [...new Set((branch.depends_on || []).map((label) => label.trim()).filter(Boolean))];
     dependencies.forEach((dependencyLabel, dependencyIndex) => {
       if (dependencyLabel === branch.label) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ['branches', index, 'depends', dependencyIndex],
+          path: ['branches', index, 'depends_on', dependencyIndex],
           message: 'A branch cannot depend on itself.',
         });
         return;
@@ -148,8 +179,8 @@ const PlannerBranchDecisionSchema = PlannerBranchDecisionBaseSchema.superRefine(
       if (dependencyBranchIndex === undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ['branches', index, 'depends', dependencyIndex],
-          message: 'depends must reference labels from the same planner_branch call.',
+          path: ['branches', index, 'depends_on', dependencyIndex],
+          message: 'depends_on must reference labels from the same planner_branch decision.',
         });
         return;
       }
@@ -157,8 +188,8 @@ const PlannerBranchDecisionSchema = PlannerBranchDecisionBaseSchema.superRefine(
       if (normalizedGroups[dependencyBranchIndex] > normalizedGroups[index]) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ['branches', index, 'depends', dependencyIndex],
-          message: 'depends cannot point to a sibling in a later execution_group.',
+          path: ['branches', index, 'depends_on', dependencyIndex],
+          message: 'depends_on cannot point to a sibling in a later execution_group.',
         });
         return;
       }
@@ -468,6 +499,8 @@ export class Agent {
   private readonly sessionCompressor: SessionCompressor;
   private readonly subagentRegistry: SubagentRegistry;
   private readonly workspaceManager: WorkspaceManager;
+  /** Ecosystem registry for external subagents discovered from .mitosis/agents/. */
+  private readonly ecosystemRegistry: EcosystemSubagentRegistry;
   /** In-process caches to avoid re-reading disk on every request. */
   private cachedWorkspaceSkills: SkillRecord[] | null = null;
   private cachedSoulsMarkdown: string | null = null;
@@ -607,6 +640,16 @@ export class Agent {
       researchSubagentHandler,
     ], projectRoot);
     this.workspaceManager = new WorkspaceManager(projectRoot);
+
+    // Ecosystem registry: discovers external subagent manifests from
+    // .mitosis/agents/ directories.  Uses a default governance runtime
+    // so capability grants are enforced from project start.
+    const ecosystemGovernance = new GovernanceRuntime({ projectRoot });
+    this.ecosystemRegistry = new EcosystemSubagentRegistry({
+      projectRoot,
+      globalGovernance: ecosystemGovernance,
+      namespaceTools: true,
+    });
   }
 
   private deriveOpenAICompatBaseURL(baseURL?: string): string | undefined {
@@ -641,6 +684,14 @@ export class Agent {
 
   async start() {
     this.mempedia.start();
+    // Discover registered ecosystem subagents from disk (non-blocking best-effort).
+    this.ecosystemRegistry.discover({
+      projectRoot: this.projectRoot,
+      agentId: 'core',
+      sessionId: 'startup',
+    }).catch((err) => {
+      console.warn('[EcosystemRegistry] discovery error:', err);
+    });
   }
 
   async sendMempediaAction(action: ToolAction): Promise<any> {
@@ -656,6 +707,18 @@ export class Agent {
     return /(response_format|text\.format|structured outputs?)/i.test(message)
       && /(json_object|json_schema|json|schema)/i.test(message)
       && /(not supported|unsupported)/i.test(message);
+  }
+
+  /**
+   * Returns the tool definitions from all enabled ecosystem (external) subagents,
+   * excluding builtin tools (read/search/edit/bash/web) that are already exposed
+   * directly to the planner as base tools.
+   */
+  private ecosystemToolDefinitions(): RuntimeToolDefinition[] {
+    const basenames = new Set(TOOL_NAMES as readonly string[]);
+    return this.ecosystemRegistry
+      .listAllTools()
+      .filter((t) => !basenames.has(t.name));
   }
 
   private buildPlannerWorkToolParameters(parameters: Record<string, unknown>): Record<string, unknown> {
@@ -734,6 +797,20 @@ export class Agent {
           parse: (input: unknown) => this.parsePlannerWorkToolInvocation(toolName, input),
         };
       }));
+
+      // Add tools from registered ecosystem subagents (external agents only).
+      // These use namespaced names like "<subagent-id>/<tool-name>" so they
+      // never collide with the 5 base tools.
+      for (const ecoTool of this.ecosystemToolDefinitions()) {
+        tools.push({
+          name: ecoTool.name,
+          description: ecoTool.description,
+          parameters: this.buildPlannerWorkToolParameters(
+            (ecoTool as RuntimeToolDefinition).parameters ?? { type: 'object', properties: {}, required: [] },
+          ),
+          parse: (input: unknown) => this.parsePlannerWorkToolInvocation(ecoTool.name, input),
+        });
+      }
     }
 
     // Add control tools
@@ -3100,11 +3177,13 @@ Decide the safer execution discipline for this turn.`,
       sessionId: runSessionId,
       ...(options.onApproval ? { approvalEngine: new CallbackApprovalEngine(options.onApproval) } : {}),
     });
+    const runWorkspaceState = new WorkspaceStateTracker(this.projectRoot);
     const plannerToolAdapter = new PlannerToolAdapter({
       projectRoot: this.projectRoot,
       codeCliRoot: this.codeCliRoot,
       runtimeHandle: runRuntimeHandle,
       mempediaClient: this.mempedia,
+      workspaceState: runWorkspaceState,
     });
     const emitTrace = (event: TraceEvent) => {
       traceBuffer.push(event);
@@ -3332,17 +3411,18 @@ Control tools: planner_subagent (subagent=plan for initial branching / plan refr
 For work, call read/search/edit/bash/web directly. Never mix control + work tools. Never reply with plain text. Never output <think> tags or reasoning text - always call tools directly.
 
 BRANCHING: When calling planner_subagent with subagent=plan, ALWAYS specify for each branch:
-- group (execution_group): 1=first wave, 2=second wave, etc. Parallel branches use same group.
+- execution_group: 1=first wave, 2=second wave, etc. Parallel branches use same group.
 - priority: 1-100, higher=more urgent. Use to order branches within same group.
-- depends: array of sibling branch labels this depends on (empty array if no dependencies).
+- depends_on: array of sibling branch labels this depends on (empty array [] if no dependencies).
 
 Execute your branch excerpt faithfully. Do not design sibling graphs — that belongs to planner_subagent with subagent=plan.
 Request planner_subagent with subagent=plan when: no canonical plan exists, current plan is wrong, or a local gap needs remediation rebranch.
 Respect execution_group and depends_on as binding constraints. Reuse branch_evidence_digest before issuing more search/fetch.
+Keep branches orthogonal to already-assigned kanban lanes. Do not recreate a sibling, ancestor, or external workstream under a new parent just because the wording changed.
 Prefer search before edit. Prefer workspace evidence before web.
 ${isPlanStage ? 'Finish by returning one executable plan through planner_final.' : isExecuteStage ? 'Follow the approved plan sequentially.' : 'Preserve the coordination graph implied by execution_group and depends_on.'}
 
-All work artifacts are automatically persisted to .mitosis/work/ for future reference.
+All work artifacts are automatically persisted to .mitosis/branches/ for future reference.
 
 ${compactCompletionRules}`,
       footer,
@@ -3385,6 +3465,8 @@ ${renderPromptList([
   'Reconcile user goal + current plan + branch status into coherent canonical_plan',
   'Compress aggressively: remove prose, deduplicate, stay under 4000 tokens',
   'Design only necessary branches for current scope',
+  'Treat existing_workstreams entries with relation=ancestor|sibling|external as already-owned lanes; do not recreate them as new child branches',
+  'For non-root scopes, every proposed branch must be narrower than the current branch focus instead of restating the whole user request',
   'Use execution_group for parallel waves; branches in the same group run concurrently',
   'Set depends_on for every branch that needs results from another branch (e.g. a build/synthesis branch that depends on research branches MUST list those branch labels in depends_on)',
   'A branch with depends_on will not start until all listed branches complete — omitting depends_on means it runs immediately in parallel',
@@ -3741,8 +3823,10 @@ ${renderPromptList([
     ): PlannedBranch[] => branches.map((branch) => ({
       label: branch.label,
       goal: branch.goal,
-      group: branch.group,
-      depends: branch.depends,
+      why: branch.why,
+      priority: branch.priority,
+      executionGroup: branch.execution_group,
+      dependsOn: branch.depends_on ?? [],
     }));
 
     const trimTextToTokenBudget = (text: string, maxTokens: number, fallbackChars = 12000): string => {
@@ -3918,6 +4002,11 @@ ${renderPromptList([
           normalizePlannerBranches,
           trimTextToTokenBudget,
           renderPlanSubagentFocus,
+          sharedProgressDigest: runWorkspaceState.renderSharedProgressDigest(
+            branch.id,
+            branch.goal,
+            kanbanSnapshot?.cards?.flatMap((card) => card.artifacts ?? []) ?? [],
+          ) || undefined,
           generateToolCalls: async (options) => this.measure(
             perfEntries,
             options.timeoutLabel,
@@ -4258,6 +4347,29 @@ Respond with tool calls. Use read/search/edit/bash/web for work. Use planner_sub
     };
 
     const executePlannerTool = async (fnName: string, args: Record<string, unknown>): Promise<string> => {
+      // 1. Check if this is an ecosystem (namespaced) tool: "<subagent-id>/<tool-name>"
+      const namespaceParts = unNamespaceTool(fnName);
+      if (namespaceParts) {
+        const { subagentId, toolName } = namespaceParts;
+        const sandbox = this.ecosystemRegistry.resolve(subagentId);
+        if (sandbox) {
+          const ctx = {
+            projectRoot: this.projectRoot,
+            agentId: runAgentId,
+            sessionId: runSessionId,
+          };
+          const result = await sandbox.executeTool(fnName, args, ctx);
+          if (result.success) {
+            return typeof result.result === 'string'
+              ? result.result
+              : JSON.stringify(result.result ?? '');
+          }
+          return `Error from subagent '${subagentId}/${toolName}': ${result.error ?? 'tool execution failed'}`;
+        }
+        // No sandbox found — fall through to "unknown tool" below.
+      }
+
+      // 2. Fall back to base tools (read / search / edit / bash / web).
       if (!TOOL_NAMES.includes(fnName as any)) {
         return `Unknown tool: ${fnName}`;
       }
